@@ -3,6 +3,25 @@
 Written at the end of Round 3 (2026-07-16), after the R3 re-audit (`AUDIT_R3.md`) and the
 targeted fix round that followed it. Read `AUDIT_R3.md` first, then this.
 
+> **STATUS UPDATE (2026-07-16).** Round 4 was launched against HEAD `4edbbe6` and **aborted
+> at 34/67 agents on an API session limit**. Raw output and what to do with it:
+> **`AUDIT_R4_PARTIAL.md`**. Lost: the mutation dimension, the docs dimension, ~30 verifiers,
+> the synthesis report, the completeness critic — so the round's headline deliverable (which
+> safety mechanisms the suite fails to defend) was never produced and **still needs running**.
+>
+> What it did land before dying: three real defects in Round 3's own fixes, all reproduced and
+> fixed in `8f1a449` — `_ensure_parcel` writing an out-of-enum `kind='file'` that bricked the
+> broker (self-inflicted P0), the gate timeout not actually bounding the gate (self-inflicted
+> P1), and R3's heartbeat fix still using a stale Python clock (P1). That is the "did Round 3
+> stop at each bug's boundary?" question answered empirically: **twice, yes.**
+>
+> One correction to this document, from the architecture dimension: **§1's option (a) rests on
+> a wrong model of git.** The 3-way merge unit is "one unchanged line", not "3 lines of
+> context". Re-derive that reasoning before implementing any gap rule.
+>
+> Re-run the round with `Workflow({scriptPath: '.../swarmsync-audit-r4-wf_7c72ed99-44a.js'})`
+> — everything below still stands.
+
 ## Where things stand
 
 Fixed and defended by mutation-proof tests this round (see "The rule" below):
