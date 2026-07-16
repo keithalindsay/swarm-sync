@@ -195,13 +195,33 @@ def build_graph(parcels: list[Parcel], root: StrPath) -> DepGraph:
         local_symbols = top_level_symbols.get(f, {})
 
         # Precompute signatures for this file's top-level function/class parcels.
+        #
+        # `local_symbols` comes from the PASSED-IN parcels (the blackboard's map),
+        # while `def_node` comes from the file as it is on disk RIGHT NOW. Those two
+        # legitimately disagree: there is no incremental indexing, so the map is only
+        # ever as fresh as the last `POST /index`, and `broker.load_scheduling_graph`
+        # deliberately passes the current DB parcels. Any symbol added since -- an
+        # agent's new function, a brand-new file the hook auto-created a coarse
+        # `<path>::<module>` parcel for -- is therefore on disk with no parcel row.
+        # That is an ORDINARY state, not a broken one.
+        #
+        # This used to subscript `local_symbols[def_node.name]` directly, so such a
+        # symbol raised KeyError out of `build_graph` -- uncaught by the guard above
+        # (it catches OSError/SyntaxError, not KeyError) and uncaught by
+        # `load_scheduling_graph`, killing dispatch for EVERY task, on every file,
+        # until the next re-index. A symbol with no parcel simply has no signature
+        # entry, exactly as if its file had not been indexed at all.
         for def_node in tree.body:
-            if isinstance(def_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                sig = _function_signature(def_node)
-                graph.signatures[local_symbols[def_node.name]] = (sig, _hash(sig))
-            elif isinstance(def_node, ast.ClassDef):
-                sig = _class_signature(def_node)
-                graph.signatures[local_symbols[def_node.name]] = (sig, _hash(sig))
+            if isinstance(def_node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                parcel_id = local_symbols.get(def_node.name)
+                if parcel_id is None:
+                    continue
+                sig = (
+                    _class_signature(def_node)
+                    if isinstance(def_node, ast.ClassDef)
+                    else _function_signature(def_node)
+                )
+                graph.signatures[parcel_id] = (sig, _hash(sig))
 
         # local_names: name visible in this file -> ("module", file) or ("symbol", parcel_id)
         local_names: dict[str, tuple[str, str]] = {}
