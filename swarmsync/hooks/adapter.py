@@ -306,7 +306,15 @@ def cmd_precheck(
             return None
         return _deny_response(relpath, owner)
 
-    result = client.lease(agent_id, parcel_id, mode="write", ttl=_hook_lease_ttl())
+    # `ensure_parcel=True`: this hook is handed whatever real file the agent is
+    # editing -- `.ts`, `.yaml`, `package.json`, or a `.py` created since the last
+    # index -- none of which the classifier (which only walks `*.py`) has emitted a
+    # parcel for. Without this the acquire hits the parcels FK, 500s, and gets
+    # swallowed by main()'s fail-open umbrella, leaving the file silently ungated
+    # in a working tree that hook subagents SHARE. See `server.leases._ensure_parcel`.
+    result = client.lease(
+        agent_id, parcel_id, mode="write", ttl=_hook_lease_ttl(), ensure_parcel=True
+    )
     if result.get("granted"):
         return None
 

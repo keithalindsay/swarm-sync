@@ -70,6 +70,7 @@ thin shell around this function, not a separate implementation.
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -88,6 +89,27 @@ from swarmsync.worktree import git_ops
 StrPath = Union[str, Path]
 
 DEFAULT_TEST_DIR = "tests"
+
+# Wall-clock ceiling for the pytest gate. The gate executes just-merged, agent-
+# authored test code of unbounded runtime while `app.post_integrate` holds the ONE
+# global `integrate_lock`, so an infinite loop (or a test that blocks on input, a
+# socket, a dead network mount) in any agent's branch does not merely fail that
+# merge -- it wedges integration for every other agent, permanently, with trunk
+# left carrying the un-gated merge commit. A timeout converts that from "the
+# coordinator is dead until someone restarts it" into an ordinary rejection.
+# Override per-deployment via SWARMSYNC_GATE_TIMEOUT (seconds).
+DEFAULT_GATE_TIMEOUT_SECONDS = 600.0
+
+
+def _gate_timeout() -> float:
+    raw = os.environ.get("SWARMSYNC_GATE_TIMEOUT")
+    if not raw:
+        return DEFAULT_GATE_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_GATE_TIMEOUT_SECONDS
+    return value if value > 0 else DEFAULT_GATE_TIMEOUT_SECONDS
 
 
 @dataclass
@@ -165,6 +187,22 @@ def _reverse_dep_files(repo: Path, changed_py: set[str]) -> set[str]:
     }
 
 
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    """SIGKILL the gate's whole process group, falling back to the direct child.
+
+    Best-effort by design: the process (or group) may already be gone, and a gate
+    that has timed out must never turn its own cleanup into an exception that
+    escapes into `integrate`'s error path.
+    """
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+
+
 def run_impact_tests(
     repo: StrPath, changed_files: list[str], test_dir: str = DEFAULT_TEST_DIR
 ) -> tuple[bool, str]:
@@ -239,14 +277,38 @@ def run_impact_tests(
             cmd = [*base_cmd, test_dir]
 
     env = {**os.environ, "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"}
-    result = subprocess.run(
-        cmd, cwd=str(repo), capture_output=True, text=True, env=env
+    timeout = _gate_timeout()
+    # `start_new_session=True` puts the gate in its own process GROUP so a timeout
+    # can kill the whole tree. `subprocess.run(timeout=...)` alone kills only the
+    # direct child -- pytest spawns (xdist workers, subprocesses under test), and
+    # those orphans would keep running, holding the repo and the CPU, after we'd
+    # already reported the merge rejected.
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(repo),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        start_new_session=True,
     )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+        returncode = proc.returncode
+    except subprocess.TimeoutExpired:
+        _kill_process_group(proc)
+        stdout, stderr = proc.communicate()
+        return False, (
+            f"{stdout}{stderr}\n"
+            f"swarm-sync: test gate exceeded {timeout:.0f}s and was killed "
+            f"(SWARMSYNC_GATE_TIMEOUT to change). Treating as a gate FAILURE: a "
+            f"branch whose tests do not terminate cannot be shown to keep trunk green."
+        )
     # pytest exit code 5 == "no tests were collected" -- e.g. a repo/fixture with
     # no test suite yet, or an impact-selection pass that (correctly) found no
     # test touches this change. Nothing to gate on is not a rejection reason.
-    ok = result.returncode in (0, 5)
-    log = result.stdout + result.stderr
+    ok = returncode in (0, 5)
+    log = stdout + stderr
     return ok, log
 
 
@@ -348,6 +410,26 @@ def integrate(
             git_ops.reset_hard(repo, pre_merge_sha, branch=into)
         except git_ops.GitOpsError as rexc:  # pragma: no cover - catastrophic git failure
             rollback_error = str(rexc)
+        else:
+            # Roll the BLACKBOARD back too, by re-deriving it from the restored
+            # trunk. Resetting git alone is only half of atomicity: `run_index`
+            # commits its own transaction (one transaction per connection, no
+            # nesting), so by the time a post-merge step fails, parcels.content_hash
+            # / blast_radius / state_summary and contracts.type_hash are already
+            # persisted from the merge we just threw away. Leaving them is worse
+            # than cosmetic -- `_check_read_deps` (step 1) compares other agents'
+            # plan-time snapshots against exactly these columns, so a phantom hash
+            # spuriously bounces innocent agents with needs_rebase and clears an
+            # agent that re-snapshotted to merge against state that never landed.
+            # Re-indexing the restored tree is the compensating action.
+            #
+            # Best-effort and reported, never raising: this runs on the error path,
+            # and a failure to re-derive must not replace the caller's real reason
+            # with a second exception.
+            try:
+                run_index(conn, repo)
+            except Exception as iexc:  # noqa: BLE001 - see above
+                rollback_error = f"blackboard re-index after rollback failed: {iexc!r}"
         payload = {"branch": branch, "into": into, "reason": reason_code}
         payload.update(payload_extra)
         full_reason = reason

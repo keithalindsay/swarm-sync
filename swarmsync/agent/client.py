@@ -104,8 +104,14 @@ class BlackboardClient:
         mode: str = "write",
         intent: Optional[str] = None,
         ttl: Optional[float] = None,
+        ensure_parcel: bool = False,
     ) -> dict:
-        """`POST /lease` -> `{"granted": bool, "lease_id": int|None, "reason": str|None}`."""
+        """`POST /lease` -> `{"granted": bool, "lease_id": int|None, "reason": str|None}`.
+
+        `ensure_parcel=True` asks the server to auto-create a coarse whole-file
+        parcel when the id is unknown, so a file the classifier never indexed is
+        still coordinated instead of ungated (see `server.leases._ensure_parcel`).
+        """
         body: dict[str, Any] = {
             "agent_id": agent_id,
             "parcel_id": parcel_id,
@@ -115,6 +121,8 @@ class BlackboardClient:
             body["intent"] = intent
         if ttl is not None:
             body["ttl"] = ttl
+        if ensure_parcel:
+            body["ensure_parcel"] = True
         r = self._http.post("/lease", json=body)
         r.raise_for_status()
         return r.json()

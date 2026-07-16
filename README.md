@@ -28,10 +28,10 @@ merges are gated.
 
 | Layer | Mechanism | Guarantees |
 |---|---|---|
-| Physical | git worktree per agent | same-file clobbering is structurally impossible |
-| Logical | atomic SQLite CAS lease per parcel | one writer per parcel; mispredictions serialize |
-| Interface | frozen contracts + `contract_change` events | no silent signature breaks under dependents |
-| Integration | serial pytest-gated merge | semantic breaks caught before landing; trunk stays green |
+| Physical | git worktree per agent | same-file clobbering is structurally impossible — **broker-driven agents only**; hook-driven Claude subagents share one working tree, where the lease is the only protection |
+| Logical | atomic SQLite CAS lease per parcel | one writer per parcel; mispredictions serialize. Covers `Edit`/`Write`-family tools — a `Bash` write (`sed -i`, `cat >`) bypasses it |
+| Interface | frozen contracts + `contract_change` events | a landed signature change is **detected and announced** to dependents, *after* it merges (DESIGN §5.3) — dependents with in-flight work are notified and re-plan; they are not prevented from building against a stale signature in the first place |
+| Integration | serial pytest-gated merge | trunk stays green: a branch is merged, tested, and **rolled back if red**, so a break is caught before it *survives* on trunk — not before it lands. Semantic conflicts that no test covers are the honest hard limit (DESIGN §6) |
 
 ## Quickstart (once built)
 
@@ -105,11 +105,27 @@ active.
 ### 2. Start the blackboard server
 
 ```bash
-swarmsync-serve --db /tmp/swarmsync.db --port 8787
+# SWARMSYNC_ROOTS must contain the repo you're coordinating (see below).
+SWARMSYNC_ROOTS=/path/to/your/repo swarmsync-serve --db /tmp/swarmsync.db --port 8787
 ```
 
 Leave it running for the duration of the coordinated session — it's the shared blackboard every
 hook call and agent talks to.
+
+#### `SWARMSYNC_ROOTS` — get this wrong and you get *silent* zero enforcement
+
+`POST /index` and `POST /integrate` take a filesystem path from the caller, so they are
+restricted to an allow-list of **managed roots**: a path must `realpath` to somewhere under
+`SWARMSYNC_ROOTS` (colon-separated) or it is rejected with `403`. **`SWARMSYNC_ROOTS` defaults to
+the server's launch cwd** — so if you start the server from anywhere that isn't an ancestor of
+the repo (another terminal, a systemd unit, `~`, or `/tmp` as in the `--db` example above),
+indexing that repo `403`s.
+
+That failure is quiet and total, in the same way as the port footgun below: no parcels get
+indexed → every lease request has no parcel to lease → the fail-open hook allows every edit →
+**no leasing whatsoever**, with nothing in the transcript to flag it. Always set
+`SWARMSYNC_ROOTS` explicitly to the repo (or repos) you intend to coordinate, and check the
+server's startup line naming its managed roots.
 
 ### 3. Turn coordination on/off per repo
 
@@ -169,6 +185,31 @@ the way the demo's symbol-mode broker run shows.
 
 Success criterion: **zero same-file textual collisions reach the integration branch**, every landed
 commit leaves the sample repo's tests green, all five assertions print PASS.
+
+## Security & trust model — read before exposing this to anything
+
+swarm-sync is a **local developer tool for a semi-trusted swarm**: your own agents, on your own
+machine, editing your own repo. It is not hardened for untrusted input, and it must not be
+exposed to a network you don't control.
+
+- **The blackboard executes code from the branches it integrates.** The `/integrate` gate's whole
+  job is to run the repo's pytest suite against a just-merged, agent-authored branch. Any
+  `conftest.py` or `test_*.py` on that branch runs as your user, with your environment. This is
+  the point of the design (nothing else can prove trunk stays green), not an oversight — but it
+  means *submitting a branch is equivalent to running code on the server*. The gate is bounded by
+  `SWARMSYNC_GATE_TIMEOUT` (default 600s), not sandboxed.
+- **Mutating routes are unauthenticated by default.** Set **`SWARMSYNC_TOKEN`** to require a
+  bearer token on `/index`, `/intent`, `/lease`, `/heartbeat`, `/release`, `/parcel/update` and
+  `/integrate`. With it unset, anyone who can reach the port can merge a branch and run its tests.
+  Read routes (`/parcels`, `/leases`, `/events`, `/contract/{symbol}`) are unauthenticated
+  regardless and expose your code's structure — symbol names, signatures, file paths.
+- **Bind to localhost.** The default host is `127.0.0.1`; keep it there.
+- **`SWARMSYNC_ROOTS`** bounds which filesystem paths `/index` and `/integrate` will touch. It is
+  a blast-radius limit on *your own* callers, not a defence against a hostile one.
+- **Bash-mediated edits are not gated.** The hook adapter's `PreToolUse` matcher covers
+  `Edit|Write|MultiEdit|NotebookEdit`. An agent that writes through `Bash` (`sed -i`, `cat >`,
+  `patch`, `git checkout`) bypasses the lease check entirely — the coordination is a cooperative
+  protocol among well-behaved agents, not a sandbox that constrains a determined one.
 
 ## Status
 
