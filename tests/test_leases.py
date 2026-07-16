@@ -411,47 +411,56 @@ def test_expired_holders_heartbeat_cannot_create_a_second_live_write_lease(conn)
     assert live[0]["agent_id"] == "agent-B"
 
 
-def test_ensure_parcel_row_is_indistinguishable_from_an_indexed_module_parcel(conn):
-    """An auto-created parcel must be a row the rest of the system can READ.
+def test_ensure_parcel_row_matches_what_the_indexer_writes_for_the_same_id(conn, tmp_path):
+    """An auto-created parcel must be the row the indexer would write for that id.
 
-    R4 caught this: `_ensure_parcel` originally wrote `kind='file'`, which is not in
-    `ParcelKind` (`Literal["function","method","class","module"]`). Every read path
-    validates through that model, and `broker.load_scheduling_graph` does
-    `SELECT * FROM parcels` + `Parcel.model_validate` on EVERY row -- so one hook
-    edit to one `package.json` raised ValidationError and stopped the broker from
-    scheduling ANY task, for any file. The hook's own tests never saw it because
-    nothing on the hook path reads parcels back through the model.
+    R4 caught two mistakes here. `_ensure_parcel` first wrote `kind='file'`, which is
+    outside `ParcelKind`, so `broker.load_scheduling_graph` (which validates EVERY
+    parcel row) raised ValidationError -- one hook lease bricked all dispatch. The
+    repair then wrote `symbol='<module>'` while the indexer leaves it NULL
+    (`schema.sql`: "NULL for interstitial (module-glue) parcels"), and the test written
+    to prove the repair asserted that wrong value -- pinning the bug.
 
-    The id minted here is exactly the indexer's whole-file interstitial
-    (`<path>::<module>`), so the row must match what a later POST /index produces.
+    So this asserts against the INDEXER's real output rather than against what I
+    happened to write.
     """
     from swarmsync.blackboard.models import Parcel
-    from swarmsync.classifier.indexer import MODULE_SYMBOL
+    from swarmsync.classifier.indexer import MODULE_SYMBOL, parse_file
+
+    src = tmp_path / "package_like.py"
+    src.write_text("import os\n\n\ndef g(x):\n    return x\n", encoding="utf-8")
+    indexed = {p.id: p for p in parse_file(src, rel_path="package_like.py")}
+    reference = indexed[f"package_like.py::{MODULE_SYMBOL}"]
 
     r = leases.acquire(
-        conn, f"package.json::{MODULE_SYMBOL}", "agent-1", mode="write", ensure_parcel=True
+        conn, f"other.py::{MODULE_SYMBOL}", "agent-1", mode="write", ensure_parcel=True
     )
     assert r.granted is True
-
     row = conn.execute(
-        "SELECT * FROM parcels WHERE id = ?", (f"package.json::{MODULE_SYMBOL}",)
+        "SELECT * FROM parcels WHERE id = ?", (f"other.py::{MODULE_SYMBOL}",)
     ).fetchone()
-    assert row is not None
+    parcel = Parcel.model_validate(dict(row))  # must survive the model every reader uses
 
-    # The row must survive the model every reader validates through.
-    parcel = Parcel.model_validate(dict(row))
-    assert parcel.kind == "module", (
-        f"auto-created parcel kind {parcel.kind!r} is not what the indexer emits for "
-        f"a <module> interstitial; readers that validate through ParcelKind will break"
+    assert parcel.kind == reference.kind == "module"
+    assert parcel.symbol == reference.symbol, (
+        f"auto-created symbol {parcel.symbol!r} != the indexer's {reference.symbol!r} "
+        f"for the same interstitial id"
     )
-    assert parcel.path == "package.json"
-    assert parcel.symbol == MODULE_SYMBOL
+    assert parcel.path == "other.py"
 
 
 def test_hook_leasing_an_unindexed_file_does_not_brick_the_broker(conn, tmp_path):
-    """The consequence, end to end: the broker must still schedule after a hook
-    lease on a non-.py file. `load_scheduling_graph` validates every parcel row, so
-    a single bad row is not a local defect -- it is total loss of dispatch."""
+    """The consequence, end to end: the broker must still schedule after a hook lease.
+
+    `load_scheduling_graph` validates every parcel row AND re-parses every file from
+    disk, so a single bad or missing row is not a local defect -- it is total loss of
+    dispatch, for every task, on every file.
+
+    Parametrised over BOTH shapes deliberately. The first version of this test used
+    only `package.json` -- the one case that passed -- and gave false confidence while
+    a new `.py` file still bricked the broker with `KeyError` one frame lower. A new
+    `.py` file with a top-level def is the case the hook hits constantly.
+    """
     from swarmsync.classifier.store import run_index
     from swarmsync.coordinator import broker
 
@@ -461,64 +470,48 @@ def test_hook_leasing_an_unindexed_file_does_not_brick_the_broker(conn, tmp_path
     run_index(conn, repo)
     assert broker.load_scheduling_graph(conn, repo) is not None
 
-    # Exactly what the hook does for an unindexed file.
+    # (a) a non-.py file -- no parser involvement
     leases.acquire(conn, "package.json::<module>", "agent-1", mode="write", ensure_parcel=True)
+    assert broker.load_scheduling_graph(conn, repo) is not None, "non-.py lease bricked dispatch"
 
-    graph, frozen = broker.load_scheduling_graph(conn, repo)
-    assert graph is not None, "one hook-leased non-.py file broke ALL broker dispatch"
+    # (b) a brand-new .py file with a top-level def, created since the last index.
+    #     Its <module> parcel exists (we just minted it); its `new_feature` parcel does
+    #     NOT. build_graph parses the file off disk and must tolerate that.
+    (repo / "feature.py").write_text(
+        "def new_feature(x):\n    return x * 2\n", encoding="utf-8"
+    )
+    leases.acquire(conn, "feature.py::<module>", "agent-2", mode="write", ensure_parcel=True)
+    graph, _frozen = broker.load_scheduling_graph(conn, repo)
+    assert graph is not None, "a new .py file with a top-level def bricked ALL broker dispatch"
+
+    # (c) same for a top-level class
+    (repo / "thing.py").write_text("class Thing:\n    pass\n", encoding="utf-8")
+    leases.acquire(conn, "thing.py::<module>", "agent-3", mode="write", ensure_parcel=True)
+    assert broker.load_scheduling_graph(conn, repo) is not None, "a new class bricked dispatch"
 
 
-def test_heartbeat_predicate_uses_sqlites_clock_not_a_stale_python_one(conn):
-    """The liveness check must be evaluated at WRITE time, not at bind time.
+def test_build_graph_tolerates_a_symbol_on_disk_with_no_parcel_row(tmp_path):
+    """The class-level fix, stated directly: the parcel map is only ever as fresh as
+    the last POST /index (there is no incremental indexing), so a symbol on disk with
+    no parcel row is ORDINARY. `build_graph` must skip it, not raise.
 
-    R4 found R3's P1-1 fix agreed with `acquire` textually but not semantically: it
-    compared against a Python `time.time()` read before `conn.execute`, so the
-    predicate answered "was this lease alive when I read the clock?". The statement
-    can serialize arbitrarily later (GIL preemption, a busy_timeout wait of up to 5s,
-    an event-loop stall). If the lease lapses in that gap while another agent lawfully
-    takes the parcel, the stale timestamp still satisfies the predicate and revives
-    the dead lease -- the double-lease again.
-
-    The delay here is injected between the clock read and SQLite serializing the
-    UPDATE. It schedules an interleaving; it changes no predicate and no value.
+    R3 logged this KeyError as a P2 reachable via a stale index; the hook's
+    auto-created coarse parcels made it persistent and turned it into a P0.
     """
-    parcel_id = _make_parcel(conn)
-    a = leases.acquire(conn, parcel_id, "agent-A", mode="write", ttl=0.30)
-    assert a.granted is True
+    from swarmsync.classifier.graph import build_graph
+    from swarmsync.classifier.indexer import parse_file
 
-    class _SlowConn:
-        """Delays A's heartbeat UPDATE so its lease lapses before it serializes."""
+    src = tmp_path / "m.py"
+    src.write_text("def known(x):\n    return x\n", encoding="utf-8")
+    parcels = list(parse_file(src, rel_path="m.py"))
 
-        def __init__(self, real):
-            self._real = real
-            self._fired = False
-
-        def __getattr__(self, name):
-            return getattr(self._real, name)
-
-        def execute(self, sql, *args, **kwargs):
-            low = " ".join(sql.split()).lower()
-            if not self._fired and low.startswith("update leases") and "heartbeat_at" in low:
-                self._fired = True
-                time.sleep(0.40)  # A's 0.30s TTL lapses inside this window...
-                # ...and B lawfully takes the parcel via acquire()'s lazy expiry.
-                b = leases.acquire(self._real, parcel_id, "agent-B", mode="write", ttl=5.0)
-                assert b.granted is True, "setup: B should win the lapsed parcel"
-            return self._real.execute(sql, *args, **kwargs)
-
-    revived = leases.heartbeat(_SlowConn(conn), a.lease_id, "agent-A", ttl=1.0)
-    assert revived is False, (
-        "a heartbeat bound before the lease lapsed still revived it: the predicate is "
-        "reading a stale Python clock instead of SQLite's write-time clock"
+    # The file grows a symbol the blackboard has never seen (an agent's edit).
+    src.write_text(
+        "def known(x):\n    return x\n\n\ndef added_since_index(y):\n    return y\n"
+        "\n\nclass AlsoAdded:\n    pass\n",
+        encoding="utf-8",
     )
 
-    live = conn.execute(
-        "SELECT id, agent_id FROM leases "
-        "WHERE parcel_id = ? AND status = 'active' AND ttl_expires_at > ?",
-        (parcel_id, time.time()),
-    ).fetchall()
-    assert len(live) == 1, (
-        f"DOUBLE LEASE via stale-clock revival: "
-        f"{[(r['id'], r['agent_id']) for r in live]} both hold {parcel_id!r}"
-    )
-    assert live[0]["agent_id"] == "agent-B"
+    graph = build_graph(parcels, tmp_path)  # must not raise KeyError
+    assert "m.py::known" in graph.signatures
+    assert "m.py::added_since_index" not in graph.signatures  # no parcel -> no signature

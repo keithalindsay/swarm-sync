@@ -50,7 +50,6 @@ import time
 from typing import Optional
 
 from swarmsync.blackboard.models import LeaseMode, LeaseResult
-from swarmsync.classifier.indexer import MODULE_SYMBOL
 from swarmsync.server.events import emit as _emit
 
 DEFAULT_TTL_SECONDS = 30.0
@@ -83,27 +82,32 @@ def _ensure_parcel(conn: sqlite3.Connection, parcel_id: str) -> None:
     handed arbitrary real files by a human's agent and must coordinate whatever it
     gets.
 
-    `kind='module'` is deliberate and load-bearing. This mints exactly the id the
-    indexer itself uses for a whole-file parcel (`<path>::<module>`, MODULE_SYMBOL),
-    and the indexer records that synthetic interstitial as `kind="module"` -- so this
-    row must be indistinguishable from the one a later `POST /index` would produce
-    for the same file. `ParcelKind` is `Literal["function","method","class","module"]`
-    and every read path validates through it: `broker.load_scheduling_graph` does
-    `SELECT * FROM parcels` and `Parcel.model_validate`s EVERY row, so a row with an
-    out-of-enum kind (an earlier version of this wrote `'file'`) raises
-    ValidationError and stops the broker scheduling ANY task, for any file --
-    one hook edit to one package.json would brick the whole coordinator.
+    The row is written to match what `POST /index` produces for the SAME id, field by
+    field, because a later re-index must heal it rather than collide with it, and
+    every reader validates it through the same model:
+
+    - `kind='module'`: this mints exactly the indexer's whole-file interstitial id
+      (`<path>::<module>`), which `indexer.parse_file` records as `kind="module"`.
+      `ParcelKind` is `Literal["function","method","class","module"]` and
+      `broker.load_scheduling_graph` `Parcel.model_validate`s EVERY row it selects, so
+      an out-of-enum kind (an earlier version wrote `'file'`) raised ValidationError
+      and stopped the broker scheduling ANY task, for any file.
+    - `symbol=NULL`: the indexer leaves the interstitial's symbol NULL, per
+      `schema.sql`'s own "NULL for interstitial (module-glue) parcels". Writing the
+      literal `'<module>'` here made the row disagree with both.
+
+    `content_hash` and the byte span are deliberately left NULL: this parcel exists to
+    be LEASED, and nothing has parsed the file. A real `POST /index` fills them in.
     """
-    path, _, symbol = parcel_id.partition("::")
+    path, _, _symbol = parcel_id.partition("::")
     conn.execute(
         """
         INSERT OR IGNORE INTO parcels (id, path, kind, symbol, updated_at)
-        VALUES (:id, :path, 'module', :symbol, :now)
+        VALUES (:id, :path, 'module', NULL, :now)
         """,
         {
             "id": parcel_id,
             "path": path,
-            "symbol": symbol or MODULE_SYMBOL,
             "now": time.time(),
         },
     )
