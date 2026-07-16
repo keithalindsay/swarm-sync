@@ -3,8 +3,10 @@
 Built in Unit U6.
 
 emit(conn, type_, agent_id=None, payload=None, ts=None) -> seq
-    Insert into `events` (autoincrement seq, ts=now unless given). Payload is
-    JSON-serialized. `type_` must be one of `blackboard.models.EventType`'s
+    Insert into `events` (autoincrement seq, ts=now unless given) and return the
+    new row's `seq` read straight off `INSERT ... RETURNING seq` (not the
+    per-connection `cur.lastrowid`, which races under concurrent emits -- see the
+    inline note). Payload is JSON-serialized. `type_` must be one of `blackboard.models.EventType`'s
     literal values -- catches typos the same way `leases.acquire` rejects an
     unrecognized lease mode. This is the single write path every other module
     (leases, agent runner, coordinator) should funnel through so `events` really
@@ -64,8 +66,17 @@ def emit(
     if type_ not in _VALID_EVENT_TYPES:
         raise ValueError(f"unrecognized event type: {type_!r}")
 
+    # RETURNING seq (not `cur.lastrowid`): mirrors `leases.acquire`'s
+    # `RETURNING id`. `cur.lastrowid` is backed by `sqlite3_last_insert_rowid()`,
+    # a per-CONNECTION value read after the GIL is re-acquired post-`step`; under
+    # concurrent emits on the one shared connection (the broker's parallel
+    # waves), another thread's INSERT can land in that window and this call would
+    # return the WRONG seq -- two distinct events reporting the same seq, silently
+    # corrupting the replay log's identity. Reading `seq` straight off this
+    # statement's own RETURNING result set is immune to that race.
     cur = conn.execute(
-        "INSERT INTO events (agent_id, type, payload, ts) VALUES (?, ?, ?, ?)",
+        "INSERT INTO events (agent_id, type, payload, ts) VALUES (?, ?, ?, ?) "
+        "RETURNING seq",
         (
             agent_id,
             type_,
@@ -73,7 +84,7 @@ def emit(
             ts if ts is not None else time.time(),
         ),
     )
-    return cur.lastrowid
+    return cur.fetchone()["seq"]
 
 
 def tail(

@@ -67,6 +67,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import os
 import socket
 import subprocess
 import sys
@@ -655,6 +656,11 @@ def run_demo(workdir: Optional[Path] = None, keep: bool = False) -> dict[str, An
     reporter = _Reporter()
     own_workdir = workdir is None
     workdir = Path(workdir) if workdir is not None else Path(tempfile.mkdtemp(prefix="swarm-sync-demo-"))
+    # SWARMSYNC_ROOTS (the /index + /integrate managed-roots allow-list) defaults to
+    # the server's cwd, but the demo builds its repo under a temp workdir. Self-configure
+    # the allow-list to that workdir so standalone `python demo/run_demo.py` works out of
+    # the box; an explicitly-set SWARMSYNC_ROOTS (e.g. from a test) still wins.
+    os.environ.setdefault("SWARMSYNC_ROOTS", os.path.realpath(workdir))
     server: Optional[_ServerThread] = None
 
     try:

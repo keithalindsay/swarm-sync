@@ -164,9 +164,15 @@ CREATE TABLE events (
 );
 ```
 
-The **`events` table is the pheromone trail and the source of truth for recovery**: the projection tables
-(parcels/leases/pheromone) can be rebuilt by replaying it. The load-bearing stigmergic signal is
-`parcels.state_summary` — the live semantic reality every agent reads before acting.
+The **`events` table is the pheromone trail and the source of truth for recovery of leases and
+pheromone**: `leases` and `pheromone` are pure projections of the event log (grants, releases, reaps,
+heartbeats, decay) and can be rebuilt by replaying it. **`parcels` and `contracts` are NOT
+event-replayable** — they hold derived facts about the *current source on disk* (byte spans,
+`content_hash`, `blast_radius`, signatures) that the event log never carries; recovering them means
+re-running the classifier (`POST /index` / `classifier.store.run_index`) against the live worktree, not
+replaying history. See §6's failure-handling table for the full recovery story. The load-bearing
+stigmergic signal is `parcels.state_summary` — the live semantic reality every agent reads before
+acting.
 
 ### 4.2 Operations (HTTP/JSON, `server/app.py`)
 
@@ -222,10 +228,25 @@ WHERE NOT EXISTS (
 exclusive are mutually exclusive. This is the safety net that makes trusting the planner's predicted
 touch-sets acceptable: a misprediction that double-targets a parcel simply loses the race and serializes.
 
-### 5.3 Contract freeze (prevention of the worst case)
-A frozen contract's signature can't be changed under a dependent. To modify one, an agent must take an
-**exclusive** lease on it and emit a `contract_change` event; the coordinator marks dependent parcels
-`stale` and their agents re-read the contract and re-plan instead of being silently broken.
+### 5.3 Contract freeze (detection, not prevention — POST-merge)
+**This is weaker than "prevention" and the implementation matches that, not the earlier draft's
+promise of a pre-merge broadcast.** An agent changing a frozen signature holds only the same
+**write/exclusive parcel lease** any edit requires (§5.2) — there is no separate "exclusive contract
+lease" step, and nothing stops the change from landing. Detection happens in the **integrator**
+(`coordinator/integrator.py`), *after* the merge has already gone through: bracketing the post-merge
+re-index (§5.4 step 4), it snapshots `contracts.type_hash` for every touched symbol **before**
+re-indexing and diffs it against the value **after**. Only a genuine, landed type_hash change emits
+`contract_change` (old/new signature + version) — never an agent's own self-report, which would be
+exactly the "lying blackboard" case §6 rejects.
+
+**The weaker guarantee this implies:** there is no proactive "mark dependent parcels `stale`" step —
+dependents are not pushed a notice at the moment the change is decided. A dependent only learns of the
+break by observing the `contract_change` event on its own (polling `GET /events`, or by opting into the
+integrator's `expected_read_deps` optimistic re-check at its *own* integrate time, §5.5). Between the
+change landing on trunk and a dependent noticing it, that dependent's in-flight work is silently
+building against a stale signature; the test gate (§5.4) is the backstop that eventually catches a
+resulting break, not this mechanism. Money-shot #3 demonstrates the happy path (a dependent that does
+poll and re-plans in time), not a guarantee that every dependent will.
 
 ### 5.4 Serial test-gated integrator (detection + resolution)
 Merges are serialized through one integrator (`coordinator/integrator.py`). For each submitted branch:
@@ -250,9 +271,10 @@ read-dependencies. A mismatch means a dependency shifted mid-work → forced reb
 | **Hot-parcel starvation** | A high-blast-radius parcel everyone needs serializes work. Frozen contracts let *readers* proceed without a write-lease; writers queue. Parallelism degrades toward serial but stays **correct**. |
 | **Classifier miss** (dynamic dispatch, reflection, string imports defeat the static graph) | Conservative fallback: when the AST is uncertain about a symbol's boundaries or references, the parcel falls back to **file** granularity, and the test gate is the backstop. |
 | **Lying blackboard** (agent writes a stale/wrong summary) | The integrator **regenerates** `state_summary` deterministically on merge; agent-written summaries are advisory only. |
-| **Blackboard SPOF / corruption** | SQLite WAL durability + the append-only `events` log allow full replay/rebuild; single-writer server avoids write contention. |
-| **Coordinator/server crash** | All state is in the durable DB + git; on restart the active-lease set and queue rebuild idempotently from `leases`/`events` + live branch heads. |
+| **Blackboard SPOF / corruption** | SQLite WAL durability + the append-only `events` log allow recovery, but the recovery path is **not** a uniform "replay everything": **leases and pheromone are event-replayable** (both are pure projections of `events` — grants/releases/reaps/heartbeats/decay — and rebuild by replaying it); **parcels and contracts are NOT** — they hold derived facts about the current on-disk source (spans, `content_hash`, `blast_radius`, signatures) that the event log doesn't carry, so recovering them means **re-running the classifier** (`POST /index`) against the live worktree, not replaying history. Single-writer server avoids write contention. |
+| **Coordinator/server crash** | On restart: replay `events` to rebuild the active-lease set and pheromone (see above), and re-run the classifier over the repo to repopulate `parcels`/`contracts`; git worktree state on disk is authoritative for the rest, so nothing here trusts staleness in the DB. |
 | **Lease livelock on a hot parcel** | Bounded retries with backoff, then escalate to a FIFO exclusive lease so contenders serialize instead of spinning. |
+| **Multi-host deployment** | Out of scope, not merely undocumented: the blackboard is a **single SQLite file** referenced by filesystem path (`SWARM_SYNC_DB`/`--db`), and every agent's git worktree (`worktree/git_ops.py`) is a plain directory under the repo's `.git`. Both assume one shared filesystem and one host. There is no network-attached DB, no distributed lock, and no cross-host worktree sharing — running agents across multiple machines against the "same" blackboard is unsupported and will not serialize correctly (SQLite's WAL locking guarantees hold only for local-filesystem access, not NFS/network mounts). |
 
 ## 7. The end-to-end demo the prototype MUST show
 

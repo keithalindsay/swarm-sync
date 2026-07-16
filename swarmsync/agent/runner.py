@@ -121,6 +121,23 @@ class _Heartbeater:
             self._thread.join(timeout=self._interval + 1.0)
 
 
+def _cleanup_worktree(repo: Path, agent_id: str) -> None:
+    """Best-effort teardown of this agent's worktree + branch (S5).
+
+    Called from a `finally` after integrate/release on the done path, and on the
+    lease_denied path, so a completed/abandoned agent never leaks its
+    `.worktrees/<agent_id>` dir or its `<agent_id>` branch -- reruns with the same
+    agent_id don't collide or accumulate orphans. Swallows `GitOpsError` (there
+    may be nothing to remove -- e.g. lease_denied created no worktree) so cleanup
+    never turns into the reason a run fails. A landed merge's commits already live
+    in trunk's history, so deleting the now-redundant branch ref loses nothing.
+    """
+    try:
+        git_ops.remove_worktree(repo, agent_id, delete_branch=True)
+    except git_ops.GitOpsError:
+        pass
+
+
 def _state_summary(parcel, task: str) -> str:
     """A lightweight, deterministic note: `kind + signature-ish info + changed-
     line count` (DESIGN §2). This is only the agent's ADVISORY self-report --
@@ -200,6 +217,9 @@ def run_agent(
         if not result.get("granted"):
             for held_parcel_id, lease_id in lease_ids.items():
                 client.release(agent_id, lease_id)
+            # S5: prune any worktree/branch this agent_id leaked on a PRIOR run
+            # before backing off, so a later rerun starts clean.
+            _cleanup_worktree(repo, agent_id)
             return AgentResult(
                 agent_id=agent_id,
                 task=task,
@@ -222,48 +242,58 @@ def run_agent(
         heartbeater.add(lease_id)
     heartbeater.start()
 
+    # Everything from here owns a worktree; the outer `finally` tears it (and the
+    # branch) down after integrate/release -- and on any mid-way failure too --
+    # so nothing leaks for a rerun to collide with (S5).
     try:
         # 5. isolated worktree + the scripted (or real) edit.
-        worktree = git_ops.add_worktree(repo, agent_id, base_commit)
-        mutator(worktree, **mutator_kwargs)
-        commit_sha = git_ops.commit_all(worktree, f"{agent_id}: {task}")
-    finally:
-        heartbeater.stop()
+        try:
+            worktree = git_ops.add_worktree(repo, agent_id, base_commit)
+            mutator(worktree, **mutator_kwargs)
+            commit_sha = git_ops.commit_all(worktree, f"{agent_id}: {task}")
+        finally:
+            heartbeater.stop()
 
-    # 6. re-derive each touched parcel's real content_hash from the committed
-    # worktree (never trust a self-reported hash) and post it + a deterministic
-    # summary; submit the branch to the integrator; release every lease held.
-    updated_parcels: dict[str, str] = {}
-    for parcel_id in target_parcels:
-        path, _, _symbol = parcel_id.partition("::")
-        fresh_parcels = parse_file(worktree / path, rel_path=path)
-        match = next((p for p in fresh_parcels if p.id == parcel_id), None)
-        if match is None:
-            # The mutator removed/renamed the symbol entirely -- nothing to
-            # post for this parcel id; leave it out of updated_parcels rather
-            # than posting a stale/None hash.
-            continue
-        client.parcel_update(
-            agent_id, parcel_id, match.content_hash, _state_summary(match, task)
+        # 6. re-derive each touched parcel's real content_hash from the committed
+        # worktree (never trust a self-reported hash) and post it + a
+        # deterministic summary; submit the branch to the integrator; release
+        # every lease held.
+        updated_parcels: dict[str, str] = {}
+        for parcel_id in target_parcels:
+            path, _, _symbol = parcel_id.partition("::")
+            fresh_parcels = parse_file(worktree / path, rel_path=path)
+            match = next((p for p in fresh_parcels if p.id == parcel_id), None)
+            if match is None:
+                # The mutator removed/renamed the symbol entirely -- nothing to
+                # post for this parcel id; leave it out of updated_parcels rather
+                # than posting a stale/None hash.
+                continue
+            # `parse_file` always populates content_hash; typeshed/model types it
+            # Optional (schema allows NULL), so pin the invariant for the str API.
+            assert match.content_hash is not None
+            client.parcel_update(
+                agent_id, parcel_id, match.content_hash, _state_summary(match, task)
+            )
+            updated_parcels[parcel_id] = match.content_hash
+
+        integrate_result = client.integrate(
+            agent_id, branch=agent_id, repo=str(repo), base_commit=base_commit
         )
-        updated_parcels[parcel_id] = match.content_hash
 
-    integrate_result = client.integrate(
-        agent_id, branch=agent_id, repo=str(repo), base_commit=base_commit
-    )
+        for lease_id in lease_ids.values():
+            client.release(agent_id, lease_id)
 
-    for lease_id in lease_ids.values():
-        client.release(agent_id, lease_id)
-
-    return AgentResult(
-        agent_id=agent_id,
-        task=task,
-        status="done",
-        branch=agent_id,
-        commit_sha=commit_sha,
-        lease_ids=lease_ids,
-        updated_parcels=updated_parcels,
-        contract_snapshot=contract_snapshot,
-        integrate_result=integrate_result,
-        lease_modes_used=lease_modes_used,
-    )
+        return AgentResult(
+            agent_id=agent_id,
+            task=task,
+            status="done",
+            branch=agent_id,
+            commit_sha=commit_sha,
+            lease_ids=lease_ids,
+            updated_parcels=updated_parcels,
+            contract_snapshot=contract_snapshot,
+            integrate_result=integrate_result,
+            lease_modes_used=lease_modes_used,
+        )
+    finally:
+        _cleanup_worktree(repo, agent_id)

@@ -8,7 +8,6 @@ Done when:
 """
 from __future__ import annotations
 
-from pathlib import Path
 
 import pytest
 
@@ -133,3 +132,67 @@ def test_merge_nonexistent_branch_raises_git_ops_error(repo):
     r, base = repo
     with pytest.raises(git_ops.GitOpsError):
         git_ops.merge_branch(r, "no-such-branch", into="integration")
+
+
+# --- S2 regression: option-injection via a leading-'-' ref/branch/path ------------
+
+
+def test_merge_branch_rejects_option_like_branch_before_running_git(repo, monkeypatch):
+    """A branch named like a git option (`--upload-pack=...`) must be REJECTED,
+    never handed to git. Before the guard, `shell=False` did not help: git parses
+    a leading-'-' argv entry as an OPTION, so the value would be executed as a
+    flag rather than treated as a branch name.
+    """
+    r, base = repo
+
+    ran = []
+    real_run = git_ops._run
+    monkeypatch.setattr(
+        git_ops, "_run", lambda *a, **k: (ran.append(a[0]), real_run(*a, **k))[1]
+    )
+
+    with pytest.raises(git_ops.GitOpsError, match="begins with '-'"):
+        git_ops.merge_branch(r, "--upload-pack=touch /tmp/pwned", into="integration")
+
+    # Rejected up front -- not a single git subprocess was spawned.
+    assert ran == []
+
+
+def test_add_worktree_rejects_option_like_name(repo):
+    r, base = repo
+    with pytest.raises(git_ops.GitOpsError, match="begins with '-'"):
+        git_ops.add_worktree(r, "--output=/tmp/pwned", base)
+    # nothing was created for the rejected name
+    assert not (r / ".worktrees" / "--output=/tmp/pwned").exists()
+
+
+def test_add_worktree_rejects_option_like_base_commit(repo):
+    r, base = repo
+    with pytest.raises(git_ops.GitOpsError, match="begins with '-'"):
+        git_ops.add_worktree(r, "agentX", "--upload-pack=evil")
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda r, base: git_ops.current_commit(r, "--not-a-ref"),
+        lambda r, base: git_ops.changed_files(r, "--evil", base),
+        lambda r, base: git_ops.reset_hard(r, "--evil"),
+        lambda r, base: git_ops.init_repo(r / "sub", initial_branch="-x"),
+    ],
+)
+def test_git_ops_reject_option_like_user_args(repo, call):
+    r, base = repo
+    with pytest.raises(git_ops.GitOpsError, match="begins with '-'"):
+        call(r, base)
+
+
+def test_normal_branch_names_still_work_after_hardening(repo):
+    """The guard must not regress ordinary usage: a plain branch still merges."""
+    r, base = repo
+    wt = git_ops.add_worktree(r, "agentOK", base)
+    (wt / "fileA.txt").write_text("edited-by-agentOK\n")
+    git_ops.commit_all(wt, "agentOK edits fileA")
+    ok, conflicts = git_ops.merge_branch(r, "agentOK", into="integration")
+    assert ok is True and conflicts == []
+    assert (r / "fileA.txt").read_text() == "edited-by-agentOK\n"

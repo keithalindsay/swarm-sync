@@ -7,7 +7,10 @@ Core API:
   parse_file(path, rel_path=None) -> list[Parcel]
     - AST-walk one module; emit a Parcel for every top-level def/async def/class and
       every method inside a class, plus one synthetic module interstitial.
-  index_repo(root) -> list[Parcel]        # walk all *.py under root
+  index_repo(root) -> list[Parcel]        # walk all *.py under root; a single
+                                          # unparseable file is skipped-and-logged
+                                          # (OSError/SyntaxError/UnicodeDecodeError),
+                                          # never aborting the whole index.
 
 GRANULARITY: emit at symbol granularity, but the ENFORCED lease granularity is chosen
 in graph.py / server config and defaults to FILE (see DESIGN §2 de-risking). Keep the
@@ -32,11 +35,14 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import logging
 import time
 from pathlib import Path
 from typing import Optional, Union
 
 from swarmsync.blackboard.models import Parcel
+
+logger = logging.getLogger(__name__)
 
 StrPath = Union[str, Path]
 
@@ -44,6 +50,17 @@ MODULE_SYMBOL = "<module>"
 
 # Directory name fragments to never descend into when walking a repo tree.
 _SKIP_DIRS = {"__pycache__", ".git", ".venv", "venv", ".pytest_cache", "node_modules"}
+
+# S3 security: bound the `index_repo` walk so a caller cannot make `POST /index`
+# spin forever / exhaust memory on a pathologically large (or symlink-inflated)
+# tree. Generous enough that no real prototype repo (sample_repo, the fixtures,
+# the demo copies) comes close, so this never changes existing behavior.
+DEFAULT_MAX_INDEX_FILES = 5000
+DEFAULT_MAX_INDEX_SECONDS = 30.0
+
+
+class IndexLimitError(RuntimeError):
+    """Raised when an `index_repo` walk exceeds its file-count or wall-clock cap."""
 
 
 def _line_start_offsets(source: bytes) -> list[int]:
@@ -67,7 +84,7 @@ def _abs_offset(line_offsets: list[int], lineno: int, col_offset: int) -> int:
     return line_offsets[lineno - 1] + col_offset
 
 
-def _decorated_start(node: ast.AST, source_lines: list[bytes], line_offsets: list[int]) -> int:
+def _decorated_start(node: ast.stmt, source_lines: list[bytes], line_offsets: list[int]) -> int:
     """Byte offset of the start of `node`, extended back over any decorators
     (including the leading '@') so a decorated def/class is one parcel.
 
@@ -85,8 +102,11 @@ def _decorated_start(node: ast.AST, source_lines: list[bytes], line_offsets: lis
     return line_offsets[first.lineno - 1] + at_idx
 
 
-def _node_span(node: ast.AST, source_lines: list[bytes], line_offsets: list[int]) -> tuple[int, int]:
+def _node_span(node: ast.stmt, source_lines: list[bytes], line_offsets: list[int]) -> tuple[int, int]:
     start = _decorated_start(node, source_lines, line_offsets)
+    # `ast.parse` always populates end positions on real statement nodes (Python 3.8+);
+    # typeshed types them Optional, so pin the invariant explicitly for the byte-offset math.
+    assert node.end_lineno is not None and node.end_col_offset is not None
     end = _abs_offset(line_offsets, node.end_lineno, node.end_col_offset)
     return start, end
 
@@ -217,16 +237,46 @@ def _is_skipped(rel_parts: tuple[str, ...]) -> bool:
     return any(part in _SKIP_DIRS or part.startswith(".") for part in rel_parts)
 
 
-def index_repo(root: StrPath) -> list[Parcel]:
+def index_repo(
+    root: StrPath,
+    *,
+    max_files: int = DEFAULT_MAX_INDEX_FILES,
+    max_seconds: float = DEFAULT_MAX_INDEX_SECONDS,
+) -> list[Parcel]:
     """Walk `root` for every `.py` file (skipping VCS/venv/cache dirs) and return
     the concatenation of `parse_file` over all of them, with each parcel's `path`
-    recorded relative to `root` (POSIX-style, stable across machines)."""
+    recorded relative to `root` (POSIX-style, stable across machines).
+
+    S3 security: the walk is bounded -- it raises `IndexLimitError` once it has
+    considered more than `max_files` candidate `.py` files or spent more than
+    `max_seconds` wall-clock, so a caller-supplied `root` cannot turn `POST /index`
+    into an unbounded CPU/memory sink."""
     root_path = Path(root).resolve()
+    deadline = time.monotonic() + max_seconds
+    considered = 0
     parcels: list[Parcel] = []
     for py_file in sorted(root_path.rglob("*.py")):
         rel_path_obj = py_file.relative_to(root_path)
         if _is_skipped(rel_path_obj.parts[:-1]):
             continue
+        considered += 1
+        if considered > max_files:
+            raise IndexLimitError(
+                f"index walk of {root_path} exceeded max_files={max_files}"
+            )
+        if time.monotonic() > deadline:
+            raise IndexLimitError(
+                f"index walk of {root_path} exceeded max_seconds={max_seconds}"
+            )
         rel = rel_path_obj.as_posix()
-        parcels.extend(parse_file(py_file, rel_path=rel))
+        # Skip-and-log a single unreadable/unparseable file instead of aborting
+        # the whole index, mirroring build_graph's per-file guard: one malformed
+        # `.py` (syntax error, invalid encoding, vanished/permission-denied file)
+        # must not stop the rest of the repo from being indexed. The test gate is
+        # the backstop for a genuinely broken file (DESIGN §6 "classifier miss").
+        try:
+            parcels.extend(parse_file(py_file, rel_path=rel))
+        except (OSError, SyntaxError, UnicodeDecodeError) as exc:
+            logger.warning("skipping unparseable file %s: %s", rel, exc)
+            continue
     return parcels

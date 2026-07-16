@@ -7,6 +7,14 @@ isolation is git's, not ours. Merge-time reconciliation is a separate, later con
 (DESIGN §5.4, the serial test-gated integrator, U10) -- this module only wraps the git
 plumbing that unit needs; it does no scheduling/locking/test-running itself.
 
+SECURITY: every user-derived ref/branch/path is checked by `_reject_option_like` before any
+git process starts -- a value beginning with '-' (e.g. a branch literally named
+`--upload-pack=<cmd>`) is refused, because git would otherwise parse it as an OPTION rather
+than data (argument injection, which `shell=False` does NOT prevent). As defense in depth,
+user-derived positionals are additionally fenced with `--end-of-options`/`--` separators on the
+argv (except `git rev-parse`, which echoes `--end-of-options` onto stdout -- there the leading-'-'
+rejection is the guard).
+
 API (thin subprocess wrappers around `git`, no shelling through a real shell -- every call is
 an argv list, never `shell=True`, so paths/branch names with spaces are safe):
   init_repo(path, initial_branch="integration") -> str        # git init + initial commit; returns its sha
@@ -33,6 +41,7 @@ touching the operator's global git config.
 """
 from __future__ import annotations
 
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Optional
@@ -45,6 +54,25 @@ class GitOpsError(RuntimeError):
     `(ok=False, conflict_paths)` from `merge_branch`. This is for everything else: a bad ref,
     a dirty worktree, git itself missing, etc.
     """
+
+
+def _reject_option_like(value: str, kind: str) -> str:
+    """Refuse any user-derived ref/branch/path that begins with '-'.
+
+    git parses a leading-'-' argument as an OPTION, not a positional, so an
+    attacker-chosen branch/ref/path like `--upload-pack=<cmd>` or `--output=...`
+    would be executed as a flag rather than treated as data (argument injection,
+    even with `shell=False`). We reject these up front -- before ANY git process
+    runs -- and additionally pass `--end-of-options`/`--` separators on the argv
+    below as defense in depth. An empty string is allowed through here (it is not
+    option-like); git itself rejects it as a bad ref where relevant.
+    """
+    if value is not None and str(value).startswith("-"):
+        raise GitOpsError(
+            f"refusing {kind} that begins with '-': {value!r} "
+            f"(git would parse it as an option, not a positional argument)"
+        )
+    return value
 
 
 def _run(
@@ -71,6 +99,7 @@ def init_repo(path: Path | str, initial_branch: str = "integration") -> str:
     never a worktree) IS the shared integration branch's working tree by construction --
     `merge_branch`'s own default `into="integration"` lands here with no extra setup.
     """
+    _reject_option_like(initial_branch, "initial branch name")
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
     _run(["git", "init", "-b", initial_branch], cwd=path)
@@ -85,6 +114,29 @@ def init_repo(path: Path | str, initial_branch: str = "integration") -> str:
     return current_commit(path)
 
 
+def _prune_stale_worktree(repo: Path, name: str, worktree_path: Path) -> None:
+    """Best-effort teardown of a leftover same-named worktree + branch so a
+    rerun's `git worktree add -b <name>` doesn't collide (S5 idempotency).
+
+    A prior run that crashed (or wasn't cleaned up) can leave any of: a
+    registered worktree, a stale worktree admin entry whose dir is already gone,
+    an orphaned on-disk dir git no longer tracks, and/or the branch. Every step
+    is `check=False` / `ignore_errors=True` -- if there is nothing to prune this
+    is a harmless no-op. `git worktree prune` only drops entries whose working
+    dir is MISSING, so a concurrently-added sibling worktree (its dir present) is
+    never affected -- safe under the broker's concurrent `add_worktree` calls.
+    """
+    _run(
+        ["git", "worktree", "remove", "--force", "--", str(worktree_path)],
+        cwd=repo,
+        check=False,
+    )
+    if worktree_path.exists():
+        shutil.rmtree(worktree_path, ignore_errors=True)
+    _run(["git", "worktree", "prune"], cwd=repo, check=False)
+    _run(["git", "branch", "-D", "--end-of-options", name], cwd=repo, check=False)
+
+
 def add_worktree(repo: Path | str, name: str, base_commit: str | None = None) -> Path:
     """Create an isolated worktree + branch `name` cut from `base_commit`.
 
@@ -92,13 +144,23 @@ def add_worktree(repo: Path | str, name: str, base_commit: str | None = None) ->
     (`<repo>/.worktrees/<name>`) -- a plain directory containing a full checkout on its own
     branch, per DESIGN §5.1: two agents in two worktrees can never collide at the filesystem
     level, even when they both touch the same source file.
+
+    IDEMPOTENT (S5): a stale same-named worktree/branch left by a prior (crashed
+    or un-cleaned) run is pruned first, so a rerun with the same agent_id/name
+    doesn't collide on `git worktree add -b` ("branch already exists" / "path
+    already exists") -- reruns don't leak or fail.
     """
+    _reject_option_like(name, "worktree/branch name")
     repo = Path(repo)
     if base_commit is None:
         base_commit = current_commit(repo)
+    _reject_option_like(base_commit, "base commit")
     worktree_path = repo / ".worktrees" / name
+    _prune_stale_worktree(repo, name, worktree_path)
+    # `--` after the options separates the positional <path> <commit-ish> from any
+    # further option parsing, so neither can be smuggled in as a flag.
     _run(
-        ["git", "worktree", "add", str(worktree_path), "-b", name, base_commit],
+        ["git", "worktree", "add", "-b", name, "--", str(worktree_path), base_commit],
         cwd=repo,
     )
     return worktree_path
@@ -111,11 +173,12 @@ def remove_worktree(repo: Path | str, name: str, delete_branch: bool = True) -> 
     branch is discarded"). Branch deletion is best-effort (`check=False`) -- it's cleanup, not
     a step whose failure should block the caller.
     """
+    _reject_option_like(name, "worktree/branch name")
     repo = Path(repo)
     worktree_path = repo / ".worktrees" / name
-    _run(["git", "worktree", "remove", "--force", str(worktree_path)], cwd=repo)
+    _run(["git", "worktree", "remove", "--force", "--", str(worktree_path)], cwd=repo)
     if delete_branch:
-        _run(["git", "branch", "-D", name], cwd=repo, check=False)
+        _run(["git", "branch", "-D", "--end-of-options", name], cwd=repo, check=False)
 
 
 def commit_all(worktree: Path | str, message: str, allow_empty: bool = False) -> str:
@@ -131,6 +194,10 @@ def commit_all(worktree: Path | str, message: str, allow_empty: bool = False) ->
 
 def current_commit(repo: Path | str, ref: str = "HEAD") -> str:
     """`git rev-parse ref`, stripped. Works against a main repo checkout or a worktree."""
+    # No `--end-of-options` here: `git rev-parse` ECHOES that marker onto stdout,
+    # which would corrupt the sha we parse back out. Rejecting a leading-'-' ref is
+    # the guard for this call instead.
+    _reject_option_like(ref, "ref")
     result = _run(["git", "rev-parse", ref], cwd=Path(repo))
     return result.stdout.strip()
 
@@ -141,7 +208,12 @@ def changed_files(repo: Path | str, branch: str, base: str) -> list[str]:
     Used by the integrator (U10) to resolve which parcels a merged branch actually touched,
     for impact test selection + re-indexing (DESIGN §5.4).
     """
-    result = _run(["git", "diff", "--name-only", f"{base}..{branch}"], cwd=Path(repo))
+    _reject_option_like(base, "base ref")
+    _reject_option_like(branch, "branch")
+    result = _run(
+        ["git", "diff", "--name-only", "--end-of-options", f"{base}..{branch}"],
+        cwd=Path(repo),
+    )
     return [line for line in result.stdout.splitlines() if line]
 
 
@@ -159,10 +231,14 @@ def reset_hard(repo: Path | str, commit: str, branch: Optional[str] = None) -> N
     invoke this immediately after `merge_branch`, which already leaves the
     working tree on `into`, so this is usually a no-op checkout).
     """
+    _reject_option_like(commit, "commit")
     repo = Path(repo)
     if branch is not None:
-        _run(["git", "checkout", branch], cwd=repo)
-    _run(["git", "reset", "--hard", commit], cwd=repo)
+        _reject_option_like(branch, "branch")
+        # `git checkout` does NOT accept `--end-of-options`; a trailing `--`
+        # separates the ref from any pathspec parsing instead.
+        _run(["git", "checkout", branch, "--"], cwd=repo)
+    _run(["git", "reset", "--hard", commit, "--"], cwd=repo)
 
 
 def merge_branch(
@@ -182,10 +258,18 @@ def merge_branch(
     (bad branch name, dirty tree, etc. -- no conflicted paths to show for it) raises
     `GitOpsError` instead of silently reporting `(False, [])`.
     """
+    _reject_option_like(into, "target branch")
+    _reject_option_like(branch, "branch")
     repo = Path(repo)
-    _run(["git", "checkout", into], cwd=repo)
+    # `git checkout` does not take `--end-of-options`; trailing `--` disambiguates.
+    _run(["git", "checkout", into, "--"], cwd=repo)
+    # `-m <msg>` must precede `--end-of-options`; everything after the marker is
+    # treated as a positional (the branch to merge), never as an option.
     result = _run(
-        ["git", "merge", "--no-ff", branch, "-m", f"merge {branch} into {into}"],
+        [
+            "git", "merge", "--no-ff", "-m", f"merge {branch} into {into}",
+            "--end-of-options", branch,
+        ],
         cwd=repo,
         check=False,
     )

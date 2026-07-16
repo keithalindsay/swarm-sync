@@ -8,13 +8,25 @@ U15 done when (BUILD_PLAN.md): the demo shows an agent changing a frozen
 signature (exclusive lease + `contract_change` event), a dependent agent
 observing it, re-reading the contract, and landing a call-site fix with tests
 green; money-shot #3 prints PASS and the full demo exits 0 with all five PASS.
+
+S6 note: the five in-process assertions below all read ONE session-scoped
+`run_demo(keep=True)` (the `demo_run` fixture) rather than each spinning up its
+own ~9s demo run -- the demo is deterministic, so a single run is authoritative
+for every angle these tests check. The literal `python demo/run_demo.py`
+subprocess done-when stays separate (it uniquely exercises `main()`'s stdout
+PASS-printing / real process exit code, which the in-process API never prints).
 """
 from __future__ import annotations
 
 import json
+import os
+import sqlite3
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RUN_DEMO = REPO_ROOT / "demo" / "run_demo.py"
@@ -23,16 +35,39 @@ sys.path.insert(0, str(REPO_ROOT / "demo"))
 import run_demo  # noqa: E402  (demo/ is not a package; path-inserted above)
 
 
+@pytest.fixture(scope="session")
+def demo_run(tmp_path_factory):
+    """Run the whole demo exactly ONCE per test session and hand every
+    in-process assertion below the same (result, workdir) pair.
+
+    This fixture is instantiated before the function-scoped `SWARMSYNC_ROOTS`
+    autouse fixture in conftest (a session fixture is set up before any
+    lower-scoped one it shares a test with), so the managed-root allow-list the
+    demo's `/index`+`/integrate` need is pinned here too. The workdir lives
+    under the system temp root, so pointing the allow-list at gettempdir()
+    covers it -- exactly the operator move conftest documents.
+    """
+    os.environ["SWARMSYNC_ROOTS"] = tempfile.gettempdir()
+    workdir = Path(tmp_path_factory.mktemp("demo-run"))
+    result = run_demo.run_demo(workdir=workdir, keep=True)
+    return result, workdir
+
+
 # --- the literal done-when: `python demo/run_demo.py` as a real subprocess ---------
 
 
 def test_run_demo_script_exits_zero_and_prints_pass_for_all_five_shots():
+    # Scrub SWARMSYNC_ROOTS from the child env: the conftest autouse fixture sets it
+    # process-wide, which would mask an out-of-the-box break. The documented invocation
+    # `python demo/run_demo.py` must work with NO pre-set allow-list (run_demo self-configures).
+    env = {k: v for k, v in os.environ.items() if k != "SWARMSYNC_ROOTS"}
     result = subprocess.run(
         [sys.executable, str(RUN_DEMO)],
         cwd=str(REPO_ROOT),
         capture_output=True,
         text=True,
         timeout=180,
+        env=env,
     )
     assert result.returncode == 0, (
         f"demo exited {result.returncode}\n--- stdout ---\n{result.stdout}\n"
@@ -50,24 +85,23 @@ def test_run_demo_script_exits_zero_and_prints_pass_for_all_five_shots():
     assert "ALL FIVE MONEY SHOTS PASS" in out
 
 
-# --- structured, in-process assertions via run_demo.run_demo() ---------------------
+# --- structured, in-process assertions -- all read the ONE `demo_run` fixture ------
 
 
-def test_run_demo_reports_all_shots_ok_and_touches_at_least_three_agents(tmp_path):
-    result = run_demo.run_demo(workdir=tmp_path / "demo-run", keep=True)
+def test_run_demo_reports_all_shots_ok_and_touches_at_least_three_agents(demo_run):
+    result, _workdir = demo_run
 
     assert result["all_ok"] is True
     for shot in ("shot1", "shot2", "shot3", "shot4", "shot5", "overall"):
         assert result["results"][shot] is True, f"{shot} did not pass: {result['results']}"
 
 
-def test_run_demo_lands_at_least_three_distinct_agents_worth_of_commits(tmp_path):
+def test_run_demo_lands_at_least_three_distinct_agents_worth_of_commits(demo_run):
     """DESIGN §7's own framing: "a run with >=3 concurrent agents on the sample
     repo." Assert the integration branch's git log actually shows >=3 distinct
     landed merge commits from >=3 distinct branches (agents), not just that the
     script printed PASS."""
-    workdir = tmp_path / "demo-run-2"
-    run_demo.run_demo(workdir=workdir, keep=True)
+    _result, workdir = demo_run
 
     repo = workdir / "repo"
     log = subprocess.run(
@@ -80,15 +114,12 @@ def test_run_demo_lands_at_least_three_distinct_agents_worth_of_commits(tmp_path
     assert len(branches) >= 3, f"expected >=3 distinct landed agent branches, got {branches!r}"
 
 
-def test_run_demo_has_zero_textual_merge_conflicts_in_its_event_log(tmp_path):
-    workdir = tmp_path / "demo-run-3"
-    result = run_demo.run_demo(workdir=workdir, keep=True)
+def test_run_demo_has_zero_textual_merge_conflicts_in_its_event_log(demo_run):
+    result, workdir = demo_run
     assert result["all_ok"] is True
 
     db_path = workdir / "blackboard.db"
     assert db_path.exists()
-
-    import sqlite3
 
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
@@ -103,9 +134,8 @@ def test_run_demo_has_zero_textual_merge_conflicts_in_its_event_log(tmp_path):
     assert "tests_failed" in reasons
 
 
-def test_run_demo_leaves_trunk_test_suite_green_at_the_end(tmp_path):
-    workdir = tmp_path / "demo-run-4"
-    result = run_demo.run_demo(workdir=workdir, keep=True)
+def test_run_demo_leaves_trunk_test_suite_green_at_the_end(demo_run):
+    result, workdir = demo_run
     assert result["all_ok"] is True
 
     repo = workdir / "repo"
@@ -119,20 +149,17 @@ def test_run_demo_leaves_trunk_test_suite_green_at_the_end(tmp_path):
 # --- U15: money-shot #3's own specifics (frozen-contract change + re-plan) ---------
 
 
-def test_run_demo_shot3_emits_contract_change_and_lands_dependent_fixes(tmp_path):
+def test_run_demo_shot3_emits_contract_change_and_lands_dependent_fixes(demo_run):
     """U15 done-when, checked directly against the blackboard/git state (not
     just the printed PASS lines): an exclusive-lease signature change on
     `calc.py::add` emits a real `contract_change` event carrying the old/new
     signature, and both real dependents' call-site fixes land on trunk."""
-    workdir = tmp_path / "demo-run-shot3"
-    result = run_demo.run_demo(workdir=workdir, keep=True)
+    result, workdir = demo_run
     assert result["all_ok"] is True
     assert result["results"]["shot3"] is True
 
     repo = workdir / "repo"
     db_path = workdir / "blackboard.db"
-
-    import sqlite3
 
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row

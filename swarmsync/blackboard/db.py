@@ -3,16 +3,28 @@
 Build in Unit U1. Responsibilities:
   - open a sqlite3 connection in WAL mode (PRAGMA journal_mode=WAL, foreign_keys=ON)
   - `init_db(path)`: execute schema.sql (idempotent CREATE TABLE IF NOT EXISTS)
-  - a single-writer connection helper; row_factory = sqlite3.Row
+  - `connect(path)`: open one more independent connection to the DB file
+  - `transaction(conn)`: run a multi-statement write batch as ONE crisp,
+    non-nesting transaction on a single connection
   - a `reset(path)` helper for tests
 
-Keep this the ONLY module that opens the DB file so single-writer semantics hold.
+**Connection model (S4).** WAL's promise is "one writer, many concurrent readers"
+-- but only *across separate connections*. A single process-wide connection shared
+by every request thread serializes on that one handle and gives away all of WAL's
+concurrency, and (worse) folds unrelated single-statement writers into whatever
+explicit transaction happens to be open on it (SQLite has exactly ONE transaction
+per connection). So callers that serve concurrent work open one connection **per
+request / per thread** via `connect()` (the server's `get_conn` dependency does
+exactly this): each such connection has its own transaction scope, real WAL reader
+concurrency, and no cross-talk. `init_db` remains the one-time schema bootstrap and
+also hands back a connection callers may keep for direct out-of-band inspection.
 """
 from __future__ import annotations
 
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Union
+from typing import Iterator, Union
 
 StrPath = Union[str, "Path"]
 
@@ -81,6 +93,41 @@ def init_db(path: StrPath) -> sqlite3.Connection:
     conn = connect(path)
     conn.executescript(SCHEMA)
     return conn
+
+
+@contextmanager
+def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """Run a multi-statement write batch as ONE transaction on `conn`.
+
+    Uses `BEGIN IMMEDIATE` (not the default deferred `BEGIN`) so the write lock is
+    taken up front: two writers can never each hold a read lock and then deadlock
+    trying to upgrade to a write under WAL -- the loser simply waits on
+    `busy_timeout`. On any exception the block `ROLLBACK`s and re-raises; otherwise
+    it `COMMIT`s.
+
+    Crucially, this transaction is scoped to THIS connection alone. Because the
+    server hands every request its own connection (see the module docstring), a
+    `ROLLBACK` here can only ever undo the statements this `with` block issued on
+    this connection -- it can never swallow a *concurrent single-statement writer*,
+    which runs on a different connection under its own autocommit transaction. The
+    `in_transaction` guard makes the "one transaction per connection" invariant
+    explicit: entering while a transaction is already open on `conn` is a bug (it
+    would silently make the outer writer's fate depend on this block's rollback),
+    so we refuse rather than nest.
+    """
+    if conn.in_transaction:
+        raise sqlite3.ProgrammingError(
+            "db.transaction(): connection is already inside a transaction; "
+            "one transaction per connection (open a separate connection instead)"
+        )
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield conn
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    else:
+        conn.execute("COMMIT")
 
 
 def reset(path: StrPath) -> None:

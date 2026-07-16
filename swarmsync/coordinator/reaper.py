@@ -15,11 +15,14 @@ so the blackboard's audit trail (and anything tailing `events`, e.g. the broker)
 sees the crash explicitly rather than just noticing the lease quietly aged out.
 
 reap_once(conn, now=None) -> list[int]
-    Find every `active` lease whose `ttl_expires_at` is at or before `now`,
-    flip it to `status='reaped'`, and emit one `reaped` event per row
+    In ONE atomic statement (`UPDATE ... WHERE status='active' AND
+    ttl_expires_at<=now RETURNING ...`), flip every timed-out `active` lease to
+    `status='reaped'` and emit one `reaped` event per row
     (`payload={"lease_id", "parcel_id", "agent_id"}`). Returns the list of
     lease ids reaped, in `id` order. A no-op (returns `[]`) when nothing is
-    past its TTL.
+    past its TTL. The single statement re-checks the ttl at write time, so a
+    lease whose ttl was just renewed by a heartbeat is excluded rather than
+    reaped out from under the agent still holding it.
 
 decay_once(conn, half_life=DEFAULT_HALF_LIFE, ts=None) -> int
     Thin pass-through to `server.events.decay_pheromone` -- multiplicative
@@ -78,37 +81,46 @@ def reap_once(conn: sqlite3.Connection, now: Optional[float] = None) -> list[int
     """
     now = now if now is not None else time.time()
 
+    # ONE atomic statement: select-and-flip in the same UPDATE so the timeout
+    # predicate is re-evaluated at write time, not at some earlier read time.
+    # The old two-step form (SELECT expired ids, then UPDATE each WHERE
+    # status='active') left a TOCTOU window: a heartbeat that renewed a lease's
+    # `ttl_expires_at` AFTER the SELECT snapshot but BEFORE the per-row UPDATE
+    # would still be reaped, because that UPDATE only re-checked `status`, never
+    # the (now-future) ttl. Folding the ttl predicate into the UPDATE's own WHERE
+    # means a lease renewed the instant before this statement runs simply fails
+    # `ttl_expires_at <= now` and is left `active` -- correct, and atomic against
+    # a concurrent heartbeat on the same single-writer connection. RETURNING
+    # hands back exactly the rows this statement flipped (mirrors
+    # `leases.acquire`'s `RETURNING id`), so there is no separate read to race.
     rows = conn.execute(
         """
-        SELECT id, agent_id, parcel_id FROM leases
+        UPDATE leases SET status = 'reaped'
         WHERE status = 'active' AND ttl_expires_at <= ?
-        ORDER BY id
+        RETURNING id, agent_id, parcel_id
         """,
         (now,),
     ).fetchall()
 
+    # RETURNING row order is unspecified; sort by id so the returned list (and the
+    # order events are emitted) is deterministic and matches the documented
+    # "in id order" contract.
+    rows = sorted(rows, key=lambda r: r["id"])
+
     reaped_ids: list[int] = []
     for row in rows:
-        cur = conn.execute(
-            "UPDATE leases SET status = 'reaped' WHERE id = ? AND status = 'active'",
-            (row["id"],),
+        events_mod.emit(
+            conn,
+            "reaped",
+            row["agent_id"],
+            {
+                "lease_id": row["id"],
+                "parcel_id": row["parcel_id"],
+                "agent_id": row["agent_id"],
+            },
+            ts=now,
         )
-        # Ownership-scoped-style guard (same pattern as leases.heartbeat/release):
-        # only emit/report if THIS call actually flipped the row. Protects against
-        # a hypothetical concurrent reaper pass racing on the same lease id.
-        if cur.rowcount == 1:
-            events_mod.emit(
-                conn,
-                "reaped",
-                row["agent_id"],
-                {
-                    "lease_id": row["id"],
-                    "parcel_id": row["parcel_id"],
-                    "agent_id": row["agent_id"],
-                },
-                ts=now,
-            )
-            reaped_ids.append(row["id"])
+        reaped_ids.append(row["id"])
 
     return reaped_ids
 
@@ -136,8 +148,8 @@ async def run(
     half_life: float = DEFAULT_HALF_LIFE,
     iterations: Optional[int] = None,
 ) -> None:
-    """The reaper's background loop (DESIGN §4.2 "Background (startup): reaper +
-    pheromone decay run as asyncio tasks").
+    """The reaper's background loop: wired into `server/app.py`'s lifespan as a
+    background `asyncio` task (DESIGN §4.2, §6 "Agent crash mid-edit").
 
     Every `interval` seconds: `reap_once` then `decay_once`. Runs forever when
     `iterations` is `None` (the real deployment shape -- `server/app.py`'s

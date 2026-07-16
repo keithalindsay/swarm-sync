@@ -150,6 +150,10 @@ class IntentBody(BaseModel):
 class HeartbeatBody(BaseModel):
     agent_id: str
     lease_id: int
+    # Optional TTL (seconds) to renew with; None -> the server's default window.
+    # The hook keepalive (S5) sends its own long TTL so a renewed lease keeps the
+    # long window instead of collapsing back to the short server default.
+    ttl: Optional[float] = None
 
 
 class ParcelUpdateBody(BaseModel):
