@@ -599,3 +599,94 @@ def test_run_agent_still_deletes_its_branch_when_the_merge_lands(client, repo):
     assert result.integrate_result["status"] == "merged"
     assert not _branch_exists(r, "agent-ok")
     assert not (r / ".worktrees" / "agent-ok").exists()
+
+
+# --- R4 P0: the client must outlive the gate it is waiting on ---------------------
+
+
+def test_client_over_a_real_url_does_not_use_httpx_5s_default_timeout():
+    """A real-socket client must not inherit httpx's 5s default.
+
+    R4 found this and I reproduced it against a live server: `httpx.Client(base_url=...)`
+    with no `timeout=` gets a 5s default, while the pytest gate `/integrate` blocks on
+    bounds itself at 600s. So ANY gate slower than 5 seconds raised ReadTimeout in the
+    agent WHILE THE SERVER WENT ON AND LANDED THE MERGE -- the agent reports failure and
+    tears down believing its work was lost, while trunk has it.
+
+    The whole suite drives a `TestClient`, which has no socket and no timeout, so
+    nothing here could ever have caught it. These tests assert on the transport the
+    client BUILDS, which is the only place the defect lives.
+    """
+    from swarmsync.agent import client as client_mod
+
+    c = client_mod.BlackboardClient("http://127.0.0.1:8787")
+    try:
+        configured = c._http.timeout  # type: ignore[attr-defined]
+        assert configured.read != 5.0, "client is on httpx's 5s default"
+        assert configured.read == client_mod.DEFAULT_TIMEOUT_SECONDS
+    finally:
+        c.close()
+
+
+def test_integrate_waits_longer_than_the_servers_gate_ceiling(monkeypatch):
+    """The /integrate request window must exceed the gate's own ceiling + slack.
+
+    Timing out on /integrate does not cancel anything -- the server keeps merging --
+    so a client window shorter than the gate guarantees agent/trunk divergence rather
+    than preventing it.
+    """
+    from swarmsync.agent import client as client_mod
+    from swarmsync.coordinator import integrator
+
+    # Default: client window must clear the integrator's default ceiling.
+    assert client_mod._integrate_timeout() > integrator.DEFAULT_GATE_TIMEOUT_SECONDS
+
+    # And it must track the operator's override, not just the default.
+    monkeypatch.setenv("SWARMSYNC_GATE_TIMEOUT", "900")
+    assert client_mod._integrate_timeout() > 900
+    assert integrator._gate_timeout() == 900
+    assert client_mod._integrate_timeout() > integrator._gate_timeout(), (
+        "raising SWARMSYNC_GATE_TIMEOUT must widen the client window too, or the "
+        "client starts timing out on gates the server is still allowed to run"
+    )
+
+    # A junk value must not collapse the window to something shorter than the gate.
+    monkeypatch.setenv("SWARMSYNC_GATE_TIMEOUT", "not-a-number")
+    assert client_mod._integrate_timeout() > integrator._gate_timeout()
+
+
+def test_integrate_passes_its_long_timeout_to_a_real_transport_only():
+    """The long window is applied per-request to a transport we own; an injected one
+    (TestClient / a caller's own client) keeps its own policy -- passing `timeout` to
+    a TestClient is a no-op that only earns a deprecation warning."""
+    from swarmsync.agent import client as client_mod
+
+    class _Recorder:
+        def __init__(self):
+            self.kwargs = None
+
+        def post(self, url, **kwargs):
+            self.kwargs = kwargs
+
+            class _R:
+                status_code = 200
+
+                @staticmethod
+                def json():
+                    return {"status": "merged"}
+
+            return _R()
+
+        def get(self, url, **kwargs):  # pragma: no cover - unused here
+            raise AssertionError
+
+    rec = _Recorder()
+    injected = client_mod.BlackboardClient(rec)
+    injected.integrate("a1", branch="a1", repo="/tmp/x")
+    assert "timeout" not in rec.kwargs, "injected transport must keep its own timeout policy"
+
+    # A client we own gets the long window explicitly on the integrate call.
+    owned = client_mod.BlackboardClient("http://127.0.0.1:8787")
+    owned._http = rec  # type: ignore[assignment]  # keep _owns_http=True
+    owned.integrate("a1", branch="a1", repo="/tmp/x")
+    assert rec.kwargs.get("timeout") == client_mod._integrate_timeout()
