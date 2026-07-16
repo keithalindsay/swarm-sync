@@ -362,7 +362,11 @@ def create_app(
 
     @app.post("/lease", response_model=LeaseResult, dependencies=[Depends(require_token)])
     def post_lease(body: LeaseRequest, conn=Depends(get_conn)):
-        kwargs: dict = {"mode": body.mode, "intent": body.intent}
+        kwargs: dict = {
+            "mode": body.mode,
+            "intent": body.intent,
+            "ensure_parcel": body.ensure_parcel,
+        }
         if body.ttl is not None:
             kwargs["ttl"] = body.ttl
         return leases_mod.acquire(conn, body.parcel_id, body.agent_id, **kwargs)

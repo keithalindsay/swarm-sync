@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import subprocess
 import textwrap
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -467,3 +468,134 @@ def test_slow_edit_applies_edit_then_returns_when_not_hanging(tmp_path):
     (tmp_path / "m.py").write_text("def a():\n    return 1\n", encoding="utf-8")
     mutators.slow_edit(tmp_path, "m.py", "a", "return 2", hang=False, delay=0.01)
     assert "return 2" in (tmp_path / "m.py").read_text()
+
+
+# --- R3 P0-1: the heartbeat must outlive the integrate gate ------------------------
+
+
+def test_heartbeat_keeps_the_lease_alive_across_the_integrate_gate(client, repo, monkeypatch):
+    """The lease must still be alive while `/integrate` runs its pytest gate.
+
+    `run_agent` used to `heartbeater.stop()` in an inner `finally` that wrapped only
+    add_worktree/mutator/commit_all, so /parcel_update and /integrate -- whose gate
+    runs for an unbounded time (impact selection falls back to the FULL suite) -- ran
+    with ZERO beats against a 30s TTL. Any gate slower than the TTL therefore got the
+    still-working agent's lease reaped and re-granted, in write mode, to a second
+    agent.
+
+    Asserted the way the bug actually bites: the lease's `ttl_expires_at` must
+    ADVANCE while integrate is in flight. Moving `stop()` back above step 6 makes
+    this fail.
+    """
+    r, base = repo
+    real_integrate = BlackboardClient.integrate
+    observed: dict = {}
+
+    def slow_integrate(self, agent_id, **kwargs):
+        # Stand where the pytest gate stands: in the middle of /integrate, long
+        # enough for several heartbeat intervals to elapse.
+        before = client.leases()
+        time.sleep(0.3)
+        after = client.leases()
+        observed["before"] = {r_["id"]: r_["ttl_expires_at"] for r_ in before}
+        observed["after"] = {r_["id"]: r_["ttl_expires_at"] for r_ in after}
+        return real_integrate(self, agent_id, **kwargs)
+
+    monkeypatch.setattr(BlackboardClient, "integrate", slow_integrate)
+
+    result = run_agent(
+        "agent-hb",
+        client,
+        r,
+        task="edit helper",
+        target_parcels=["mod_a.py::helper"],
+        mutator=mutators.edit_function_body,
+        mutator_kwargs={
+            "path": "mod_a.py",
+            "symbol": "helper",
+            "new_body": "return x + y + 7",
+        },
+        base_commit=base,
+        lease_ttl=30.0,
+        heartbeat_interval=0.05,
+    )
+    assert result.status == "done"
+
+    lease_id = result.lease_ids["mod_a.py::helper"]
+    assert lease_id in observed["before"], "lease vanished before integrate even started"
+    assert observed["after"][lease_id] > observed["before"][lease_id], (
+        "lease TTL did not advance during /integrate: the agent stopped heartbeating "
+        "before its own gate ran, so a slow gate gets its lease reaped mid-flight"
+    )
+
+
+# --- R3 P1-6: a rejected agent's branch is the only copy of its work ---------------
+
+
+@pytest.mark.parametrize("rejected_status", ["merge_rejected", "needs_rebase"])
+def test_run_agent_keeps_its_branch_when_integrate_does_not_land(
+    client, repo, monkeypatch, rejected_status
+):
+    """On a rejection the branch MUST survive: it is the only ref to the work.
+
+    S5's worktree cleanup called `remove_worktree(delete_branch=True)`
+    unconditionally after integrate returned -- including on merge_rejected
+    (conflict, red gate, integration_error) and needs_rebase. The integrator
+    explicitly `reset --hard`s trunk back to `pre_merge_sha` on those paths, so
+    nothing else references the agent's commits and `git branch -D` made them
+    unreachable (reflog only). That silently destroyed the work AND defeated DESIGN
+    §5.5's bounce-back-and-rebase story: there is no branch left to rebase.
+    """
+    r, base = repo
+
+    def rejecting_integrate(self, agent_id, **kwargs):
+        return {"status": rejected_status, "branch": agent_id, "reason": "simulated"}
+
+    monkeypatch.setattr(BlackboardClient, "integrate", rejecting_integrate)
+
+    result = run_agent(
+        agent_id="agent-rej",
+        client=client,
+        repo=r,
+        task="break helper",
+        target_parcels=["mod_a.py::helper"],
+        mutator=mutators.edit_function_body,
+        mutator_kwargs={"path": "mod_a.py", "symbol": "helper", "new_body": "return 999"},
+        base_commit=base,
+        heartbeat_interval=0.05,
+    )
+    assert result.integrate_result["status"] == rejected_status
+
+    assert _branch_exists(r, "agent-rej"), (
+        f"branch was deleted after {rejected_status}: the agent's commits are now "
+        f"unreachable and there is nothing left to rebase and resubmit"
+    )
+    # The commit itself is still reachable through that branch.
+    reachable = subprocess.run(
+        ["git", "cat-file", "-e", f"{result.commit_sha}^{{commit}}"],
+        cwd=r,
+        capture_output=True,
+    )
+    assert reachable.returncode == 0, "the rejected agent's commit is gone"
+    # The ephemeral worktree dir is still cleaned up -- only the branch is kept.
+    assert not (r / ".worktrees" / "agent-rej").exists()
+
+
+def test_run_agent_still_deletes_its_branch_when_the_merge_lands(client, repo):
+    """The other half: a LANDED merge's commits live in trunk, so the branch really
+    is redundant and must still be cleaned up (no leaked refs per run)."""
+    r, base = repo
+    result = run_agent(
+        agent_id="agent-ok",
+        client=client,
+        repo=r,
+        task="rewrite helper",
+        target_parcels=["mod_a.py::helper"],
+        mutator=mutators.edit_function_body,
+        mutator_kwargs={"path": "mod_a.py", "symbol": "helper", "new_body": "return x + y + 7"},
+        base_commit=base,
+        heartbeat_interval=0.05,
+    )
+    assert result.integrate_result["status"] == "merged"
+    assert not _branch_exists(r, "agent-ok")
+    assert not (r / ".worktrees" / "agent-ok").exists()

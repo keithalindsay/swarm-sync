@@ -8,9 +8,11 @@ green.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import textwrap
+import time
 
 import pytest
 
@@ -510,3 +512,115 @@ def test_no_contract_change_event_when_an_unrelated_branch_merges(repo, conn):
 
     events = events_mod.tail(conn, since_seq=0)
     assert not [e for e in events if e.type == "contract_change"]
+
+
+# --- R3 P1-4: the test gate must not run unbounded under the global lock -----------
+
+
+def test_run_impact_tests_kills_a_hanging_gate_and_rejects(tmp_path, monkeypatch):
+    """A branch whose tests never terminate must be REJECTED, not wedge the system.
+
+    The gate executes just-merged, agent-authored test code while
+    `app.post_integrate` holds the ONE global `integrate_lock`, so before the timeout
+    a single infinite loop in any agent's branch queued every other agent's
+    /integrate behind it forever -- no cancellation, no recovery short of a restart,
+    and trunk left carrying the un-gated merge commit.
+
+    This test HANGS FOREVER if the timeout is removed, so it is its own proof.
+    """
+    repo = tmp_path / "hangrepo"
+    (repo / "tests").mkdir(parents=True)
+    (repo / "mod_a.py").write_text("def helper(x):\n    return x + 1\n", encoding="utf-8")
+    (repo / "tests" / "test_hang.py").write_text(
+        "import time\n\n\ndef test_hangs():\n    time.sleep(600)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SWARMSYNC_GATE_TIMEOUT", "2")
+
+    started = time.monotonic()
+    ok, log = integrator.run_impact_tests(repo, ["mod_a.py"])
+    elapsed = time.monotonic() - started
+
+    assert ok is False, "a non-terminating gate must be a rejection, not a pass"
+    assert "exceeded" in log
+    assert elapsed < 60, f"gate was not killed at its timeout (took {elapsed:.1f}s)"
+
+
+def test_gate_timeout_is_configurable_and_falls_back_to_the_default():
+    """Operators must be able to raise the ceiling for a genuinely slow suite, and a
+    junk value must not silently disable the gate's only protection."""
+    assert integrator._gate_timeout() == integrator.DEFAULT_GATE_TIMEOUT_SECONDS
+    for junk in ("not-a-number", "0", "-5", ""):
+        os.environ["SWARMSYNC_GATE_TIMEOUT"] = junk
+        try:
+            assert integrator._gate_timeout() == integrator.DEFAULT_GATE_TIMEOUT_SECONDS
+        finally:
+            del os.environ["SWARMSYNC_GATE_TIMEOUT"]
+    os.environ["SWARMSYNC_GATE_TIMEOUT"] = "12.5"
+    try:
+        assert integrator._gate_timeout() == 12.5
+    finally:
+        del os.environ["SWARMSYNC_GATE_TIMEOUT"]
+
+
+# --- R3 P1-5: rolling back trunk must roll back the blackboard too -----------------
+
+
+def test_post_reindex_failure_rolls_the_blackboard_back_with_trunk(conn, repo, monkeypatch):
+    """A merge rejected AFTER re-indexing must not leave the blackboard describing
+    the code that was thrown away.
+
+    Step 4 calls `run_index`, which COMMITS its own transaction (SQLite has one
+    transaction per connection and no nesting), so by the time anything after it
+    fails -- the `regenerate_summary`/UPDATE loop, the contract-diff SELECT, or a
+    transient `database is locked` from another writer -- those rows are already
+    persisted from a merge that is about to be reset out. The S1 atomicity guard
+    reset trunk with `git reset --hard` and stopped there.
+
+    That is not cosmetic: `_check_read_deps` (step 1) compares other agents'
+    plan-time snapshots against exactly these columns, so a phantom hash spuriously
+    bounces innocent agents with `needs_rebase` and clears an agent that
+    re-snapshotted to merge against state that never landed.
+    """
+    r, base = repo
+    run_index(conn, r)
+
+    def _hash_of(parcel_id):
+        row = conn.execute(
+            "SELECT content_hash FROM parcels WHERE id = ?", (parcel_id,)
+        ).fetchone()
+        return row["content_hash"] if row else None
+
+    before = _hash_of("mod_a.py::helper")
+    assert before is not None
+    pre_head = git_ops.current_commit(r, ref="integration")
+
+    # A branch that merges cleanly and PASSES the gate, so we reach step 4. The
+    # edit must change helper's real content_hash (a comment-only change does not --
+    # the hash is computed over parsed source, so a trailing comment is invisible to
+    # it and would make this test pass for the wrong reason). `tests/test_a.py` is
+    # value-agnostic on purpose, so an arithmetic tweak still passes the gate.
+    worktree = git_ops.add_worktree(r, "agent-x", base)
+    (worktree / "mod_a.py").write_text(
+        "def helper(x):\n    return x + 999\n", encoding="utf-8"
+    )
+    git_ops.commit_all(worktree, "agent-x: arithmetic tweak the gate accepts")
+
+    # ...then blow up AFTER run_index has already committed the new hashes.
+    def boom(*a, **kw):
+        raise RuntimeError("simulated post-reindex failure")
+
+    monkeypatch.setattr(integrator, "regenerate_summary", boom)
+
+    result = integrator.integrate(conn, r, "agent-x", base_commit=base, agent_id="agent-x")
+    assert result.status == "merge_rejected"
+
+    # git rolled back...
+    assert git_ops.current_commit(r, ref="integration") == pre_head
+    assert "999" not in (r / "mod_a.py").read_text(encoding="utf-8")
+
+    # ...and so must the blackboard, which is the projection every agent reads.
+    assert _hash_of("mod_a.py::helper") == before, (
+        "blackboard still carries the REJECTED merge's content_hash while trunk has "
+        "been reset: agents now plan against a state that never landed"
+    )

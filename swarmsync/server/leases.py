@@ -55,6 +55,35 @@ from swarmsync.server.events import emit as _emit
 DEFAULT_TTL_SECONDS = 30.0
 
 
+def _ensure_parcel(conn: sqlite3.Connection, parcel_id: str) -> None:
+    """Create a coarse whole-file parcel row for `parcel_id` if none exists.
+
+    `leases.parcel_id` is an FK to `parcels(id)` with `foreign_keys=ON`, so leasing
+    a parcel the classifier never emitted raises IntegrityError. The classifier only
+    indexes `*.py`, which left EVERY non-Python file (`.ts`, `.yaml`, `package.json`,
+    `Dockerfile`) and every newly-created file unleasable -- and on the hook path
+    that surfaced as a 500 the adapter's fail-open umbrella swallowed, so those files
+    were silently ungated while the docs promised they were coordinated. Since hook
+    subagents share ONE working tree, the lease is the only collision protection
+    there and its absence is the absence of the product.
+
+    Callers opt in (`ensure_parcel=True`) rather than getting this for free: the
+    broker resolves parcel ids from a real index, so an unknown id there is a bug
+    worth surfacing, not a row to conjure. The hook path is the opposite -- it is
+    handed arbitrary real files by a human's agent and must coordinate whatever it
+    gets. `kind='file'` records that this parcel is coarse (whole-file) and was never
+    parsed into symbols.
+    """
+    path, _, symbol = parcel_id.partition("::")
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO parcels (id, path, kind, symbol, updated_at)
+        VALUES (:id, :path, 'file', :symbol, :now)
+        """,
+        {"id": parcel_id, "path": path, "symbol": symbol or "<module>", "now": time.time()},
+    )
+
+
 def acquire(
     conn: sqlite3.Connection,
     parcel_id: str,
@@ -62,10 +91,19 @@ def acquire(
     mode: LeaseMode = "write",
     ttl: float = DEFAULT_TTL_SECONDS,
     intent: Optional[str] = None,
+    ensure_parcel: bool = False,
 ) -> LeaseResult:
-    """Atomic CAS acquire. Returns LeaseResult(granted, lease_id, reason)."""
+    """Atomic CAS acquire. Returns LeaseResult(granted, lease_id, reason).
+
+    `ensure_parcel=True` auto-creates a coarse whole-file parcel row when the id is
+    unknown, so any file can be coordinated even if the classifier never parsed it.
+    See `_ensure_parcel` for why this is opt-in.
+    """
     if mode not in ("read", "write", "exclusive"):
         raise ValueError(f"unrecognized lease mode: {mode!r}")
+
+    if ensure_parcel:
+        _ensure_parcel(conn, parcel_id)
 
     now = time.time()
     ttl_expires_at = now + ttl
@@ -146,11 +184,21 @@ def heartbeat(
     heartbeating a lease you no longer hold is a silent no-op, never an error.
     """
     now = time.time()
+    # `ttl_expires_at > :now` is load-bearing, not belt-and-braces: acquire() uses
+    # lazy expiry (an expired holder does not block a new acquire), so between the
+    # moment a lease expires and the moment the reaper flips its status, the row is
+    # still `status='active'` while another agent can lawfully take the parcel.
+    # Without this clause a blind heartbeat from the original holder pushes that row
+    # back into the future and BOTH rows are then active+unexpired+write on one
+    # parcel -- the exact double-lease this module exists to prevent. Matching
+    # acquire()'s predicate keeps correctness independent of the reaper having run,
+    # as this module's docstring promises.
     cur = conn.execute(
         """
         UPDATE leases
         SET heartbeat_at = :now, ttl_expires_at = :ttl_expires_at
         WHERE id = :lease_id AND agent_id = :agent_id AND status = 'active'
+          AND ttl_expires_at > :now
         """,
         {
             "now": now,

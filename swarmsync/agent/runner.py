@@ -76,9 +76,11 @@ class _Heartbeater:
     process (SIGKILL, money-shot #4) simply stops heartbeating -- there is
     nothing to explicitly clean up in that scenario; the reaper (U11)
     reclaims the lease once `ttl_expires_at` lapses. Under a normal
-    (non-crashed) run, `stop()` is always called from a `finally` block in
-    `run_agent` before the worktree commit, so the thread never outlives the
-    call that started it.
+    (non-crashed) run, `stop()` is called from `run_agent`'s OUTER `finally` --
+    i.e. only once /parcel_update and /integrate have returned -- so the beat
+    covers every step that still needs the lease (notably the integrate gate,
+    whose runtime is unbounded), and the thread never outlives the call that
+    started it.
     """
 
     def __init__(
@@ -121,7 +123,7 @@ class _Heartbeater:
             self._thread.join(timeout=self._interval + 1.0)
 
 
-def _cleanup_worktree(repo: Path, agent_id: str) -> None:
+def _cleanup_worktree(repo: Path, agent_id: str, delete_branch: bool = False) -> None:
     """Best-effort teardown of this agent's worktree + branch (S5).
 
     Called from a `finally` after integrate/release on the done path, and on the
@@ -129,11 +131,18 @@ def _cleanup_worktree(repo: Path, agent_id: str) -> None:
     `.worktrees/<agent_id>` dir or its `<agent_id>` branch -- reruns with the same
     agent_id don't collide or accumulate orphans. Swallows `GitOpsError` (there
     may be nothing to remove -- e.g. lease_denied created no worktree) so cleanup
-    never turns into the reason a run fails. A landed merge's commits already live
-    in trunk's history, so deleting the now-redundant branch ref loses nothing.
+    never turns into the reason a run fails.
+
+    `delete_branch` defaults to FALSE and must be opted into by the caller, which
+    may only do so once the merge has actually LANDED. A landed merge's commits
+    live in trunk's history, so dropping the redundant ref loses nothing -- but on
+    the merge_rejected/needs_rebase paths the integrator has reset trunk back to
+    `pre_merge_sha`, so this branch is the ONLY reference to the agent's commits.
+    Deleting it there makes the work unreachable and destroys the rebase-and-
+    resubmit path DESIGN §5.5 promises.
     """
     try:
-        git_ops.remove_worktree(repo, agent_id, delete_branch=True)
+        git_ops.remove_worktree(repo, agent_id, delete_branch=delete_branch)
     except git_ops.GitOpsError:
         pass
 
@@ -242,17 +251,25 @@ def run_agent(
         heartbeater.add(lease_id)
     heartbeater.start()
 
-    # Everything from here owns a worktree; the outer `finally` tears it (and the
-    # branch) down after integrate/release -- and on any mid-way failure too --
-    # so nothing leaks for a rerun to collide with (S5).
+    # Everything from here owns a worktree; the outer `finally` tears it down
+    # after integrate/release -- and on any mid-way failure too -- so nothing
+    # leaks for a rerun to collide with (S5). `landed` stays False unless the
+    # integrator reports `merged`, so a failure anywhere in here keeps the branch.
+    landed = False
     try:
         # 5. isolated worktree + the scripted (or real) edit.
-        try:
-            worktree = git_ops.add_worktree(repo, agent_id, base_commit)
-            mutator(worktree, **mutator_kwargs)
-            commit_sha = git_ops.commit_all(worktree, f"{agent_id}: {task}")
-        finally:
-            heartbeater.stop()
+        #
+        # The heartbeat must outlive this block: step 6 posts /parcel/update and
+        # then /integrate, whose pytest gate runs for an unbounded time (impact
+        # selection falls back to the FULL suite). Stopping the heartbeat here --
+        # as this code used to -- left the rest of the run beating zero times
+        # against a 30s TTL, so any gate slower than the TTL got this agent's
+        # lease reaped mid-flight and re-granted, in write mode, to another agent
+        # while this one was still working. It is released explicitly on the
+        # success path below and stopped in the outer `finally` regardless.
+        worktree = git_ops.add_worktree(repo, agent_id, base_commit)
+        mutator(worktree, **mutator_kwargs)
+        commit_sha = git_ops.commit_all(worktree, f"{agent_id}: {task}")
 
         # 6. re-derive each touched parcel's real content_hash from the committed
         # worktree (never trust a self-reported hash) and post it + a
@@ -279,6 +296,10 @@ def run_agent(
         integrate_result = client.integrate(
             agent_id, branch=agent_id, repo=str(repo), base_commit=base_commit
         )
+        # Only a LANDED merge makes this agent's branch redundant; see
+        # `_cleanup_worktree`. On merge_rejected/needs_rebase the integrator has
+        # reset trunk, so the branch is the only thing still pointing at the work.
+        landed = integrate_result.get("status") == "merged"
 
         for lease_id in lease_ids.values():
             client.release(agent_id, lease_id)
@@ -296,4 +317,8 @@ def run_agent(
             lease_modes_used=lease_modes_used,
         )
     finally:
-        _cleanup_worktree(repo, agent_id)
+        # Stopping the beat here (rather than after commit_all) is what keeps this
+        # agent's lease alive across /parcel/update and /integrate's unbounded
+        # pytest gate -- see the note in the try block above.
+        heartbeater.stop()
+        _cleanup_worktree(repo, agent_id, delete_branch=landed)

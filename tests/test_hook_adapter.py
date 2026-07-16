@@ -667,3 +667,100 @@ def test_indexed_symlinked_py_stays_leasable(monkeypatch, tmp_path, tmp_path_fac
         assert leases[0]["parcel_id"] == f"linked.py::{MODULE_SYMBOL}"
         assert leases[0]["agent_id"] == "a1"
     assert out == ""
+
+
+# --- R3 P0-2: unindexed files must be coordinated, not silently ungated ------------
+
+
+@pytest.mark.parametrize(
+    "filename, why",
+    [
+        ("package.json", "non-Python: the classifier only walks *.py"),
+        ("deploy.yaml", "non-Python"),
+        ("Dockerfile", "non-Python, no extension"),
+        ("brand_new.py", "created after the last POST /index, so it has no parcel yet"),
+    ],
+)
+def test_precheck_gates_files_the_classifier_never_indexed(
+    monkeypatch, repo, indexed_client, filename, why
+):
+    """An edit to an unindexed file must take a real lease -- not fail open.
+
+    `leases.parcel_id` is an FK to `parcels(id)`, so leasing a parcel the classifier
+    never emitted raised IntegrityError -> 500 -> raise_for_status -> main()'s
+    deliberate fail-open umbrella -> exit 0 with NO lease and NO deny. Since
+    `indexer.index_repo` only walks `*.py`, that silently ungated every `.ts`,
+    `.yaml`, `package.json` and every newly-created file.
+
+    That is worse here than anywhere else in the system: hook-driven subagents share
+    ONE working tree (`_repo_root = payload['cwd']`), so DESIGN §5.1's worktree
+    isolation does not exist on this surface and the lease is the only thing standing
+    between two agents and a lost edit.
+    """
+    monkeypatch.setenv("SWARMSYNC_ACTIVE", "1")
+    (repo / filename).write_text("{}\n", encoding="utf-8")
+
+    payload = _payload("Edit", file_path=str(repo / filename), cwd=str(repo), agent_id="agent-1")
+    code, out, err = _run("precheck", payload, http_factory=_http_factory(indexed_client))
+
+    assert code == 0
+    assert out == "", f"expected ALLOW for the first agent on {filename} ({why})"
+    assert "failing open" not in err, (
+        f"{filename} fell through the fail-open umbrella instead of being leased "
+        f"({why}): {err.strip()}"
+    )
+
+    leases = indexed_client.get("/leases").json()
+    held = [lease for lease in leases if lease["parcel_id"] == f"{filename}::{MODULE_SYMBOL}"]
+    assert len(held) == 1, f"no lease was taken on {filename} -- it is ungated ({why})"
+    assert held[0]["agent_id"] == "agent-1"
+    assert held[0]["mode"] == "write"
+
+
+def test_second_agent_is_denied_an_unindexed_file_held_by_the_first(
+    monkeypatch, repo, indexed_client
+):
+    """The invariant P0-2 actually broke: one agent per file, for ANY file.
+
+    Two subagents told to add a dependency to package.json would both be allowed,
+    both write it in the same shared working tree, and the last writer would silently
+    destroy the other's edit.
+    """
+    monkeypatch.setenv("SWARMSYNC_ACTIVE", "1")
+    (repo / "package.json").write_text('{"deps": {}}\n', encoding="utf-8")
+    factory = _http_factory(indexed_client)
+
+    code_a, out_a, _ = _run(
+        "precheck",
+        _payload("Edit", file_path=str(repo / "package.json"), cwd=str(repo), agent_id="agent-A"),
+        http_factory=factory,
+    )
+    assert (code_a, out_a) == (0, "")  # A gets it
+
+    code_b, out_b, _ = _run(
+        "precheck",
+        _payload("Edit", file_path=str(repo / "package.json"), cwd=str(repo), agent_id="agent-B"),
+        http_factory=factory,
+    )
+    assert code_b == 0
+    assert out_b != "", "agent-B was ALLOWED to edit a file agent-A holds -- last writer wins"
+    decision = json.loads(out_b)
+    assert decision["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "agent-A" in decision["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+def test_unreachable_blackboard_still_fails_open(monkeypatch, repo):
+    """The fail-open umbrella must still cover TRANSIENT failure.
+
+    P0-2's fix distinguishes "this parcel does not exist" (a deterministic property
+    of the file -> lease it) from "the blackboard is down" (transient -> allow, so a
+    dead coordinator never bricks the user's session). This pins the second half so
+    the fix can't be over-applied into failing closed on an outage.
+    """
+    monkeypatch.setenv("SWARMSYNC_ACTIVE", "1")
+    payload = _payload("Edit", file_path=str(repo / "mod_a.py"), cwd=str(repo), agent_id="agent-1")
+    code, out, err = _run("precheck", payload, http_factory=lambda base_url: _ExplodingHttp())
+
+    assert code == 0
+    assert out == ""
+    assert "failing open" in err

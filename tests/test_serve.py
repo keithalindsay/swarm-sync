@@ -6,6 +6,7 @@ default. `uvicorn.run` is stubbed so the process never actually binds a socket.
 """
 from __future__ import annotations
 
+import os
 import sys
 
 import pytest
@@ -56,3 +57,57 @@ def test_serve_main_help_exits_zero(monkeypatch, capsys):
     assert exc.value.code == 0
     out = capsys.readouterr().out
     assert "--host" in out and "--port" in out and "--db" in out
+
+
+# --- R3 P1-10: managed roots must be explicit and visible at boot ------------------
+
+
+def test_serve_root_flag_sets_managed_roots(monkeypatch, tmp_path, capsys):
+    """`--root` is the explicit way to say which repo this server may coordinate.
+
+    Getting the managed roots wrong does not raise -- it makes /index 403, which
+    leaves the parcel map empty, which makes every hook fail open: silently NO
+    coordination. So the roots must be settable without knowing about an env var,
+    and must be printed at boot where an operator will actually see them.
+    """
+    monkeypatch.setattr("uvicorn.run", lambda app, host, port: None)
+    monkeypatch.delenv("SWARMSYNC_ROOTS", raising=False)
+    repo_a, repo_b = tmp_path / "a", tmp_path / "b"
+    repo_a.mkdir()
+    repo_b.mkdir()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "swarmsync-serve",
+            "--db",
+            str(tmp_path / "bb.db"),
+            "--root",
+            str(repo_a),
+            "--root",
+            str(repo_b),
+        ],
+    )
+
+    serve.main()
+
+    roots = os.environ["SWARMSYNC_ROOTS"].split(os.pathsep)
+    assert str(repo_a) in roots and str(repo_b) in roots
+
+    out = capsys.readouterr().out
+    assert "managed roots" in out
+    assert str(repo_a) in out, "the operator is never shown which roots are active"
+
+
+def test_serve_announces_managed_roots_even_when_defaulted(monkeypatch, tmp_path, capsys):
+    """With no --root and no SWARMSYNC_ROOTS the roots default to the launch cwd --
+    the exact silent-misconfiguration case -- so the boot line matters most here."""
+    monkeypatch.setattr("uvicorn.run", lambda app, host, port: None)
+    monkeypatch.delenv("SWARMSYNC_ROOTS", raising=False)
+    monkeypatch.setattr(sys, "argv", ["swarmsync-serve", "--db", str(tmp_path / "bb.db")])
+
+    serve.main()
+
+    out = capsys.readouterr().out
+    assert "managed roots" in out
+    assert "403" in out, "the 403 consequence is not surfaced at boot"

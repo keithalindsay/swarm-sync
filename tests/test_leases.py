@@ -348,3 +348,64 @@ def test_barrier_gated_acquires_on_distinct_parcels_return_distinct_lease_ids(co
     }
     for requested_pid, returned_id in observed:
         assert row_parcel[returned_id] == requested_pid
+
+
+# --- R3 P1-1: expired leases must not be resurrected by a blind heartbeat ----------
+
+
+def test_heartbeat_on_expired_lease_is_a_noop(conn):
+    """A heartbeat may not revive a lease whose TTL already lapsed.
+
+    `leases.py`'s docstring promises "a stale/foreign/EXPIRED heartbeat is a silent
+    no-op ... rather than reviving a lease", and the reaper note promises
+    "correctness here does not depend on the reaper having run first". Both are only
+    true if `heartbeat` carries the same `ttl_expires_at > now` predicate `acquire`
+    uses. Deleting that clause makes this test fail.
+    """
+    parcel_id = _make_parcel(conn)
+    r = leases.acquire(conn, parcel_id, "agent-A", mode="write", ttl=0.05)
+    assert r.granted is True
+    time.sleep(0.1)
+
+    assert leases.heartbeat(conn, r.lease_id, "agent-A", ttl=10_000.0) is False
+
+    row = conn.execute(
+        "SELECT ttl_expires_at FROM leases WHERE id = ?", (r.lease_id,)
+    ).fetchone()
+    assert row["ttl_expires_at"] <= time.time(), "expired lease was pushed into the future"
+
+
+def test_expired_holders_heartbeat_cannot_create_a_second_live_write_lease(conn):
+    """The double-lease invariant, stated as the thing it actually protects.
+
+    NO reaper runs here -- deliberately. `acquire` uses lazy expiry, so between a
+    lease lapsing and the reaper flipping its status there is a window in which the
+    row is still `status='active'` while another agent can lawfully take the parcel.
+    If the original holder's heartbeat can push that row's TTL forward in that
+    window, two agents hold the same parcel in write mode at once -- the one thing
+    this module exists to prevent. `create_app(reaper_interval=None)` is a supported
+    config, and the reaper can die, so this must hold with no reaper at all.
+    """
+    parcel_id = _make_parcel(conn)
+    a = leases.acquire(conn, parcel_id, "agent-A", mode="write", ttl=0.05)
+    assert a.granted is True
+    time.sleep(0.1)
+
+    # B lawfully takes the parcel: A's lease has lapsed (lazy expiry).
+    b = leases.acquire(conn, parcel_id, "agent-B", mode="write", ttl=30.0)
+    assert b.granted is True
+
+    # A is oblivious and keeps beating (runner's _Heartbeater beats blindly on a
+    # timer and swallows every exception -- exactly this client).
+    leases.heartbeat(conn, a.lease_id, "agent-A", ttl=10_000.0)
+
+    live = conn.execute(
+        "SELECT id, agent_id FROM leases "
+        "WHERE parcel_id = ? AND status = 'active' AND ttl_expires_at > ?",
+        (parcel_id, time.time()),
+    ).fetchall()
+    assert len(live) == 1, (
+        f"DOUBLE LEASE: {[(r['id'], r['agent_id']) for r in live]} "
+        f"hold {parcel_id!r} in write mode simultaneously"
+    )
+    assert live[0]["agent_id"] == "agent-B"

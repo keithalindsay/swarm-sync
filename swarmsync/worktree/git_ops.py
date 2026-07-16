@@ -41,6 +41,7 @@ touching the operator's global git config.
 """
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -73,6 +74,37 @@ def _reject_option_like(value: str, kind: str) -> str:
             f"(git would parse it as an option, not a positional argument)"
         )
     return value
+
+
+_SAFE_NAME_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+
+
+def _reject_unsafe_name(name: str, kind: str = "worktree/branch name") -> str:
+    """Refuse any worktree/branch name that isn't a plain, single-segment token.
+
+    SECURITY: option-rejection alone is not enough here, because the dangerous sink
+    is not git's argv -- it is `shutil.rmtree`. `add_worktree` builds
+    `repo/.worktrees/<name>` and hands it to `_prune_stale_worktree`, which rmtree's
+    it BEFORE any git process runs, so a name is a filesystem path fragment first and
+    a git ref second:
+
+        '../../../tmp/evil' -> <repo>/.worktrees/../../../tmp/evil   (escapes the repo)
+        '/etc/passwd'       -> /etc/passwd    (pathlib DISCARDS the prefix on an
+                                               absolute right-hand operand)
+
+    Names are agent ids / task ids, which are legitimately plain tokens, so an
+    allow-list costs nothing and closes traversal, absolute paths, separators, NUL,
+    and leading '-' in one predicate. `add_worktree` additionally asserts the
+    resolved path is contained in `.worktrees/` -- defense in depth, since this is a
+    recursive delete.
+    """
+    if not isinstance(name, str) or not _SAFE_NAME_RE.match(name):
+        raise GitOpsError(
+            f"refusing unsafe {kind}: {name!r} (must match {_SAFE_NAME_RE.pattern} -- "
+            f"path separators, '..', absolute paths and leading '-' are rejected "
+            f"because this name becomes a filesystem path that gets recursively deleted)"
+        )
+    return name
 
 
 def _run(
@@ -150,12 +182,20 @@ def add_worktree(repo: Path | str, name: str, base_commit: str | None = None) ->
     doesn't collide on `git worktree add -b` ("branch already exists" / "path
     already exists") -- reruns don't leak or fail.
     """
-    _reject_option_like(name, "worktree/branch name")
+    _reject_unsafe_name(name, "worktree/branch name")
     repo = Path(repo)
     if base_commit is None:
         base_commit = current_commit(repo)
     _reject_option_like(base_commit, "base commit")
     worktree_path = repo / ".worktrees" / name
+    # Defense in depth behind `_reject_unsafe_name`: `_prune_stale_worktree` runs a
+    # recursive delete on this path, so prove containment rather than trust the name
+    # predicate alone. `.worktrees` may not exist yet on a first run, hence parents.
+    worktrees_root = (repo / ".worktrees").resolve()
+    if not worktree_path.resolve().is_relative_to(worktrees_root):
+        raise GitOpsError(
+            f"refusing worktree path outside {worktrees_root}: {worktree_path!r}"
+        )
     _prune_stale_worktree(repo, name, worktree_path)
     # `--` after the options separates the positional <path> <commit-ish> from any
     # further option parsing, so neither can be smuggled in as a flag.
@@ -172,11 +212,21 @@ def remove_worktree(repo: Path | str, name: str, delete_branch: bool = True) -> 
     Used to discard an orphaned/reaped agent's worktree (DESIGN §6: "the orphan worktree
     branch is discarded"). Branch deletion is best-effort (`check=False`) -- it's cleanup, not
     a step whose failure should block the caller.
+
+    Removing the worktree is `check=False` for the same reason: a caller cleaning up
+    after a run that never got as far as creating a worktree (or that already had it
+    removed) still needs the `delete_branch` step below to run. With `check=True` the
+    missing-worktree case raised and silently skipped the branch delete, so a leaked
+    branch from a prior run was never actually pruned.
     """
-    _reject_option_like(name, "worktree/branch name")
+    _reject_unsafe_name(name, "worktree/branch name")
     repo = Path(repo)
     worktree_path = repo / ".worktrees" / name
-    _run(["git", "worktree", "remove", "--force", "--", str(worktree_path)], cwd=repo)
+    _run(
+        ["git", "worktree", "remove", "--force", "--", str(worktree_path)],
+        cwd=repo,
+        check=False,
+    )
     if delete_branch:
         _run(["git", "branch", "-D", "--end-of-options", name], cwd=repo, check=False)
 

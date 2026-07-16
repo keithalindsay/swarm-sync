@@ -204,17 +204,23 @@ class _RaceConn:
 
 def test_reap_once_excludes_lease_renewed_by_heartbeat_in_the_race_window(conn):
     parcel_id = _make_parcel(conn)
-    # Lease starts already expired (a crashed-looking agent) so it is a reap
-    # candidate at `now`...
-    r = leases.acquire(conn, parcel_id, "agent-dead", mode="write", ttl=-1.0)
+    # A live agent whose lease is still valid in real time...
+    r = leases.acquire(conn, parcel_id, "agent-live", mode="write", ttl=5.0)
     assert r.granted is True
 
     def renew():
-        # ...but a heartbeat renews it far into the future inside the race window.
-        assert leases.heartbeat(conn, r.lease_id, "agent-dead", ttl=10_000.0) is True
+        # ...renews far into the future inside the reaper's race window.
+        assert leases.heartbeat(conn, r.lease_id, "agent-live", ttl=10_000.0) is True
 
     race = _RaceConn(conn, renew)
-    reaped = reaper.reap_once(race, now=time.time())
+    # Candidacy is driven by the reaper's `now`, not by expiring the lease in real
+    # time. The previous version of this test set ttl=-1.0 and asserted that
+    # heartbeat() revived an ALREADY-EXPIRED lease -- which is the double-lease bug
+    # (`leases.heartbeat` had no `ttl_expires_at > now` predicate) written down as a
+    # requirement. A heartbeat may only renew a lease its owner still holds, so the
+    # scenario is now built the way it actually occurs: a lease that is live when the
+    # heartbeat lands, and a candidate from the reaper's point of view.
+    reaped = reaper.reap_once(race, now=time.time() + 10.0)
 
     # The renewed lease must NOT be reaped (fails on the old SELECT-then-UPDATE).
     assert r.lease_id not in reaped

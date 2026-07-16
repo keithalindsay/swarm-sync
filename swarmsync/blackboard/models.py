@@ -133,6 +133,10 @@ class LeaseRequest(BaseModel):
     mode: LeaseMode = "write"
     intent: Optional[str] = None
     ttl: Optional[float] = None
+    # Opt-in whole-file parcel auto-creation for callers (the hook adapter) that
+    # lease arbitrary real files rather than ids resolved from a real index.
+    # See `server.leases._ensure_parcel`.
+    ensure_parcel: bool = False
 
 
 class LeaseResult(BaseModel):

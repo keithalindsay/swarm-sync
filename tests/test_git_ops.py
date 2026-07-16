@@ -160,7 +160,12 @@ def test_merge_branch_rejects_option_like_branch_before_running_git(repo, monkey
 
 def test_add_worktree_rejects_option_like_name(repo):
     r, base = repo
-    with pytest.raises(git_ops.GitOpsError, match="begins with '-'"):
+    # `add_worktree` validates the name against a strict allow-list rather than
+    # only rejecting a leading '-', because the name becomes a filesystem path that
+    # gets recursively deleted -- so the message is the allow-list's, not
+    # `_reject_option_like`'s. The behaviour under test is unchanged: an
+    # option-like name never reaches a git subprocess.
+    with pytest.raises(git_ops.GitOpsError, match="refusing unsafe"):
         git_ops.add_worktree(r, "--output=/tmp/pwned", base)
     # nothing was created for the rejected name
     assert not (r / ".worktrees" / "--output=/tmp/pwned").exists()
@@ -196,3 +201,65 @@ def test_normal_branch_names_still_work_after_hardening(repo):
     ok, conflicts = git_ops.merge_branch(r, "agentOK", into="integration")
     assert ok is True and conflicts == []
     assert (r / "fileA.txt").read_text() == "edited-by-agentOK\n"
+
+
+# --- R3 P1-2: worktree names are path fragments, not just git refs -----------------
+
+
+@pytest.mark.parametrize(
+    "evil",
+    [
+        "../../../escape",
+        "..",
+        "a/../../escape",
+        "sub/dir",
+        "/tmp/absolute",
+        "-rf",
+        "",
+    ],
+)
+def test_add_worktree_rejects_traversal_and_separator_names(repo, evil):
+    """A worktree name becomes `<repo>/.worktrees/<name>` and is then RECURSIVELY
+    DELETED by `_prune_stale_worktree` before any git process runs. So the guard
+    must reject path traversal, separators and absolute paths -- not merely names
+    that look like git options.
+    """
+    r, base = repo
+    with pytest.raises(git_ops.GitOpsError, match="refusing unsafe"):
+        git_ops.add_worktree(r, evil, base)
+
+
+def test_add_worktree_traversal_cannot_delete_a_directory_outside_the_repo(repo, tmp_path):
+    """The exploit, end to end: `add_worktree` recursively deleted an arbitrary
+    directory OUTSIDE the repo before running git.
+
+    Reachable in normal use -- the broker derives the worktree name from
+    `task.task_id` and `run_agent` passes it straight through. Note the first call in
+    a fresh repo silently no-ops (`.worktrees/` doesn't exist yet, so `exists()` is
+    False); the deletion fires from the SECOND agent onward, which is exactly why
+    tests missed it. This creates `.worktrees/` first so the delete would really fire.
+    """
+    r, base = repo
+    (r / ".worktrees").mkdir(exist_ok=True)
+
+    victim_dir = tmp_path / "victim"
+    victim_dir.mkdir()
+    victim_file = victim_dir / "precious.txt"
+    victim_file.write_text("do not delete me", encoding="utf-8")
+
+    # `<repo>/.worktrees/../../victim` == tmp_path/victim
+    evil = f"../../{victim_dir.name}"
+    with pytest.raises(git_ops.GitOpsError):
+        git_ops.add_worktree(r, evil, base)
+
+    assert victim_dir.exists(), "add_worktree deleted a directory outside the repo"
+    assert victim_file.read_text(encoding="utf-8") == "do not delete me"
+
+
+def test_add_worktree_still_accepts_ordinary_agent_ids(repo):
+    """The allow-list must not break the names the system actually uses."""
+    r, base = repo
+    for name in ("agent-1", "agent_x", "task.42", "T7"):
+        wt = git_ops.add_worktree(r, name, base)
+        assert wt.exists()
+        git_ops.remove_worktree(r, name, delete_branch=True)
