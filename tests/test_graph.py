@@ -242,3 +242,64 @@ def test_build_graph_and_blast_radius_are_deterministic(fixture_repo):
     blast2 = blast_radius(graph2)
 
     assert blast1 == blast2
+
+
+# --- R4 mutation M-1: the parse guard is real, and was undefended -----------------
+
+
+def test_build_graph_survives_a_file_that_is_broken_on_disk_right_now(tmp_path):
+    """A file that parsed at index time is ROUTINELY broken on disk in a live swarm.
+
+    R4's mutation dimension deleted `SyntaxError` from build_graph's per-file guard
+    and the whole suite stayed green. The guard is NOT dead code: `index_repo` skips
+    unparseable files, so via that path no parcel exists to re-parse -- but
+    `broker.load_scheduling_graph` and `integrator._reverse_dep_files` build parcels
+    from the DATABASE (rows indexed when the file was valid) and then re-read the file
+    from DISK. Agents are editing that tree; mid-edit it does not parse.
+
+    Without the guard that raises straight out of build_graph, so the broker schedules
+    NO task for ANY file and /integrate 500s -- one transiently-broken file bricks the
+    whole coordinator. That is the same class as the `kind='file'` ValidationError and
+    the `local_symbols` KeyError, both of which were P0s: every reader of the parcel
+    map re-parses the world and dies on one bad file.
+    """
+    from swarmsync.classifier.indexer import parse_file
+
+    good = tmp_path / "good.py"
+    good.write_text("def kept(x):\n    return x\n", encoding="utf-8")
+    broken = tmp_path / "broken.py"
+    broken.write_text("def helper(x):\n    return x\n", encoding="utf-8")
+
+    # Index both while they are valid, as POST /index would.
+    parcels = list(parse_file(good, rel_path="good.py")) + list(
+        parse_file(broken, rel_path="broken.py")
+    )
+
+    # An agent is mid-edit: the file no longer parses.
+    broken.write_text("def helper(x:\n", encoding="utf-8")
+
+    graph = build_graph(parcels, tmp_path)  # must not raise
+
+    # The unaffected file is still fully scheduled against.
+    assert "good.py::kept" in graph.signatures, (
+        "a transiently-broken sibling file wiped out scheduling for everything else"
+    )
+
+
+def test_build_graph_survives_an_undecodable_file_on_disk(tmp_path):
+    """Same guard, the other reachable arm: a file that is valid UTF-8 at index time
+    and binary garbage on disk now (a bad write, a merge artifact)."""
+    from swarmsync.classifier.indexer import parse_file
+
+    good = tmp_path / "good.py"
+    good.write_text("def kept(x):\n    return x\n", encoding="utf-8")
+    weird = tmp_path / "weird.py"
+    weird.write_text("def w(x):\n    return x\n", encoding="utf-8")
+    parcels = list(parse_file(good, rel_path="good.py")) + list(
+        parse_file(weird, rel_path="weird.py")
+    )
+
+    weird.write_bytes(b"\xff\xfe\x00\x01 not utf-8 \xc3\x28")
+
+    graph = build_graph(parcels, tmp_path)
+    assert "good.py::kept" in graph.signatures
