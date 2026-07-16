@@ -28,6 +28,7 @@ dev = [
 
 [project.scripts]
 swarm-sync = "swarmsync.server.app:main"
+swarmsync-hook = "swarmsync.hooks.adapter:main"
 
 [tool.setuptools.packages.find]
 include = ["swarmsync*"]
