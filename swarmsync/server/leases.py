@@ -50,9 +50,19 @@ import time
 from typing import Optional
 
 from swarmsync.blackboard.models import LeaseMode, LeaseResult
+from swarmsync.classifier.indexer import MODULE_SYMBOL
 from swarmsync.server.events import emit as _emit
 
 DEFAULT_TTL_SECONDS = 30.0
+
+# Epoch seconds from SQLite's OWN clock, evaluated when the statement is serialized
+# rather than when Python bound its parameters. Sub-second precision, and it agrees
+# with `time.time()` to well under a millisecond, so it is directly comparable to the
+# `ttl_expires_at` values Python writes. (`unixepoch('now','subsec')` would be the
+# modern spelling but needs SQLite >= 3.42; this expression works on every version we
+# support -- 3.37 ships with Ubuntu 22.04.) Used by any predicate whose correctness
+# depends on "is this lease alive NOW" rather than "was it alive when I looked".
+_NOW_SQL = "((julianday('now') - 2440587.5) * 86400.0)"
 
 
 def _ensure_parcel(conn: sqlite3.Connection, parcel_id: str) -> None:
@@ -71,16 +81,31 @@ def _ensure_parcel(conn: sqlite3.Connection, parcel_id: str) -> None:
     broker resolves parcel ids from a real index, so an unknown id there is a bug
     worth surfacing, not a row to conjure. The hook path is the opposite -- it is
     handed arbitrary real files by a human's agent and must coordinate whatever it
-    gets. `kind='file'` records that this parcel is coarse (whole-file) and was never
-    parsed into symbols.
+    gets.
+
+    `kind='module'` is deliberate and load-bearing. This mints exactly the id the
+    indexer itself uses for a whole-file parcel (`<path>::<module>`, MODULE_SYMBOL),
+    and the indexer records that synthetic interstitial as `kind="module"` -- so this
+    row must be indistinguishable from the one a later `POST /index` would produce
+    for the same file. `ParcelKind` is `Literal["function","method","class","module"]`
+    and every read path validates through it: `broker.load_scheduling_graph` does
+    `SELECT * FROM parcels` and `Parcel.model_validate`s EVERY row, so a row with an
+    out-of-enum kind (an earlier version of this wrote `'file'`) raises
+    ValidationError and stops the broker scheduling ANY task, for any file --
+    one hook edit to one package.json would brick the whole coordinator.
     """
     path, _, symbol = parcel_id.partition("::")
     conn.execute(
         """
         INSERT OR IGNORE INTO parcels (id, path, kind, symbol, updated_at)
-        VALUES (:id, :path, 'file', :symbol, :now)
+        VALUES (:id, :path, 'module', :symbol, :now)
         """,
-        {"id": parcel_id, "path": path, "symbol": symbol or "<module>", "now": time.time()},
+        {
+            "id": parcel_id,
+            "path": path,
+            "symbol": symbol or MODULE_SYMBOL,
+            "now": time.time(),
+        },
     )
 
 
@@ -184,25 +209,38 @@ def heartbeat(
     heartbeating a lease you no longer hold is a silent no-op, never an error.
     """
     now = time.time()
-    # `ttl_expires_at > :now` is load-bearing, not belt-and-braces: acquire() uses
-    # lazy expiry (an expired holder does not block a new acquire), so between the
-    # moment a lease expires and the moment the reaper flips its status, the row is
-    # still `status='active'` while another agent can lawfully take the parcel.
-    # Without this clause a blind heartbeat from the original holder pushes that row
-    # back into the future and BOTH rows are then active+unexpired+write on one
-    # parcel -- the exact double-lease this module exists to prevent. Matching
-    # acquire()'s predicate keeps correctness independent of the reaper having run,
-    # as this module's docstring promises.
+    # The liveness predicate is load-bearing, not belt-and-braces: acquire() uses lazy
+    # expiry (an expired holder does not block a new acquire), so between the moment a
+    # lease expires and the moment the reaper flips its status, the row is still
+    # `status='active'` while another agent can lawfully take the parcel. Without it a
+    # blind heartbeat from the original holder pushes that row back into the future and
+    # BOTH rows are then active+unexpired+write on one parcel -- the exact double-lease
+    # this module exists to prevent. It keeps correctness independent of the reaper
+    # having run, as this module's docstring promises.
+    #
+    # It compares against SQLITE'S clock (`_NOW_SQL`), not a Python `time.time()` bound
+    # before `execute`. A Python-side timestamp answers "was this lease alive when I
+    # read the clock?", and the statement may serialize arbitrarily later (GIL
+    # preemption, a busy_timeout wait of up to 5s, threadpool queueing, an event-loop
+    # stall). If the lease lapses inside that gap while another agent lawfully acquires
+    # the parcel, a stale `:now` still satisfies the predicate and revives the dead
+    # lease -- reopening the double-lease with extra steps.
+    #
+    # heartbeat is the ONLY one of the four predicates where clock staleness points the
+    # unsafe way: a stale `now` in acquire's `l.ttl_expires_at > :now` sees a conflict
+    # as MORE live (denies -> fails safe), and a stale `now` in reap_once's
+    # `ttl_expires_at <= :now` reaps FEWER rows (fails safe). Here it revives. `ttl` is
+    # a caller-supplied, unvalidated knob (POST /lease {"ttl":...}, run_agent(lease_ttl=)),
+    # so a deployment that shortens it toward request latency would reopen this in full.
     cur = conn.execute(
-        """
+        f"""
         UPDATE leases
-        SET heartbeat_at = :now, ttl_expires_at = :ttl_expires_at
+        SET heartbeat_at = {_NOW_SQL}, ttl_expires_at = {_NOW_SQL} + :ttl
         WHERE id = :lease_id AND agent_id = :agent_id AND status = 'active'
-          AND ttl_expires_at > :now
-        """,
+          AND ttl_expires_at > {_NOW_SQL}
+        """,  # noqa: S608 - _NOW_SQL is a module constant, never caller input
         {
-            "now": now,
-            "ttl_expires_at": now + ttl,
+            "ttl": ttl,
             "lease_id": lease_id,
             "agent_id": agent_id,
         },

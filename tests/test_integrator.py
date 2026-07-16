@@ -624,3 +624,46 @@ def test_post_reindex_failure_rolls_the_blackboard_back_with_trunk(conn, repo, m
         "blackboard still carries the REJECTED merge's content_hash while trunk has "
         "been reset: agents now plan against a state that never landed"
     )
+
+
+def test_gate_timeout_is_bounded_even_when_a_descendant_escapes_the_group_kill(
+    tmp_path, monkeypatch
+):
+    """The timeout must bound the gate even when the killpg does NOT reach everything.
+
+    R4 found the hole in R3's own timeout fix: `communicate()` waits for EOF on the
+    pipes, not for the direct child to die, and EOF only comes when every holder of
+    the write end exits. A grandchild that re-`setsid`s is in its own process group,
+    survives the group kill, and keeps the inherited pipe open -- so the unbounded
+    drain blocked for that descendant's whole lifetime while `post_integrate` held
+    the global `integrate_lock`. That is the permanent wedge the timeout exists to
+    prevent, reinstated by the fix's own cleanup path.
+
+    `addopts = -s` turns pytest's fd-capture off so the gate's real pipe reaches the
+    grandchild -- a setting the merged, agent-authored repo controls.
+    """
+    repo = tmp_path / "escaperepo"
+    (repo / "tests").mkdir(parents=True)
+    (repo / "pytest.ini").write_text("[pytest]\naddopts = -s\n", encoding="utf-8")
+    (repo / "mod_a.py").write_text("def helper(x):\n    return x\n", encoding="utf-8")
+    (repo / "tests" / "test_daemon.py").write_text(
+        "import subprocess, time\n\n\n"
+        "def test_starts_a_background_service():\n"
+        "    subprocess.Popen(['sleep', '120'], start_new_session=True)\n"
+        "    time.sleep(120)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SWARMSYNC_GATE_TIMEOUT", "2")
+
+    started = time.monotonic()
+    ok, log = integrator.run_impact_tests(repo, ["mod_a.py"])
+    elapsed = time.monotonic() - started
+
+    assert ok is False
+    assert "exceeded" in log
+    # 2s gate + a bounded drain. Without the drain bound this blocks ~120s on the
+    # escaped `sleep`, holding the global integrate lock the whole time.
+    assert elapsed < 30, (
+        f"gate took {elapsed:.1f}s: a descendant that escaped the group kill still "
+        f"wedges the gate (and the global integrate_lock) on the drain"
+    )
