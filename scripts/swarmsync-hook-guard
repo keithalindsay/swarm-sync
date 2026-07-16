@@ -1,0 +1,23 @@
+#!/bin/sh
+# Fast opt-in guard for the swarm-sync Claude Code hooks.
+#
+# Wired into settings.json instead of calling swarmsync-hook directly, this makes
+# NORMAL (non-coordinated) editing pay ~zero overhead: when swarm-sync is not
+# activated it exits 0 immediately without ever starting Python. It only launches
+# the real adapter when a coordinated session is active:
+#   - env SWARMSYNC_ACTIVE is set, OR
+#   - a .swarmsync-active marker file exists at the project root.
+#
+# Fail-open by construction: if the adapter is missing or errors, editing still works.
+
+HOOK_BIN="/home/keith/projects/swarm-sync/.venv/bin/swarmsync-hook"
+MARKER_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
+
+if [ -n "$SWARMSYNC_ACTIVE" ] || [ -f "$MARKER_DIR/.swarmsync-active" ]; then
+    if [ -x "$HOOK_BIN" ]; then
+        exec "$HOOK_BIN" "$@"
+    fi
+fi
+
+# Not active (or adapter unavailable): allow the tool call, do nothing.
+exit 0
