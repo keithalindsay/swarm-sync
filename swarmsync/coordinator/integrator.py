@@ -100,6 +100,12 @@ DEFAULT_TEST_DIR = "tests"
 # Override per-deployment via SWARMSYNC_GATE_TIMEOUT (seconds).
 DEFAULT_GATE_TIMEOUT_SECONDS = 600.0
 
+# How long to wait for a killed gate's output after the group kill. Short by design:
+# by this point the verdict (rejected) is already decided and the log is a nicety, so
+# there is no reason to let an escaped descendant holding the pipes delay the caller
+# -- which holds the global integrate_lock.
+_DRAIN_TIMEOUT_SECONDS = 5.0
+
 
 def _gate_timeout() -> float:
     raw = os.environ.get("SWARMSYNC_GATE_TIMEOUT")
@@ -185,6 +191,17 @@ def _reverse_dep_files(repo: Path, changed_py: set[str]) -> set[str]:
     return {
         graph.parcels_by_id[a].path for a in affected if a in graph.parcels_by_id
     }
+
+
+def _close_streams(proc: subprocess.Popen) -> None:
+    """Drop our read ends of a killed gate's pipes. Best-effort: this runs only on
+    the already-failing timeout path and must not raise into it."""
+    for stream in (proc.stdout, proc.stderr):
+        try:
+            if stream is not None:
+                stream.close()
+        except OSError:
+            pass
 
 
 def _kill_process_group(proc: subprocess.Popen) -> None:
@@ -297,7 +314,23 @@ def run_impact_tests(
         returncode = proc.returncode
     except subprocess.TimeoutExpired:
         _kill_process_group(proc)
-        stdout, stderr = proc.communicate()
+        # Draining the pipes must ALSO be bounded. `communicate()` waits for EOF on
+        # stdout/stderr, not for the direct child to die -- and EOF only arrives once
+        # EVERY holder of the write end has exited. A grandchild that re-`setsid`s
+        # (`subprocess.Popen(..., start_new_session=True)`, a double-forking daemon)
+        # is in its own process group, so the killpg above never reaches it, and it
+        # keeps the inherited pipe open. An unbounded drain here therefore blocks for
+        # that descendant's whole lifetime while `post_integrate` holds the global
+        # `integrate_lock` -- reinstating the exact permanent wedge this timeout
+        # exists to prevent. Reachable whenever the merged branch turns pytest's
+        # fd-capture off (`addopts = -s`), which the agent-authored repo controls.
+        try:
+            stdout, stderr = proc.communicate(timeout=_DRAIN_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            # A descendant escaped the group kill and still holds the pipes. Abandon
+            # the output rather than wait on it; the verdict does not depend on it.
+            stdout, stderr = "", ""
+            _close_streams(proc)
         return False, (
             f"{stdout}{stderr}\n"
             f"swarm-sync: test gate exceeded {timeout:.0f}s and was killed "

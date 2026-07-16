@@ -409,3 +409,116 @@ def test_expired_holders_heartbeat_cannot_create_a_second_live_write_lease(conn)
         f"hold {parcel_id!r} in write mode simultaneously"
     )
     assert live[0]["agent_id"] == "agent-B"
+
+
+def test_ensure_parcel_row_is_indistinguishable_from_an_indexed_module_parcel(conn):
+    """An auto-created parcel must be a row the rest of the system can READ.
+
+    R4 caught this: `_ensure_parcel` originally wrote `kind='file'`, which is not in
+    `ParcelKind` (`Literal["function","method","class","module"]`). Every read path
+    validates through that model, and `broker.load_scheduling_graph` does
+    `SELECT * FROM parcels` + `Parcel.model_validate` on EVERY row -- so one hook
+    edit to one `package.json` raised ValidationError and stopped the broker from
+    scheduling ANY task, for any file. The hook's own tests never saw it because
+    nothing on the hook path reads parcels back through the model.
+
+    The id minted here is exactly the indexer's whole-file interstitial
+    (`<path>::<module>`), so the row must match what a later POST /index produces.
+    """
+    from swarmsync.blackboard.models import Parcel
+    from swarmsync.classifier.indexer import MODULE_SYMBOL
+
+    r = leases.acquire(
+        conn, f"package.json::{MODULE_SYMBOL}", "agent-1", mode="write", ensure_parcel=True
+    )
+    assert r.granted is True
+
+    row = conn.execute(
+        "SELECT * FROM parcels WHERE id = ?", (f"package.json::{MODULE_SYMBOL}",)
+    ).fetchone()
+    assert row is not None
+
+    # The row must survive the model every reader validates through.
+    parcel = Parcel.model_validate(dict(row))
+    assert parcel.kind == "module", (
+        f"auto-created parcel kind {parcel.kind!r} is not what the indexer emits for "
+        f"a <module> interstitial; readers that validate through ParcelKind will break"
+    )
+    assert parcel.path == "package.json"
+    assert parcel.symbol == MODULE_SYMBOL
+
+
+def test_hook_leasing_an_unindexed_file_does_not_brick_the_broker(conn, tmp_path):
+    """The consequence, end to end: the broker must still schedule after a hook
+    lease on a non-.py file. `load_scheduling_graph` validates every parcel row, so
+    a single bad row is not a local defect -- it is total loss of dispatch."""
+    from swarmsync.classifier.store import run_index
+    from swarmsync.coordinator import broker
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "mod.py").write_text("def f(x):\n    return x\n", encoding="utf-8")
+    run_index(conn, repo)
+    assert broker.load_scheduling_graph(conn, repo) is not None
+
+    # Exactly what the hook does for an unindexed file.
+    leases.acquire(conn, "package.json::<module>", "agent-1", mode="write", ensure_parcel=True)
+
+    graph, frozen = broker.load_scheduling_graph(conn, repo)
+    assert graph is not None, "one hook-leased non-.py file broke ALL broker dispatch"
+
+
+def test_heartbeat_predicate_uses_sqlites_clock_not_a_stale_python_one(conn):
+    """The liveness check must be evaluated at WRITE time, not at bind time.
+
+    R4 found R3's P1-1 fix agreed with `acquire` textually but not semantically: it
+    compared against a Python `time.time()` read before `conn.execute`, so the
+    predicate answered "was this lease alive when I read the clock?". The statement
+    can serialize arbitrarily later (GIL preemption, a busy_timeout wait of up to 5s,
+    an event-loop stall). If the lease lapses in that gap while another agent lawfully
+    takes the parcel, the stale timestamp still satisfies the predicate and revives
+    the dead lease -- the double-lease again.
+
+    The delay here is injected between the clock read and SQLite serializing the
+    UPDATE. It schedules an interleaving; it changes no predicate and no value.
+    """
+    parcel_id = _make_parcel(conn)
+    a = leases.acquire(conn, parcel_id, "agent-A", mode="write", ttl=0.30)
+    assert a.granted is True
+
+    class _SlowConn:
+        """Delays A's heartbeat UPDATE so its lease lapses before it serializes."""
+
+        def __init__(self, real):
+            self._real = real
+            self._fired = False
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+        def execute(self, sql, *args, **kwargs):
+            low = " ".join(sql.split()).lower()
+            if not self._fired and low.startswith("update leases") and "heartbeat_at" in low:
+                self._fired = True
+                time.sleep(0.40)  # A's 0.30s TTL lapses inside this window...
+                # ...and B lawfully takes the parcel via acquire()'s lazy expiry.
+                b = leases.acquire(self._real, parcel_id, "agent-B", mode="write", ttl=5.0)
+                assert b.granted is True, "setup: B should win the lapsed parcel"
+            return self._real.execute(sql, *args, **kwargs)
+
+    revived = leases.heartbeat(_SlowConn(conn), a.lease_id, "agent-A", ttl=1.0)
+    assert revived is False, (
+        "a heartbeat bound before the lease lapsed still revived it: the predicate is "
+        "reading a stale Python clock instead of SQLite's write-time clock"
+    )
+
+    live = conn.execute(
+        "SELECT id, agent_id FROM leases "
+        "WHERE parcel_id = ? AND status = 'active' AND ttl_expires_at > ?",
+        (parcel_id, time.time()),
+    ).fetchall()
+    assert len(live) == 1, (
+        f"DOUBLE LEASE via stale-clock revival: "
+        f"{[(r['id'], r['agent_id']) for r in live]} both hold {parcel_id!r}"
+    )
+    assert live[0]["agent_id"] == "agent-B"
