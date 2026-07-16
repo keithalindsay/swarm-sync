@@ -196,6 +196,40 @@ def test_index_repo_walks_all_py_files_and_skips_junk_dirs(tmp_path):
     assert not any(pid.startswith("__pycache__") for pid in ids)
 
 
+def test_index_repo_skips_malformed_file_and_indexes_the_rest(tmp_path, caplog):
+    """S2 regression: one unparseable `.py` must not abort the whole index.
+
+    Before the guard, `index_repo` let the malformed file's `SyntaxError` (and,
+    for bad bytes, `UnicodeDecodeError`) propagate out of `parse_file`, so a
+    single broken file in the repo took the entire parcel map down with it.
+    """
+    (tmp_path / "good_a.py").write_text("def a():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "good_b.py").write_text(
+        "class B:\n    def m(self):\n        return 2\n", encoding="utf-8"
+    )
+    # syntactically broken Python
+    (tmp_path / "broken_syntax.py").write_text("def oops(:\n    pass\n", encoding="utf-8")
+    # invalid UTF-8 bytes -> UnicodeDecodeError inside parse_file
+    (tmp_path / "broken_bytes.py").write_bytes(b"\xff\xfe def x(): pass\n")
+
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        parcels = index_repo(tmp_path)  # must not raise
+
+    ids = {p.id for p in parcels}
+    # the good files are fully indexed...
+    assert "good_a.py::a" in ids
+    assert "good_b.py::B.m" in ids
+    # ...and neither broken file contributed any parcels
+    assert not any(pid.startswith("broken_syntax.py") for pid in ids)
+    assert not any(pid.startswith("broken_bytes.py") for pid in ids)
+    # each skip is logged (not swallowed silently)
+    skipped = {rec.getMessage() for rec in caplog.records}
+    assert any("broken_syntax.py" in m for m in skipped)
+    assert any("broken_bytes.py" in m for m in skipped)
+
+
 def test_index_repo_reindex_is_deterministic(tmp_path):
     (tmp_path / "a.py").write_text(FIXTURE_SOURCE, encoding="utf-8")
     first = {p.id: p.content_hash for p in index_repo(tmp_path)}

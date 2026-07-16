@@ -150,6 +150,82 @@ def test_reap_once_default_now_is_real_time(conn):
     assert len(reaped_ids) == 1
 
 
+# --- S2 regression: reaper vs a heartbeat that renews ttl (TOCTOU) ----------------
+
+
+class _RaceConn:
+    """Connection proxy that fires `on_reap_read` in the reaper's critical window.
+
+    Models a heartbeat that renews a lease's ttl concurrently with `reap_once`,
+    landing at exactly the moment that distinguishes the atomic fix from the old
+    two-step (SELECT-then-UPDATE) form:
+
+    - NEW (one atomic `UPDATE ... WHERE ttl_expires_at<=now RETURNING`): the
+      renewal is applied just BEFORE that statement runs, so its own WHERE now
+      sees a future ttl and skips the row.
+    - OLD (SELECT expired ids, then per-row `UPDATE ... WHERE status='active'`):
+      the renewal lands AFTER the SELECT snapshot but BEFORE the UPDATE, which
+      re-checked only `status` and reaped the freshly-renewed lease anyway.
+
+    Either way the invariant under test is the same: a lease renewed in that
+    window must be left `active`, never reaped.
+    """
+
+    def __init__(self, real, on_reap_read):
+        self._real = real
+        self._on_reap_read = on_reap_read
+        self._fired = False
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def execute(self, sql, *args, **kwargs):
+        low = " ".join(sql.split()).lower()
+        is_atomic_reap = (
+            "update leases" in low and "reaped" in low and "ttl_expires_at" in low
+        )
+        is_reap_select = (
+            low.startswith("select") and "from leases" in low and "ttl_expires_at" in low
+        )
+        if not self._fired and is_atomic_reap:
+            # NEW code path: renew immediately BEFORE the atomic reap statement.
+            self._fired = True
+            self._on_reap_read()
+            return self._real.execute(sql, *args, **kwargs)
+        if not self._fired and is_reap_select:
+            # OLD code path: let the candidate read happen, THEN renew, before
+            # the per-row UPDATE that follows.
+            cur = self._real.execute(sql, *args, **kwargs)
+            self._fired = True
+            self._on_reap_read()
+            return cur
+        return self._real.execute(sql, *args, **kwargs)
+
+
+def test_reap_once_excludes_lease_renewed_by_heartbeat_in_the_race_window(conn):
+    parcel_id = _make_parcel(conn)
+    # Lease starts already expired (a crashed-looking agent) so it is a reap
+    # candidate at `now`...
+    r = leases.acquire(conn, parcel_id, "agent-dead", mode="write", ttl=-1.0)
+    assert r.granted is True
+
+    def renew():
+        # ...but a heartbeat renews it far into the future inside the race window.
+        assert leases.heartbeat(conn, r.lease_id, "agent-dead", ttl=10_000.0) is True
+
+    race = _RaceConn(conn, renew)
+    reaped = reaper.reap_once(race, now=time.time())
+
+    # The renewed lease must NOT be reaped (fails on the old SELECT-then-UPDATE).
+    assert r.lease_id not in reaped
+    row = conn.execute(
+        "SELECT status FROM leases WHERE id = ?", (r.lease_id,)
+    ).fetchone()
+    assert row["status"] == "active"
+    reaped_events = [e for e in events.tail(conn, since_seq=0) if e.type == "reaped"]
+    assert reaped_events == []
+
+
 # --- decay_once --------------------------------------------------------------------
 
 
@@ -237,7 +313,7 @@ async def test_run_can_be_cancelled_cleanly(conn):
         await task
 
 
-# --- wired into server/app.py's lifespan (DESIGN §4.2 "Background (startup)") ------
+# --- wired into server/app.py's lifespan (DESIGN §4.2, §6) -------------------------
 
 
 def test_reaper_is_wired_into_app_lifespan_and_reaps_expired_leases(tmp_path):
@@ -249,26 +325,32 @@ def test_reaper_is_wired_into_app_lifespan_and_reaps_expired_leases(tmp_path):
     from fastapi.testclient import TestClient
 
     app = create_app(tmp_path / "blackboard.db", reaper_interval=0.05)
-    with TestClient(app) as client:
+    with TestClient(app):
         conn = app.state.conn
         parcel_id = _make_parcel(conn)
         r = leases.acquire(conn, parcel_id, "agent-dead", mode="write", ttl=-1.0)
         assert r.granted is True
 
+        # Poll on the `reaped` EVENT, not the intermediate lease `status`: the
+        # reaper marks the row `reaped` and THEN emits the event (two steps on
+        # its own connection), so waiting on `status=='reaped'` via this separate
+        # inspection connection can observe the status before the event lands --
+        # a test race. The event is the end-state we actually assert on.
         deadline = time.time() + 2.0
+        reaped_events: list = []
         while time.time() < deadline:
-            row = conn.execute(
-                "SELECT status FROM leases WHERE id = ?", (r.lease_id,)
-            ).fetchone()
-            if row["status"] == "reaped":
+            reaped_events = [
+                e for e in events.tail(conn, since_seq=0) if e.type == "reaped"
+            ]
+            if reaped_events:
                 break
             time.sleep(0.05)
         else:
             pytest.fail("background reaper never reaped the expired lease in time")
 
-        reaped_events = [
-            e for e in events.tail(conn, since_seq=0) if e.type == "reaped"
-        ]
+        assert conn.execute(
+            "SELECT status FROM leases WHERE id = ?", (r.lease_id,)
+        ).fetchone()["status"] == "reaped"
         assert len(reaped_events) == 1
 
 
@@ -276,7 +358,7 @@ def test_reaper_interval_none_disables_background_loop(tmp_path):
     from fastapi.testclient import TestClient
 
     app = create_app(tmp_path / "blackboard.db", reaper_interval=None)
-    with TestClient(app) as client:
+    with TestClient(app):
         conn = app.state.conn
         parcel_id = _make_parcel(conn)
         r = leases.acquire(conn, parcel_id, "agent-dead", mode="write", ttl=-1.0)

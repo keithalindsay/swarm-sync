@@ -212,6 +212,18 @@ def load_scheduling_graph(conn: sqlite3.Connection, repo: StrPath) -> tuple[DepG
     return graph, frozen_ids
 
 
+def _resolved_parcels(conn: sqlite3.Connection, task: Task, mode: str) -> list[Parcel]:
+    """Load every parcel a task resolves to. `resolve_task` only returns ids that
+    have a live parcel (it raises otherwise), so each load is non-None here; the
+    assert pins that invariant for the `co_schedulable(Parcel, Parcel)` contract."""
+    parcels: list[Parcel] = []
+    for pid in resolve_task(conn, task, mode=mode):
+        parcel = _load_parcel(conn, pid)
+        assert parcel is not None
+        parcels.append(parcel)
+    return parcels
+
+
 def schedulable(
     conn: sqlite3.Connection,
     task_a: Task,
@@ -223,8 +235,8 @@ def schedulable(
     """True iff every parcel `task_a` targets is `co_schedulable` with every
     parcel `task_b` targets (DESIGN §3: "two tasks are safely parallel iff
     their whole target-parcel sets are pairwise co-schedulable")."""
-    parcels_a = [_load_parcel(conn, pid) for pid in resolve_task(conn, task_a, mode=mode)]
-    parcels_b = [_load_parcel(conn, pid) for pid in resolve_task(conn, task_b, mode=mode)]
+    parcels_a = _resolved_parcels(conn, task_a, mode=mode)
+    parcels_b = _resolved_parcels(conn, task_b, mode=mode)
     return all(
         co_schedulable(pa, pb, mode=mode, graph=graph, frozen_ids=frozen_ids)
         for pa in parcels_a

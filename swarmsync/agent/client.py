@@ -23,7 +23,7 @@ SDK worker later: the wire protocol/methods below stay identical; only
 """
 from __future__ import annotations
 
-from typing import Any, Optional, Protocol
+from typing import Any, Optional, Protocol, cast
 
 import httpx
 
@@ -38,7 +38,10 @@ class BlackboardClient:
 
     def __init__(self, http: "_HttpLike | str") -> None:
         if isinstance(http, str):
-            self._http: _HttpLike = httpx.Client(base_url=http)
+            # httpx.Client satisfies the duck-typed `.get(url, **kw)`/`.post(url, **kw)`
+            # protocol at runtime; its nominal signatures differ (keyword-only params),
+            # so cast rather than let mypy reject the structurally-compatible transport.
+            self._http: _HttpLike = cast(_HttpLike, httpx.Client(base_url=http))
             self._owns_http = True
         else:
             self._http = http
@@ -116,10 +119,17 @@ class BlackboardClient:
         r.raise_for_status()
         return r.json()
 
-    def heartbeat(self, agent_id: str, lease_id: int) -> bool:
-        r = self._http.post(
-            "/heartbeat", json={"agent_id": agent_id, "lease_id": lease_id}
-        )
+    def heartbeat(
+        self, agent_id: str, lease_id: int, ttl: Optional[float] = None
+    ) -> bool:
+        """`POST /heartbeat` -> renew the lease's TTL. `ttl` (seconds) overrides
+        the server's default renewal window when given -- the hook keepalive (S5)
+        passes its own long TTL here so a renewed lease keeps the long window,
+        not the short server default."""
+        body: dict[str, Any] = {"agent_id": agent_id, "lease_id": lease_id}
+        if ttl is not None:
+            body["ttl"] = ttl
+        r = self._http.post("/heartbeat", json=body)
         r.raise_for_status()
         return bool(r.json()["ok"])
 

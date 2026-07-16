@@ -250,3 +250,101 @@ def test_acquire_on_nonexistent_parcel_raises_integrity_error(conn):
 
     with pytest.raises(sqlite3.IntegrityError):
         leases.acquire(conn, "does.not.exist", "agent-1", mode="write")
+
+
+# --- concurrency: barrier-gated CAS is exactly-once, and returns each grant's
+#     own lease id (pins the `sqlite3_last_insert_rowid()` race, DESIGN §5.2) -------
+
+
+def test_barrier_gated_write_acquires_on_one_parcel_grant_exactly_once(conn):
+    """N threads race a write-acquire on the SAME parcel, released together by a
+    barrier to maximize contention. The CAS must grant EXACTLY ONE of them and
+    leave EXACTLY ONE active lease row -- the load-bearing mutual-exclusion
+    guarantee (DESIGN §5.2). The granted lease id must be the id of that one
+    active row (not some sibling's, which the old `cur.lastrowid` read could
+    have handed back)."""
+    import threading
+
+    parcel_id = _make_parcel(conn)
+    n_threads = 24
+    barrier = threading.Barrier(n_threads)
+    results: list[object] = []
+    lock = threading.Lock()
+
+    def worker(i: int) -> None:
+        barrier.wait()  # release all contenders at once
+        r = leases.acquire(conn, parcel_id, f"agent-{i}", mode="write")
+        with lock:
+            results.append(r)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    granted = [r for r in results if r.granted]
+    denied = [r for r in results if not r.granted]
+    assert len(granted) == 1, f"expected exactly 1 grant, got {len(granted)}"
+    assert len(denied) == n_threads - 1
+
+    active = conn.execute(
+        "SELECT id FROM leases WHERE parcel_id = ? AND status = 'active'", (parcel_id,)
+    ).fetchall()
+    assert len(active) == 1, "exactly one active lease must exist on a contended parcel"
+    # the grant reported ITS OWN row's id, not a racing sibling insert's.
+    assert granted[0].lease_id == active[0]["id"]
+
+
+def test_barrier_gated_acquires_on_distinct_parcels_return_distinct_lease_ids(conn):
+    """N threads each write-acquire their OWN distinct parcel behind a barrier.
+    Distinct parcels never conflict, so ALL must grant -- and each returned
+    `lease_id` must be that acquire's OWN inserted row (a clean bijection).
+
+    This pins the `emit`/`acquire` lastrowid regression: `cur.lastrowid` reads
+    the per-CONNECTION `sqlite3_last_insert_rowid()` after the GIL is re-acquired
+    post-step, so a sibling INSERT on this one shared connection lands in that
+    window and hands the call back a DIFFERENT lease's id. `INSERT ... RETURNING
+    id` reads each statement's own result and is immune. Empirically the old
+    form makes distinct grants collide on the same id here."""
+    import threading
+
+    n_threads, per_thread = 8, 12
+    total = n_threads * per_thread
+    # id -> the parcel that acquire actually created a row for.
+    for k in range(total):
+        _make_parcel(conn, parcel_id=f"p{k}.py::foo")
+
+    barrier = threading.Barrier(n_threads)
+    observed: list[tuple[str, int]] = []  # (requested_parcel_id, returned_lease_id)
+    lock = threading.Lock()
+
+    def worker(t_idx: int) -> None:
+        my_parcels = [f"p{t_idx * per_thread + j}.py::foo" for j in range(per_thread)]
+        barrier.wait()
+        local = []
+        for pid in my_parcels:
+            r = leases.acquire(conn, pid, f"agent-{t_idx}", mode="write")
+            assert r.granted, f"distinct parcel {pid} should never be denied"
+            local.append((pid, r.lease_id))
+        with lock:
+            observed.extend(local)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(observed) == total
+    returned_ids = [lid for _pid, lid in observed]
+    assert len(set(returned_ids)) == total, "concurrent acquires returned duplicate lease ids"
+
+    # Every returned id truly belongs to the parcel that acquire was called for
+    # (the id was not clobbered by a sibling insert on the shared connection).
+    row_parcel = {
+        row["id"]: row["parcel_id"]
+        for row in conn.execute("SELECT id, parcel_id FROM leases").fetchall()
+    }
+    for requested_pid, returned_id in observed:
+        assert row_parcel[returned_id] == requested_pid

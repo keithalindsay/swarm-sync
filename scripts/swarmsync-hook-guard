@@ -9,12 +9,35 @@
 #   - a .swarmsync-active marker file exists at the project root.
 #
 # Fail-open by construction: if the adapter is missing or errors, editing still works.
+#
+# HOOK_BIN resolution (no hardcoded path -- this script must keep working
+# regardless of where the repo/venv is checked out, or under an install that
+# isn't a venv at all):
+#   1. `command -v swarmsync-hook` -- whatever the console script resolves to
+#      on PATH (an activated venv, a pipx shim, a system install, ...).
+#   2. Fall back to the sibling `../.venv/bin/swarmsync-hook` relative to this
+#      script's own location (`scripts/` next to the repo-root `.venv/`) --
+#      covers settings.json wiring this script by absolute path with a PATH
+#      that doesn't include the venv's bin/.
 
-HOOK_BIN="/home/keith/projects/swarm-sync/.venv/bin/swarmsync-hook"
+resolve_hook_bin() {
+    if command -v swarmsync-hook >/dev/null 2>&1; then
+        command -v swarmsync-hook
+        return 0
+    fi
+    script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+    candidate="$script_dir/../.venv/bin/swarmsync-hook"
+    if [ -x "$candidate" ]; then
+        echo "$candidate"
+        return 0
+    fi
+    return 1
+}
+
 MARKER_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
 
 if [ -n "$SWARMSYNC_ACTIVE" ] || [ -f "$MARKER_DIR/.swarmsync-active" ]; then
-    if [ -x "$HOOK_BIN" ]; then
+    if HOOK_BIN=$(resolve_hook_bin) && [ -x "$HOOK_BIN" ]; then
         exec "$HOOK_BIN" "$@"
     fi
 fi

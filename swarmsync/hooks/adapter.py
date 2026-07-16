@@ -16,10 +16,13 @@ process invocation):
                 whole-file parcel id, checks the blackboard's active leases, and
                 either allows (free, or already held by this same agent_id) or
                 acquires a fresh write-lease (free) or denies (held by another
-                agent, or this agent lost the acquire race).
+                agent, or this agent lost the acquire race). Refreshes the TTL of
+                a lease this agent already holds (S5 keepalive).
   postupdate    PostToolUse. Re-parses the edited file with
                 `classifier.indexer.parse_file` and POSTs the freshly re-derived
-                content_hash + a deterministic state_summary to /parcel/update.
+                content_hash + a deterministic state_summary to /parcel/update
+                (or a raw-byte hash + 'dirty/unparseable' marker if the edit left
+                the file syntactically invalid). Refreshes the lease TTL (S5).
                 Never releases the lease here -- the agent keeps it until it
                 stops (SubagentStop/Stop -> `release`).
   release       SubagentStop/Stop. Releases every active lease this agent_id
@@ -63,6 +66,7 @@ gets stuck.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -81,6 +85,17 @@ DEFAULT_SWARMSYNC_URL = "http://127.0.0.1:8787"
 _DEFAULT_TIMEOUT_SECONDS = 2.0
 ACTIVE_MARKER_FILENAME = ".swarmsync-active"
 
+# S5 keepalive: the TTL the hook acquires/renews a lease with. The server's own
+# default lease TTL is 30s (`server.leases.DEFAULT_TTL_SECONDS`) -- far too short
+# to survive normal agent think time between a precheck and its postupdate (a
+# single big edit can take longer than that to generate), which would silently
+# expire the "one-agent-per-file" lease mid-session and let the reaper hand the
+# file to someone else. So the hook acquires with a MUCH longer TTL and renews it
+# on every precheck AND postupdate (see `cmd_precheck`/`cmd_postupdate`). Override
+# with `SWARMSYNC_LEASE_TTL` (seconds); the tests use a short value to exercise
+# renewal across a window quickly.
+DEFAULT_HOOK_LEASE_TTL_SECONDS = 300.0
+
 # Tool names `precheck`/`postupdate` care about; every other `tool_name` is an
 # immediate ALLOW / no-op. Matches Claude Code's Edit-family tool set.
 EDIT_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
@@ -92,8 +107,51 @@ EDIT_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
 HttpFactory = Callable[[str], Any]
 
 
+def _hook_lease_ttl() -> float:
+    """The lease TTL (seconds) the hook acquires/renews with -- `SWARMSYNC_LEASE_TTL`
+    if it parses as a float, else `DEFAULT_HOOK_LEASE_TTL_SECONDS`."""
+    raw = os.environ.get("SWARMSYNC_LEASE_TTL")
+    if raw is None:
+        return DEFAULT_HOOK_LEASE_TTL_SECONDS
+    try:
+        return float(raw)
+    except ValueError:
+        return DEFAULT_HOOK_LEASE_TTL_SECONDS
+
+
 def _default_http_factory(base_url: str) -> httpx.Client:
-    return httpx.Client(base_url=base_url, timeout=_DEFAULT_TIMEOUT_SECONDS)
+    # S3 security: if the operator gated the blackboard with SWARMSYNC_TOKEN, send it
+    # as a bearer token on every request so the hook can still reach the (now
+    # authenticated) mutating routes. Unset -> no header, open blackboard, unchanged
+    # behavior. The header is a default on the client, so it rides along on both the
+    # BlackboardClient calls and cmd_session_start's direct http.post.
+    headers: dict[str, str] = {}
+    token = os.environ.get("SWARMSYNC_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return httpx.Client(
+        base_url=base_url, timeout=_DEFAULT_TIMEOUT_SECONDS, headers=headers
+    )
+
+
+_USAGE = (
+    "swarmsync-hook <subcommand>\n"
+    "\n"
+    "Claude Code hooks adapter for swarm-sync lease coordination. Reads a JSON\n"
+    "hook-event payload on stdin; the subcommand is the first argument.\n"
+    "\n"
+    "Subcommands:\n"
+    "  precheck       PreToolUse  -- lease-gate an Edit/Write/MultiEdit/NotebookEdit\n"
+    "  postupdate     PostToolUse -- re-hash the edited file, POST /parcel/update\n"
+    "  release        Stop/SubagentStop -- release this agent's active leases\n"
+    "  session-start  SessionStart -- best-effort POST /index of the repo root\n"
+    "\n"
+    "Environment:\n"
+    "  SWARMSYNC_ACTIVE=1        enable enforcement (else every subcommand no-ops)\n"
+    "  SWARMSYNC_URL            blackboard base URL (default http://127.0.0.1:8787)\n"
+    "  SWARMSYNC_TOKEN          bearer token sent when the blackboard requires auth\n"
+    "  SWARMSYNC_LEASE_TTL      lease TTL seconds the hook acquires/renews with\n"
+)
 
 
 # --- activation ----------------------------------------------------------------
@@ -120,14 +178,26 @@ def _relpath(file_path: Optional[str], repo_root: Path) -> Optional[str]:
     against `repo_root` and return a POSIX-style repo-relative path, or
     `None` if `file_path` is missing or resolves outside `repo_root`
     (nothing to lease -- treated as ALLOW/no-op by every caller).
+
+    Symlink policy (S5): resolve the PARENT directory (canonicalizes `..` and
+    symlinked parent dirs, so a genuine escape out of the repo still returns
+    None) but KEEP the leaf name -- do NOT follow a leaf symlink to its target.
+    `classifier.indexer.index_repo` walks the tree and records each `.py` file's
+    ON-DISK location relative to the repo root (an indexed symlinked `.py` gets a
+    parcel id under its own name, not its target's), so the hook must map the
+    same way or the parcel-id lookup misses and the edit silently bypasses the
+    lease. The old `abs_p.resolve()` followed the leaf symlink, which either
+    escaped the repo (ValueError -> None -> no lease at all) or mapped to a
+    different path than the indexer used (lease check on the wrong parcel).
     """
     if not file_path:
         return None
     p = Path(file_path)
     abs_p = p if p.is_absolute() else (repo_root / p)
     try:
-        rel = abs_p.resolve().relative_to(repo_root.resolve())
-    except ValueError:
+        resolved = abs_p.parent.resolve() / abs_p.name
+        rel = resolved.relative_to(repo_root.resolve())
+    except (ValueError, OSError):
         return None
     return rel.as_posix()
 
@@ -181,6 +251,22 @@ def _find_holder(leases: list[dict], parcel_id: str) -> Optional[str]:
     return None
 
 
+def _find_lease(leases: list[dict], parcel_id: str) -> Optional[dict]:
+    """The active lease dict for `parcel_id` (with its `id`/`agent_id`), or None."""
+    for lease in leases:
+        if lease.get("parcel_id") == parcel_id:
+            return lease
+    return None
+
+
+def _keepalive(client: BlackboardClient, agent_id: str, lease: dict) -> None:
+    """Refresh (heartbeat) `agent_id`'s own lease's TTL so it doesn't silently
+    expire during think time (S5). No-op if the lease has no usable id."""
+    lease_id = lease.get("id")
+    if lease_id is not None:
+        client.heartbeat(agent_id, lease_id, ttl=_hook_lease_ttl())
+
+
 def cmd_precheck(
     tool_name: Optional[str],
     tool_input: Mapping[str, Any],
@@ -192,12 +278,12 @@ def cmd_precheck(
 
     Non-edit tools and files outside the repo are an immediate `None` (ALLOW)
     without touching the blackboard at all. For an in-repo edit target:
-      - already leased by THIS agent_id -> ALLOW (re-editing your own leased
-        file must never self-deny);
+      - already leased by THIS agent_id -> refresh the TTL (S5 keepalive) and
+        ALLOW (re-editing your own leased file must never self-deny);
       - leased by ANOTHER agent_id -> DENY;
-      - free -> acquire a write lease; ALLOW on grant, DENY if the acquire
-        itself loses the race (another agent's acquire won between our
-        `GET /leases` read and our `POST /lease`).
+      - free -> acquire a write lease (with the hook's long, renewing TTL);
+        ALLOW on grant, DENY if the acquire itself loses the race (another
+        agent's acquire won between our `GET /leases` read and our `POST /lease`).
     """
     if tool_name not in EDIT_TOOLS:
         return None
@@ -207,13 +293,20 @@ def cmd_precheck(
         return None
     parcel_id = _parcel_id(relpath)
 
-    holder = _find_holder(client.leases(), parcel_id)
-    if holder is not None:
-        if holder == agent_id:
+    lease = _find_lease(client.leases(), parcel_id)
+    if lease is not None:
+        owner = lease.get("agent_id") or "another agent"
+        if owner == agent_id:
+            # KEEPALIVE: the hook is stateless across invocations, so the lease
+            # id is re-read here rather than remembered; bumping its TTL on every
+            # precheck keeps the "one-agent-per-file" lease alive across the think
+            # time between successive edits instead of letting the 30s server TTL
+            # expire it out from under a still-active agent.
+            _keepalive(client, agent_id, lease)
             return None
-        return _deny_response(relpath, holder)
+        return _deny_response(relpath, owner)
 
-    result = client.lease(agent_id, parcel_id, mode="write")
+    result = client.lease(agent_id, parcel_id, mode="write", ttl=_hook_lease_ttl())
     if result.get("granted"):
         return None
 
@@ -242,6 +335,16 @@ def _state_summary(relpath: str, agent_id: str, parcels: list, module_parcel) ->
     )
 
 
+def _dirty_summary(relpath: str, agent_id: str, exc: Exception) -> str:
+    """DETERMINISTIC marker for a syntactically-invalid edited file (no
+    wall-clock/randomness): names the failure class, not its message (line
+    numbers / offsets in the message would make it non-reproducible)."""
+    return (
+        f"swarm-sync hook: {relpath} edited by {agent_id}; "
+        f"DIRTY/UNPARSEABLE ({type(exc).__name__})"
+    )
+
+
 def cmd_postupdate(
     tool_name: Optional[str],
     tool_input: Mapping[str, Any],
@@ -251,8 +354,17 @@ def cmd_postupdate(
 ) -> None:
     """Re-parse the just-edited file and POST its fresh content_hash (never
     the agent's self-reported one -- DESIGN §5.4/§6 "lying blackboard" rule)
-    plus a deterministic state_summary to `/parcel/update`. Never releases
-    the lease (the agent keeps it until SubagentStop/Stop -> `release`).
+    plus a deterministic state_summary to `/parcel/update`. Also refreshes the
+    agent's lease TTL (S5 keepalive). Never releases the lease (the agent keeps
+    it until SubagentStop/Stop -> `release`).
+
+    If the edit left the file syntactically INVALID (SyntaxError) or unreadable
+    as UTF-8 (UnicodeDecodeError), we do NOT silently no-out: that would leave
+    the blackboard advertising the STALE last-good content_hash, hiding that the
+    file is now dirty. Instead we push a raw whole-file byte hash + a
+    'DIRTY/UNPARSEABLE' state_summary, so the parcel's content_hash genuinely
+    changes and the summary flags that it can't be parsed until the agent fixes
+    it (the integrator's re-index/test gate is the eventual backstop).
     """
     if tool_name not in EDIT_TOOLS:
         return
@@ -262,13 +374,33 @@ def cmd_postupdate(
     abs_path = repo_root / relpath
     if not abs_path.exists():
         return  # e.g. the edit deleted the file; nothing left to re-hash
-
-    parcels = parse_file(abs_path, rel_path=relpath)
     parcel_id = _parcel_id(relpath)
+
+    # KEEPALIVE (S5): refresh this agent's lease on the edited parcel before
+    # anything that could raise, so a long edit doesn't let the lease expire.
+    lease = _find_lease(client.leases(), parcel_id)
+    if lease is not None and lease.get("agent_id") == agent_id:
+        _keepalive(client, agent_id, lease)
+
+    try:
+        parcels = parse_file(abs_path, rel_path=relpath)
+    except (SyntaxError, UnicodeDecodeError, ValueError) as exc:
+        # Unparseable edit: push a raw-byte content_hash + dirty marker instead
+        # of a silent no-op (SyntaxError / a NUL byte -> ValueError from
+        # ast.parse / invalid UTF-8 -> UnicodeDecodeError).
+        raw_hash = hashlib.sha256(abs_path.read_bytes()).hexdigest()
+        client.parcel_update(
+            agent_id, parcel_id, raw_hash, _dirty_summary(relpath, agent_id, exc)
+        )
+        return
+
     module_parcel = next((p for p in parcels if p.id == parcel_id), None)
     if module_parcel is None:
         return  # should be unreachable (parse_file always emits the module parcel)
 
+    # `parse_file` always populates content_hash; the model types it Optional
+    # (schema allows NULL), so pin the invariant for the str-typed update API.
+    assert module_parcel.content_hash is not None
     client.parcel_update(
         agent_id,
         parcel_id,
@@ -336,7 +468,7 @@ def _dispatch(
 
     base_url = os.environ.get("SWARMSYNC_URL", DEFAULT_SWARMSYNC_URL)
     owns_http = http_factory is None
-    factory = http_factory or _default_http_factory
+    factory: HttpFactory = http_factory or _default_http_factory
     http = factory(base_url)
     try:
         client = BlackboardClient(http)
@@ -394,6 +526,13 @@ def main(
     if not argv:
         return 0  # no subcommand given -- nothing to enforce, ALLOW
     subcommand = argv[0]
+
+    # `--help`/`-h`: print usage and exit 0. Only ever invoked by a human at a
+    # shell (Claude Code's hook runner passes a real subcommand), so writing to
+    # stdout here never interferes with the deny-JSON protocol.
+    if subcommand in ("-h", "--help"):
+        out.write(_USAGE)
+        return 0
 
     try:
         raw = stdin.read()

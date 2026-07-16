@@ -24,6 +24,7 @@ from __future__ import annotations
 import io
 import json
 import textwrap
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -174,7 +175,7 @@ def test_marker_file_activates_without_env_var(monkeypatch, repo, indexed_client
     assert code == 0
     assert out == ""
     leases = indexed_client.get("/leases").json()
-    assert any(l["agent_id"] == "agent-1" for l in leases)
+    assert any(lease["agent_id"] == "agent-1" for lease in leases)
 
 
 # --- non-edit tool -> ALLOW ---------------------------------------------------------
@@ -447,7 +448,7 @@ def test_release_only_releases_calling_agents_leases(monkeypatch, repo, indexed_
 
     assert code == 0
     leases = indexed_client.get("/leases").json()
-    assert [l["agent_id"] for l in leases] == ["agent-2"]
+    assert [lease["agent_id"] for lease in leases] == ["agent-2"]
 
 
 def test_release_is_a_noop_when_agent_holds_no_leases(monkeypatch, repo, indexed_client):
@@ -506,4 +507,163 @@ def test_unknown_subcommand_is_a_noop_allow(monkeypatch, repo, indexed_client):
     payload = _payload("Edit", file_path=str(repo / "mod_a.py"), cwd=str(repo), agent_id="agent-1")
     code, out, err = _run("some-future-hook", payload, http_factory=_http_factory(indexed_client))
     assert code == 0
+
+
+# --- S5 keepalive: precheck/postupdate refresh the lease TTL -----------------------
+
+
+def _lease_for(client, parcel_id):
+    return next(
+        (ls for ls in client.get("/leases").json() if ls["parcel_id"] == parcel_id),
+        None,
+    )
+
+
+def test_precheck_refreshes_ttl_on_own_held_lease(monkeypatch, repo, indexed_client):
+    """S5: a precheck for a file THIS agent already leases must bump the lease's
+    TTL (keepalive), not just silently ALLOW -- otherwise the 30s server TTL
+    expires during think time and the reaper hands the file to someone else.
+    Fails on pre-S5 (precheck returned None with no heartbeat)."""
+    monkeypatch.setenv("SWARMSYNC_ACTIVE", "1")
+    monkeypatch.setenv("SWARMSYNC_LEASE_TTL", "0.5")
+    parcel_id = f"mod_a.py::{MODULE_SYMBOL}"
+    held = indexed_client.post(
+        "/lease",
+        json={"agent_id": "a1", "parcel_id": parcel_id, "mode": "write", "ttl": 0.5},
+    ).json()
+    assert held["granted"]
+    before = _lease_for(indexed_client, parcel_id)
+
+    time.sleep(0.2)  # still inside the 0.5s window -- lease is live
+    payload = _payload("Edit", file_path=str(repo / "mod_a.py"), cwd=str(repo), agent_id="a1")
+    code, out, err = _run("precheck", payload, http_factory=_http_factory(indexed_client))
+    assert code == 0
+    assert out == ""  # ALLOW (own lease), no self-deny
+
+    after = _lease_for(indexed_client, parcel_id)
+    assert after is not None
+    assert after["id"] == before["id"]  # SAME lease -- renewed, not re-acquired
+    assert after["ttl_expires_at"] > before["ttl_expires_at"]  # TTL pushed forward
+
+
+def test_postupdate_refreshes_ttl_on_own_held_lease(monkeypatch, repo, indexed_client):
+    """S5: postupdate must also renew the lease TTL. Fails on pre-S5 (postupdate
+    only re-hashed the file, never touched the lease)."""
+    monkeypatch.setenv("SWARMSYNC_ACTIVE", "1")
+    monkeypatch.setenv("SWARMSYNC_LEASE_TTL", "0.5")
+    parcel_id = f"mod_a.py::{MODULE_SYMBOL}"
+    held = indexed_client.post(
+        "/lease",
+        json={"agent_id": "a1", "parcel_id": parcel_id, "mode": "write", "ttl": 0.5},
+    ).json()
+    assert held["granted"]
+    before = _lease_for(indexed_client, parcel_id)
+
+    time.sleep(0.2)
+    payload = _payload("Edit", file_path=str(repo / "mod_a.py"), cwd=str(repo), agent_id="a1")
+    code, out, err = _run("postupdate", payload, http_factory=_http_factory(indexed_client))
+    assert code == 0
+
+    after = _lease_for(indexed_client, parcel_id)
+    assert after is not None
+    assert after["id"] == before["id"]
+    assert after["ttl_expires_at"] > before["ttl_expires_at"]
+
+
+def test_keepalive_prevents_expiry_across_a_ttl_window(monkeypatch, repo, indexed_client):
+    """S5 (the named regression): a hook-held lease survives a wall-clock window
+    LONGER than a single TTL because each postupdate keeps renewing it -- and a
+    different agent stays locked out the whole time. Pre-S5 the lease expired one
+    TTL after acquisition (postupdate never renewed) and the other agent could
+    grab the file."""
+    monkeypatch.setenv("SWARMSYNC_ACTIVE", "1")
+    monkeypatch.setenv("SWARMSYNC_LEASE_TTL", "0.4")
+    parcel_id = f"mod_a.py::{MODULE_SYMBOL}"
+    # Seed a1's short-TTL lease directly (stand-in for the initial acquire); the
+    # behavior under test is that postupdate keepalive keeps it alive from here.
+    held = indexed_client.post(
+        "/lease",
+        json={"agent_id": "a1", "parcel_id": parcel_id, "mode": "write", "ttl": 0.4},
+    ).json()
+    assert held["granted"]
+
+    payload = _payload("Edit", file_path=str(repo / "mod_a.py"), cwd=str(repo), agent_id="a1")
+    for _ in range(6):  # 6 * 0.15s = 0.9s elapsed, well past the 0.4s TTL
+        time.sleep(0.15)
+        _run("postupdate", payload, http_factory=_http_factory(indexed_client))
+
+    active = _lease_for(indexed_client, parcel_id)
+    assert active is not None, "keepalive should have kept a1's lease alive"
+    assert active["id"] == held["lease_id"]
+    assert active["agent_id"] == "a1"
+
+    # a different agent is still denied -- the one-agent-per-file promise held.
+    other = _payload("Edit", file_path=str(repo / "mod_a.py"), cwd=str(repo), agent_id="a2")
+    code, out, err = _run("precheck", other, http_factory=_http_factory(indexed_client))
+    assert out != ""
+    assert json.loads(out)["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+# --- S5: unparseable edit -> dirty marker, not a silent no-op ----------------------
+
+
+def test_postupdate_pushes_dirty_marker_when_edit_is_unparseable(
+    monkeypatch, repo, indexed_client
+):
+    """S5: if an edit leaves the file syntactically invalid, postupdate must push
+    a raw-byte content_hash + a DIRTY/UNPARSEABLE marker so the blackboard stops
+    advertising the STALE last-good hash. Pre-S5 the SyntaxError propagated to the
+    fail-open umbrella -> silent no-op -> the parcel still showed the old hash."""
+    monkeypatch.setenv("SWARMSYNC_ACTIVE", "1")
+    parcel_id = f"mod_a.py::{MODULE_SYMBOL}"
+    good_hash = {p["id"]: p for p in indexed_client.get("/parcels").json()}[parcel_id][
+        "content_hash"
+    ]
+
+    # simulate the edit having left mod_a.py with a syntax error on disk.
+    (repo / "mod_a.py").write_text(
+        "def helper(x, y=1:\n    return x + y\n", encoding="utf-8"
+    )
+    payload = _payload("Edit", file_path=str(repo / "mod_a.py"), cwd=str(repo), agent_id="a1")
+    code, out, err = _run("postupdate", payload, http_factory=_http_factory(indexed_client))
+    assert code == 0
+
+    after = {p["id"]: p for p in indexed_client.get("/parcels").json()}[parcel_id]
+    assert after["content_hash"] != good_hash  # NOT the stale last-good value
+    assert "DIRTY/UNPARSEABLE" in after["state_summary"]
+
+
+# --- S5: an indexed symlinked .py stays leasable (no silent bypass) ---------------
+
+
+def test_indexed_symlinked_py_stays_leasable(monkeypatch, tmp_path, tmp_path_factory):
+    """S5 symlink policy: a `.py` that is a symlink (pointing outside the repo)
+    is indexed under its own in-repo name, so the hook must lease it under that
+    same name. Pre-S5 `_relpath` followed the leaf symlink to its target, which
+    resolved outside the repo -> None -> the edit silently bypassed the lease
+    entirely (no lease acquired)."""
+    outside = tmp_path_factory.mktemp("outside") / "real_impl.py"
+    outside.write_text("def impl():\n    return 1\n", encoding="utf-8")
+    repo_dir = tmp_path_factory.mktemp("repo_symlink")
+    (repo_dir / "linked.py").symlink_to(outside)
+
+    app = create_app(tmp_path / "bb.db")
+    with TestClient(app) as c:
+        assert c.post("/index", json={"root": str(repo_dir)}).status_code == 200
+        parcel_ids = {p["id"] for p in c.get("/parcels").json()}
+        # indexed under its own on-disk name, not the symlink target's:
+        assert f"linked.py::{MODULE_SYMBOL}" in parcel_ids
+
+        monkeypatch.setenv("SWARMSYNC_ACTIVE", "1")
+        payload = _payload(
+            "Edit", file_path=str(repo_dir / "linked.py"), cwd=str(repo_dir), agent_id="a1"
+        )
+        code, out, err = _run("precheck", payload, http_factory=_http_factory(c))
+        assert code == 0
+        assert out == ""  # ALLOW after acquiring -- not a silent bypass
+
+        leases = c.get("/leases").json()
+        assert len(leases) == 1
+        assert leases[0]["parcel_id"] == f"linked.py::{MODULE_SYMBOL}"
+        assert leases[0]["agent_id"] == "a1"
     assert out == ""

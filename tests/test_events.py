@@ -75,6 +75,50 @@ def test_emit_default_ts_is_now(conn):
     assert before <= row["ts"] <= after
 
 
+# --- S2 regression: concurrent emits get distinct, monotonic seqs -----------------
+
+
+def test_concurrent_emits_return_distinct_monotonic_seqs(conn):
+    """Many threads emitting against the one shared connection must each get back
+    their OWN row's seq -- a bijection with the rows actually written.
+
+    Fails on the old `return cur.lastrowid`: `lastrowid` is the per-CONNECTION
+    `sqlite3_last_insert_rowid()`, read after the GIL is re-acquired post-step, so
+    a sibling thread's INSERT lands in that window and two emits report the same
+    seq. `INSERT ... RETURNING seq` reads each statement's own result and is
+    immune. (Empirically the old form produces >100 duplicate seqs at this size.)
+    """
+    import threading
+
+    n_threads, per_thread = 8, 80
+    barrier = threading.Barrier(n_threads)
+    returned: list[int] = []
+    lock = threading.Lock()
+
+    def worker():
+        barrier.wait()  # release all threads together to maximize contention
+        local = [events.emit(conn, "planned", "agent-x") for _ in range(per_thread)]
+        with lock:
+            returned.extend(local)
+
+    threads = [threading.Thread(target=worker) for _ in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    total = n_threads * per_thread
+    # Every returned seq is distinct...
+    assert len(returned) == total
+    assert len(set(returned)) == total, "concurrent emits returned duplicate seqs"
+    # ...and they are exactly the seqs actually persisted (a clean bijection).
+    assert set(returned) == set(range(1, total + 1))
+    persisted = {
+        row["seq"] for row in conn.execute("SELECT seq FROM events").fetchall()
+    }
+    assert set(returned) == persisted
+
+
 # --- done-when: tail(since=k) returns only seq>k, in order ------------------------
 
 

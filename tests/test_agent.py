@@ -8,6 +8,7 @@ resulting event sequence and a committed diff.
 from __future__ import annotations
 
 import json
+import subprocess
 import textwrap
 
 import pytest
@@ -77,15 +78,16 @@ def test_run_agent_full_lifecycle(client, repo):
     assert result.commit_sha != base
     assert "mod_a.py::helper" in result.updated_parcels
 
-    # committed diff: exactly the touched file changed on agent-1's branch,
-    # and the new body actually landed there.
-    touched = git_ops.changed_files(r, "agent-1", base)
-    assert touched == ["mod_a.py"]
-    worktree = r / ".worktrees" / "agent-1"
-    assert "x + y + 100" in (worktree / "mod_a.py").read_text()
+    # exactly the touched file changed (from the integrator's own diff of the
+    # branch it landed) -- S5 cleaned up the ephemeral worktree/branch, so assert
+    # against the durable integrate result, not a now-removed branch ref.
+    assert result.integrate_result["changed_files"] == ["mod_a.py"]
     # U10's integrator is real now -- run_agent's own POST /integrate call
     # landed the branch, so the main checkout (== "integration") has the change.
     assert "x + y + 100" in (r / "mod_a.py").read_text()
+    # S5: run_agent removes its worktree + branch after integrate/release so a
+    # rerun with the same agent_id doesn't collide or leak.
+    assert not (r / ".worktrees" / "agent-1").exists()
 
     # event sequence: planned -> lease_granted -> done -> released, all for agent-1.
     events = client.events(since=0)
@@ -144,7 +146,90 @@ def test_run_agent_backs_off_on_lease_denied(client, repo):
 
     # agent-0's original lease is untouched by agent-1's backoff.
     leases = client.leases()
-    assert any(l["agent_id"] == "agent-0" for l in leases)
+    assert any(lease["agent_id"] == "agent-0" for lease in leases)
+
+
+def test_run_agent_releases_already_held_leases_on_a_mid_acquire_denial(client, repo):
+    """Multi-parcel partial-lease rollback (DESIGN §5.2): a task that gets some
+    of its target leases but is DENIED partway must release every lease it
+    already holds and back off cleanly -- never leave an orphaned lock. Here
+    agent-1 targets [helper, other]; agent-0 already holds `other`, so agent-1
+    acquires `helper` first, then is denied on `other` and must release
+    `helper`. Proof it was released: a fresh agent-2 can immediately acquire
+    `helper` (on a non-rolling-back runner, helper would stay locked by agent-1
+    and agent-2 would be denied)."""
+    r, base = repo
+    held = client.lease("agent-0", "mod_a.py::other", mode="write")
+    assert held["granted"] is True
+
+    result = run_agent(
+        agent_id="agent-1",
+        client=client,
+        repo=r,
+        task="rewrite both",
+        # helper is acquirable; other is already held -> denial mid-acquire.
+        target_parcels=["mod_a.py::helper", "mod_a.py::other"],
+        mutator=mutators.edit_function_body,
+        mutator_kwargs={"path": "mod_a.py", "symbol": "helper", "new_body": "return 0"},
+        base_commit=base,
+    )
+
+    assert result.status == "lease_denied"
+    assert result.denied_parcels == ["mod_a.py::other"]
+    # never created a worktree for a task that couldn't get all its locks.
+    assert not (r / ".worktrees" / "agent-1").exists()
+
+    # agent-1 must hold NO active lease -- the partially-acquired `helper` was
+    # rolled back (released), not orphaned.
+    active = client.leases()
+    assert not any(le["agent_id"] == "agent-1" for le in active), (
+        f"agent-1 leaked a partial lease: {active!r}"
+    )
+
+    # ...and because helper is genuinely free again, a fresh agent can take it.
+    regrab = client.lease("agent-2", "mod_a.py::helper", mode="write")
+    assert regrab["granted"] is True, "helper was not released on rollback"
+
+
+def test_heartbeater_survives_a_raising_heartbeat_and_keeps_beating():
+    """The background `_Heartbeater` thread must never die on a failed beat
+    (DESIGN §6 'server went away' -- a lost beat is a legitimate outcome the
+    reaper handles). A heartbeat that RAISES must be swallowed and the loop must
+    keep beating on the next tick. Pins the per-beat try/except in `_run`."""
+    import threading
+    import time
+
+    from swarmsync.agent.runner import _Heartbeater
+
+    lock = threading.Lock()
+    calls = {"total": 0, "ok": 0}
+
+    class _FlakyClient:
+        def heartbeat(self, agent_id, lease_id):
+            with lock:
+                calls["total"] += 1
+                n = calls["total"]
+            if n == 1:
+                # first beat blows up -- must NOT kill the daemon thread.
+                raise RuntimeError("server went away")
+            with lock:
+                calls["ok"] += 1
+
+    hb = _Heartbeater(_FlakyClient(), "agent-x", interval=0.02)
+    hb.add(lease_id=1)
+    hb.start()
+    try:
+        deadline = time.time() + 3.0
+        # survived the raise iff it produced >=2 successful beats afterward.
+        while time.time() < deadline and calls["ok"] < 2:
+            time.sleep(0.02)
+        assert calls["total"] >= 1
+        assert calls["ok"] >= 2, f"heartbeater died after a raising beat: {calls!r}"
+        assert hb._thread is not None and hb._thread.is_alive()
+    finally:
+        hb.stop()
+
+    assert not (hb._thread is not None and hb._thread.is_alive())
 
 
 def test_two_agents_disjoint_functions_same_file_both_land(client, repo):
@@ -175,14 +260,62 @@ def test_two_agents_disjoint_functions_same_file_both_land(client, repo):
     assert result_a.status == "done"
     assert result_b.status == "done"
 
-    ok_a, conflicts_a = git_ops.merge_branch(r, "agent-a", into="integration")
-    ok_b, conflicts_b = git_ops.merge_branch(r, "agent-b", into="integration")
-    assert (ok_a, conflicts_a) == (True, [])
-    assert (ok_b, conflicts_b) == (True, [])
+    # each run_agent already landed its own branch via POST /integrate; a clean
+    # (conflict-free) merge is exactly what `status="merged"` reports. S5 then
+    # tore down both worktrees/branches, so re-merging by name is no longer
+    # possible -- assert on the durable trunk state + the merged verdicts instead.
+    assert result_a.integrate_result["status"] == "merged"
+    assert result_b.integrate_result["status"] == "merged"
+    assert result_a.integrate_result["conflicts"] == []
+    assert result_b.integrate_result["conflicts"] == []
 
     merged_text = (r / "mod_a.py").read_text()
     assert "return x - y" in merged_text
     assert "return z * 3" in merged_text
+
+
+def _branch_exists(repo, name):
+    out = subprocess.run(
+        ["git", "branch", "--list", name],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+    ).stdout
+    return out.strip() != ""
+
+
+def test_run_agent_cleans_up_worktree_and_branch_and_rerun_is_idempotent(client, repo):
+    """S5: run_agent tears its worktree + branch down after integrate/release, and
+    add_worktree prunes a stale same-named leftover -- so a rerun under the SAME
+    agent_id neither leaks nor collides. Pre-S5 the first run left
+    `.worktrees/agent-x` + branch `agent-x` behind, and the second run's
+    `git worktree add -b agent-x` raised (branch/path already exists)."""
+    r, base = repo
+
+    def _run_once():
+        return run_agent(
+            agent_id="agent-x",
+            client=client,
+            repo=r,
+            task="rewrite helper",
+            target_parcels=["mod_a.py::helper"],
+            mutator=mutators.edit_function_body,
+            mutator_kwargs={"path": "mod_a.py", "symbol": "helper", "new_body": "return x + y + 7"},
+            base_commit=base,
+            heartbeat_interval=0.05,
+        )
+
+    first = _run_once()
+    assert first.status == "done"
+    # no leak: the ephemeral worktree dir and branch are both gone.
+    assert not (r / ".worktrees" / "agent-x").exists()
+    assert not _branch_exists(r, "agent-x")
+
+    # rerun with the same agent_id succeeds (idempotent add_worktree), no collision.
+    second = _run_once()
+    assert second.status == "done"
+    assert not (r / ".worktrees" / "agent-x").exists()
+    assert not _branch_exists(r, "agent-x")
 
 
 def test_run_agent_fetches_read_contracts(client, repo):

@@ -28,6 +28,17 @@ integrate(conn, repo, branch, base_commit=None, into="integration", ...) -> Inte
      Green -> land: emit `merged`. Red -> `git_ops.reset_hard(repo, pre_merge_sha)`
      to undo the just-landed merge commit, emit `merge_rejected` with the
      captured pytest log, trunk (`into`) is left exactly as it was pre-merge.
+
+  ATOMICITY (S1 hardening): once the merge commit is on trunk, EVERYTHING after
+  it -- the pytest gate, re-index, `state_summary` regen, contract detection --
+  runs inside one guard. Any failure there (a later GitOpsError, a parse/
+  re-index crash, a bad symbol) `git reset --hard`s trunk back to `pre_merge_sha`
+  so it is left byte-identical, and returns a STRUCTURED `merge_rejected`
+  (reason `integration_error`) instead of bubbling a 500 that would strand a
+  half-integrated, un-reindexed merge on trunk. The success-path events
+  (`merged`/`contract_change`/`reindexed`) are emitted only after that guarded
+  block succeeds, so a rolled-back merge never leaves a dangling `merged` event
+  in the log the projection tables replay from.
   4. On land only: re-index the repo (`classifier.store.run_index`, same
      pipeline `POST /index` uses) so `blast_radius`/`content_hash`/contracts
      stay current, then **authoritatively regenerate `state_summary`**
@@ -58,15 +69,18 @@ thin shell around this function, not a separate implementation.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Union
 
 from swarmsync.blackboard.models import Parcel
-from swarmsync.classifier.graph import DepGraph
+from swarmsync.classifier.graph import DepGraph, build_graph
+from swarmsync.classifier.indexer import index_repo
 from swarmsync.classifier.store import run_index
 from swarmsync.server import events as events_mod
 from swarmsync.worktree import git_ops
@@ -116,21 +130,62 @@ def _check_read_deps(
     return stale
 
 
+def _reverse_dep_files(repo: Path, changed_py: set[str]) -> set[str]:
+    """Every repo file that TRANSITIVELY reverse-depends on a changed `.py` file,
+    via the classifier's real import/call dependency graph.
+
+    This is the correctness core of impact selection: a test that exercises the
+    changed code only *indirectly* (it imports module M, which imports the changed
+    module C -- and the test's own source never names C) is a genuine dependent
+    the old bare-stem-substring scan silently skipped. We re-index the (already
+    merged) repo on disk, build the dep graph, seed a BFS at every parcel whose
+    file is a changed file, walk `reverse_edges` to the transitive dependent set,
+    and map those parcel ids back to their files. Returns an empty set on any
+    failure (a broken repo, etc.) -- the substring heuristic + full-suite fallback
+    below still backstop selection, so this only ever ADDS coverage, never removes.
+    """
+    if not changed_py:
+        return set()
+    try:
+        parcels = index_repo(repo)
+        graph = build_graph(parcels, repo)
+    except Exception:  # noqa: BLE001 -- selection is best-effort; never fail the gate here
+        return set()
+    changed_parcel_ids = {p.id for p in parcels if p.path in changed_py}
+    affected: set[str] = set()
+    queue: deque[str] = deque(changed_parcel_ids)
+    while queue:
+        pid = queue.popleft()
+        for dependent in graph.reverse_edges.get(pid, set()):
+            if dependent not in affected:
+                affected.add(dependent)
+                queue.append(dependent)
+    return {
+        graph.parcels_by_id[a].path for a in affected if a in graph.parcels_by_id
+    }
+
+
 def run_impact_tests(
     repo: StrPath, changed_files: list[str], test_dir: str = DEFAULT_TEST_DIR
 ) -> tuple[bool, str]:
     """Run pytest restricted to tests reachable from `changed_files` (DESIGN §5.4
-    step 3): impact selection with a full-suite fallback.
+    step 3): a CONSERVATIVE over-selection with a full-suite fallback.
 
-    Heuristic: a test file "reaches" a changed file if the changed file's
-    module basename (e.g. `helper` for `mod_a.py`... actually the FILE's own
-    stem, e.g. `mod_a` for `mod_a.py`) appears as a token in the test file's
-    source (covers both `import mod_a` and `from mod_a import helper`).
-    If nothing matches -- selection is uncertain (e.g. no changed `.py` files,
-    or no test imports anything by that name) -- fall back to running the
-    whole `test_dir` rather than risk silently skipping a relevant test.
-    If `test_dir` doesn't exist under `repo` at all, falls back further to
-    running pytest across the whole repo.
+    A test file is selected if EITHER:
+      - the dependency graph shows it transitively reverse-depends on a changed
+        file (`_reverse_dep_files`) -- the authoritative signal, and the one that
+        catches indirect dependents a textual scan misses; OR
+      - the changed file's module stem appears as a token in the test's source
+        (the old bare-stem heuristic, KEPT as a backstop for edges the classifier
+        can't see -- dynamic dispatch / string imports, DESIGN §6 "classifier
+        miss": over-selecting a test is always safe, skipping an affected one is
+        the bug we're fixing).
+    Selecting the UNION is a strict over-approximation of the old behavior, so it
+    can only run more tests, never fewer -- it never skips an affected test.
+    If nothing matches -- selection is genuinely uncertain (no changed `.py`
+    files, or no test relates to the change) -- fall back to the whole `test_dir`
+    rather than risk a silent skip. If `test_dir` doesn't exist under `repo` at
+    all, falls back further to running pytest across the whole repo.
 
     Returns `(ok, combined_stdout_stderr_log)`. Uses `sys.executable -m pytest`
     so it runs against whichever Python/venv is already running this process
@@ -140,26 +195,53 @@ def run_impact_tests(
     repo = Path(repo)
     tests_root = repo / test_dir
 
+    # S3 security: sandbox the gate's pytest run against the untrusted agent branch
+    # we just merged. `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` + `-p no:cacheprovider`
+    # stop third-party pytest plugins / conftest side effects on $PATH from being
+    # auto-loaded and running arbitrary code inside our process's environment;
+    # `--import-mode=importlib` avoids mutating `sys.path`/polluting the parent's
+    # module namespace via legacy prepend-import. These narrow WHAT the gate can do
+    # without changing whether a genuinely passing/failing suite passes/fails.
+    base_cmd = [
+        sys.executable,
+        "-m",
+        "pytest",
+        "-q",
+        "-p",
+        "no:cacheprovider",
+        "--import-mode=importlib",
+    ]
+
     if not tests_root.exists():
-        cmd = [sys.executable, "-m", "pytest", "-q"]
+        cmd = base_cmd
     else:
-        changed_stems = {Path(f).stem for f in changed_files if f.endswith(".py")}
+        changed_py = {f for f in changed_files if f.endswith(".py")}
+        changed_stems = {Path(f).stem for f in changed_py}
+        # Authoritative dependency-graph reverse-deps (transitive), plus the
+        # substring backstop -- their union is the conservative over-select.
+        affected_files = _reverse_dep_files(repo, changed_py)
         selected: list[str] = []
         for test_file in sorted(tests_root.rglob("test_*.py")):
+            rel_posix = test_file.relative_to(repo).as_posix()
             try:
                 text = test_file.read_text(encoding="utf-8")
             except OSError:
                 continue
-            if any(stem and stem in text for stem in changed_stems):
+            hit_graph = rel_posix in affected_files
+            hit_substr = any(stem and stem in text for stem in changed_stems)
+            if hit_graph or hit_substr:
                 selected.append(str(test_file.relative_to(repo)))
         if selected:
-            cmd = [sys.executable, "-m", "pytest", "-q", *selected]
+            cmd = [*base_cmd, *selected]
         else:
             # Selection uncertain (nothing matched, or no changed .py files) --
             # full-suite fallback per DESIGN §5.4.
-            cmd = [sys.executable, "-m", "pytest", "-q", test_dir]
+            cmd = [*base_cmd, test_dir]
 
-    result = subprocess.run(cmd, cwd=str(repo), capture_output=True, text=True)
+    env = {**os.environ, "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"}
+    result = subprocess.run(
+        cmd, cwd=str(repo), capture_output=True, text=True, env=env
+    )
     # pytest exit code 5 == "no tests were collected" -- e.g. a repo/fixture with
     # no test suite yet, or an impact-selection pass that (correctly) found no
     # test touches this change. Nothing to gate on is not a rejection reason.
@@ -239,8 +321,56 @@ def integrate(
 
     pre_merge_sha = git_ops.current_commit(repo, ref=into)
 
+    def _reject_and_reset(
+        reason_code: str,
+        reason: str,
+        *,
+        result_fields: Optional[dict] = None,
+        **payload_extra,
+    ) -> IntegrateResult:
+        """Roll `into` back to its exact pre-merge state and return a STRUCTURED
+        merge_rejected (DESIGN §5.4 "leave trunk untouched on reject").
+
+        S1 atomicity contract: used for any failure at or AFTER the merge --
+        a GitOpsError, a parse/re-index crash, a bad ref -- so trunk is left
+        byte-identical to `pre_merge_sha` and the caller gets a rejection object
+        instead of a bubbled-out 500 sitting on top of a half-integrated trunk.
+        `git reset --hard pre_merge_sha` is a no-op when the merge never landed
+        (conflict aborted, error before the commit) and undoes the merge commit
+        when it did -- either way trunk ends at `pre_merge_sha`.
+
+        `payload_extra` are extra fields for the emitted event; `result_fields`
+        are extra fields for the returned `IntegrateResult` (e.g. the pytest
+        `changed_files`/`test_log` on a red-gate rejection).
+        """
+        rollback_error: Optional[str] = None
+        try:
+            git_ops.reset_hard(repo, pre_merge_sha, branch=into)
+        except git_ops.GitOpsError as rexc:  # pragma: no cover - catastrophic git failure
+            rollback_error = str(rexc)
+        payload = {"branch": branch, "into": into, "reason": reason_code}
+        payload.update(payload_extra)
+        full_reason = reason
+        if rollback_error is not None:
+            payload["rollback_error"] = rollback_error
+            full_reason = f"{reason} (WARNING: trunk rollback also failed: {rollback_error})"
+        events_mod.emit(conn, "merge_rejected", agent_id, payload, ts=now)
+        return IntegrateResult(
+            status="merge_rejected",
+            branch=branch,
+            into=into,
+            reason=full_reason,
+            **(result_fields or {}),
+        )
+
     # --- step 2: serialized merge -------------------------------------------
-    ok, conflicts = git_ops.merge_branch(repo, branch, into=into)
+    try:
+        ok, conflicts = git_ops.merge_branch(repo, branch, into=into)
+    except git_ops.GitOpsError as exc:
+        # A non-conflict merge failure (bad ref, dirty tree, git missing):
+        # merge_branch already aborted any in-progress merge, so trunk is at
+        # pre_merge_sha -- surface it as a structured rejection, not a 500.
+        return _reject_and_reset("merge_error", f"git merge failed: {exc}")
     if not ok:
         events_mod.emit(
             conn,
@@ -262,42 +392,109 @@ def integrate(
             reason="textual merge conflict (touch-set misprediction)",
         )
 
-    # Diff against the branch's OWN fork point (`base_commit`) when known --
-    # that isolates exactly the files *this branch's commits* touched. Falling
-    # back to `pre_merge_sha` (trunk's head right before this merge) is only a
-    # best-effort approximation for a caller that didn't pass `base_commit`:
-    # it can over-report files the branch never touched but trunk has since
-    # moved past (the branch's own tree looks "different" there too).
-    diff_base = base_commit if base_commit is not None else pre_merge_sha
-    changed = git_ops.changed_files(repo, branch, diff_base)
+    # From here the merge commit is ON trunk (`into`). Everything below --
+    # diffing, the pytest gate, re-index, summary regen, contract detection --
+    # runs inside one try/except so ANY post-merge failure rolls trunk back to
+    # `pre_merge_sha` (byte-identical) and returns a structured merge_rejected,
+    # never a 500 leaving a half-integrated, un-reindexed merge on trunk. The
+    # success-path events (`merged`/`contract_change`/`reindexed`) are emitted
+    # only AFTER this whole block succeeds, so a rolled-back merge never leaves
+    # a dangling `merged` event in the log the projection tables replay from.
+    try:
+        # Diff against the branch's OWN fork point (`base_commit`) when known --
+        # that isolates exactly the files *this branch's commits* touched. Falling
+        # back to `pre_merge_sha` (trunk's head right before this merge) is only a
+        # best-effort approximation for a caller that didn't pass `base_commit`:
+        # it can over-report files the branch never touched but trunk has since
+        # moved past (the branch's own tree looks "different" there too).
+        diff_base = base_commit if base_commit is not None else pre_merge_sha
+        changed = git_ops.changed_files(repo, branch, diff_base)
 
-    # --- step 3: impact-selected pytest gate --------------------------------
-    tests_ok, test_log = run_impact_tests(repo, changed, test_dir=test_dir)
-    if not tests_ok:
-        git_ops.reset_hard(repo, pre_merge_sha, branch=into)
-        events_mod.emit(
-            conn,
-            "merge_rejected",
-            agent_id,
-            {
-                "branch": branch,
-                "into": into,
-                "reason": "tests_failed",
-                "changed_files": changed,
-                "test_log": test_log[-4000:],  # keep the event payload bounded
-            },
-            ts=now,
-        )
-        return IntegrateResult(
-            status="merge_rejected",
-            branch=branch,
-            into=into,
-            changed_files=changed,
-            test_log=test_log,
-            reason="impact tests failed",
+        # --- step 3: impact-selected pytest gate --------------------------------
+        tests_ok, test_log = run_impact_tests(repo, changed, test_dir=test_dir)
+        if not tests_ok:
+            return _reject_and_reset(
+                "tests_failed",
+                "impact tests failed",
+                changed_files=changed,
+                test_log=test_log[-4000:],  # keep the event payload bounded
+                result_fields={"changed_files": changed, "test_log": test_log},
+            )
+
+        merged_commit = git_ops.current_commit(repo, ref=into)
+
+        # --- step 4: re-index + authoritative state_summary regen ---------------
+        changed_set = set(changed)
+
+        # Frozen-contract change detection (DESIGN §5.3, money-shot #3, U15):
+        # snapshot every contract whose symbol lives in a file this branch
+        # touched BEFORE re-indexing, so it can be diffed against the same
+        # symbols' post-re-index state below. Restricted to `changed_set` since
+        # `run_index` re-parses the WHOLE repo every call (per `classifier.store`'s
+        # own "no incremental diffing" note) -- an unrelated file's contract rows
+        # cannot have changed from THIS branch's edit, so there is nothing to
+        # gain (and a real false-positive risk to avoid) by comparing those too.
+        before_contracts = {
+            row["symbol"]: (row["signature"], row["type_hash"], row["version"])
+            for row in conn.execute(
+                "SELECT symbol, signature, type_hash, version FROM contracts"
+            ).fetchall()
+            if row["symbol"].split("::", 1)[0] in changed_set
+        }
+
+        index_kwargs = {} if threshold is None else {"threshold": threshold}
+        index_result = run_index(conn, repo, **index_kwargs)
+        touched_parcels = [p for p in index_result.parcels if p.path in changed_set]
+
+        reindexed_ids: list[str] = []
+        for parcel in touched_parcels:
+            summary = regenerate_summary(parcel, index_result.graph)
+            conn.execute(
+                "UPDATE parcels SET state_summary = ?, updated_at = ? WHERE id = ?",
+                (summary, now, parcel.id),
+            )
+            reindexed_ids.append(parcel.id)
+
+        # Diff post-re-index contract state against the pre-re-index snapshot
+        # above. A symbol whose `type_hash` genuinely changed -> a frozen
+        # signature really did change on this landed merge -> a
+        # `contract_change` (old/new signature + version) so a dependent watching
+        # `GET /events` (or holding a plan-time `read_contracts` snapshot,
+        # `agent/runner.py`) can observe it and re-plan (DESIGN §5.3/§4.3). The
+        # events are collected here and emitted below with the rest of the
+        # success-path events, once the atomic block is known to have succeeded.
+        contract_changes: list[str] = []
+        contract_change_payloads: list[dict] = []
+        for row in conn.execute(
+            "SELECT symbol, signature, type_hash, version FROM contracts"
+        ).fetchall():
+            symbol = row["symbol"]
+            before = before_contracts.get(symbol)
+            if before is None or before[1] == row["type_hash"]:
+                continue  # unknown before this merge, or genuinely unchanged
+            contract_changes.append(symbol)
+            contract_change_payloads.append(
+                {
+                    "symbol": symbol,
+                    "branch": branch,
+                    "into": into,
+                    "old_signature": before[0],
+                    "new_signature": row["signature"],
+                    "old_version": before[2],
+                    "new_version": row["version"],
+                }
+            )
+    except Exception as exc:  # noqa: BLE001 -- deliberate: any post-merge failure
+        # A failure AFTER the merge landed (a later GitOpsError, a parse/re-index
+        # crash, a bad symbol, etc.): roll trunk back to byte-identical
+        # pre_merge_sha and reject structurally rather than 500 with the merge
+        # still sitting on trunk. No `merged` event was emitted yet, so the log
+        # stays consistent (only the merge_rejected below).
+        return _reject_and_reset(
+            "integration_error", f"post-merge integration failed: {exc!r}"
         )
 
-    merged_commit = git_ops.current_commit(repo, ref=into)
+    # --- success: the whole atomic block landed. Emit the trail now. --------
     events_mod.emit(
         conn,
         "merged",
@@ -310,70 +507,8 @@ def integrate(
         },
         ts=now,
     )
-
-    # --- step 4: re-index + authoritative state_summary regen ---------------
-    changed_set = set(changed)
-
-    # Frozen-contract change detection (DESIGN §5.3, money-shot #3, U15):
-    # snapshot every contract whose symbol lives in a file this branch
-    # touched BEFORE re-indexing, so it can be diffed against the same
-    # symbols' post-re-index state below. Restricted to `changed_set` since
-    # `run_index` re-parses the WHOLE repo every call (per `classifier.store`'s
-    # own "no incremental diffing" note) -- an unrelated file's contract rows
-    # cannot have changed from THIS branch's edit, so there is nothing to
-    # gain (and a real false-positive risk to avoid) by comparing those too.
-    before_contracts = {
-        row["symbol"]: (row["signature"], row["type_hash"], row["version"])
-        for row in conn.execute(
-            "SELECT symbol, signature, type_hash, version FROM contracts"
-        ).fetchall()
-        if row["symbol"].split("::", 1)[0] in changed_set
-    }
-
-    index_kwargs = {} if threshold is None else {"threshold": threshold}
-    index_result = run_index(conn, repo, **index_kwargs)
-    touched_parcels = [p for p in index_result.parcels if p.path in changed_set]
-
-    reindexed_ids: list[str] = []
-    for parcel in touched_parcels:
-        summary = regenerate_summary(parcel, index_result.graph)
-        conn.execute(
-            "UPDATE parcels SET state_summary = ?, updated_at = ? WHERE id = ?",
-            (summary, now, parcel.id),
-        )
-        reindexed_ids.append(parcel.id)
-
-    # Diff post-re-index contract state against the pre-re-index snapshot
-    # above. A symbol whose `type_hash` genuinely changed -> a frozen
-    # signature really did change on this landed merge -> emit
-    # `contract_change` (old/new signature + version) so a dependent watching
-    # `GET /events` (or holding a plan-time `read_contracts` snapshot,
-    # `agent/runner.py`) can observe it and re-plan (DESIGN §5.3/§4.3).
-    contract_changes: list[str] = []
-    for row in conn.execute(
-        "SELECT symbol, signature, type_hash, version FROM contracts"
-    ).fetchall():
-        symbol = row["symbol"]
-        before = before_contracts.get(symbol)
-        if before is None or before[1] == row["type_hash"]:
-            continue  # unknown before this merge, or genuinely unchanged
-        contract_changes.append(symbol)
-        events_mod.emit(
-            conn,
-            "contract_change",
-            agent_id,
-            {
-                "symbol": symbol,
-                "branch": branch,
-                "into": into,
-                "old_signature": before[0],
-                "new_signature": row["signature"],
-                "old_version": before[2],
-                "new_version": row["version"],
-            },
-            ts=now,
-        )
-
+    for payload in contract_change_payloads:
+        events_mod.emit(conn, "contract_change", agent_id, payload, ts=now)
     events_mod.emit(
         conn,
         "reindexed",

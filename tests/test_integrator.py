@@ -305,6 +305,59 @@ def test_stale_read_dependency_short_circuits_to_needs_rebase(conn, repo):
     assert result2.status == "merged"
 
 
+def test_stale_frozen_contract_type_hash_short_circuits_to_needs_rebase(conn, repo):
+    """DESIGN §5.5's optimistic re-check resolves a read-dep id against
+    `parcels.content_hash` first and FALLS BACK to `contracts.type_hash` when
+    the id names a frozen contract with no parcel row of that id (the
+    contract-only branch of `_check_read_deps`). A drifted `type_hash` -> no
+    merge attempted, `needs_rebase`; a matching one lets the merge proceed.
+
+    The matching-hash assertion is what pins the contracts fallback: without it,
+    a contract-only id would miss the parcels lookup (current=None), never
+    match its real type_hash, and wrongly short-circuit even a fresh branch."""
+    r, base = repo
+    run_index(conn, r)
+
+    # A frozen contract whose SYMBOL is not any parcel's id -> forces the
+    # `_check_read_deps` contracts.type_hash lookup path (the parcels lookup misses).
+    conn.execute(
+        "INSERT INTO contracts (symbol, signature, type_hash, frozen, version) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("phantom.py::ghost", "ghost(x)", "TYPEHASH-A", 1, 1),
+    )
+
+    # Drifted type_hash -> needs_rebase, and NO merge is attempted.
+    stale = integrator.integrate(
+        conn,
+        r,
+        "branch-need-not-exist",
+        agent_id="agent-stale",
+        expected_read_deps={"phantom.py::ghost": "TYPEHASH-OLD"},
+    )
+    assert stale.status == "needs_rebase"
+    assert stale.stale_deps == ["phantom.py::ghost"]
+    rebase_events = [e for e in events_mod.tail(conn, since_seq=0) if e.type == "needs_rebase"]
+    assert len(rebase_events) == 1
+    assert rebase_events[0].agent_id == "agent-stale"
+
+    # Matching type_hash -> the contract fallback resolves it as fresh and the
+    # merge proceeds normally (proves the branch really read contracts, not None).
+    worktree = git_ops.add_worktree(r, "agent-contract-fresh", base)
+    (worktree / "mod_b.py").write_text(
+        "def other(y):\n    return y * 30\n", encoding="utf-8"
+    )
+    git_ops.commit_all(worktree, "agent-contract-fresh: edit other")
+    fresh = integrator.integrate(
+        conn,
+        r,
+        "agent-contract-fresh",
+        base_commit=base,
+        agent_id="agent-contract-fresh",
+        expected_read_deps={"phantom.py::ghost": "TYPEHASH-A"},
+    )
+    assert fresh.status == "merged"
+
+
 # --- impact test selection: full-suite fallback when nothing matches --------------
 
 
@@ -324,6 +377,56 @@ def test_run_impact_tests_selects_only_the_reachable_test_file(repo):
     # impact selection actually narrowed the pytest invocation, not a
     # full-suite fallback.
     assert "1 passed" in log
+
+
+def test_impact_selection_runs_a_transitively_affected_test(tmp_path):
+    """S5: impact selection must not skip a test that exercises the changed file
+    only INDIRECTLY. `test_mid` calls `mid.use()` which calls the changed
+    `base.core()`, but `test_mid`'s source never names `base` -- so the old
+    bare-stem-substring scan (stem `base`) skipped it while still selecting
+    `test_base` (which DOES name `base`), meaning no full-suite fallback either.
+    The change breaks `test_mid` but not `test_base`, so the old selector merged
+    a broken change (`test_mid` never ran); the new dependency-graph reverse-dep
+    selector runs `test_mid`, catches the break, and rejects the merge."""
+    r = tmp_path / "repo"
+    r.mkdir()
+    (r / "base.py").write_text("def core():\n    return 1\n", encoding="utf-8")
+    (r / "mid.py").write_text(
+        "from base import core\n\n\ndef use():\n    return core()\n", encoding="utf-8"
+    )
+    tests = r / "tests"
+    tests.mkdir()
+    # names 'base' -> substring-selected; asserts the POST-change value so it
+    # passes after the edit (this is what suppresses the full-suite fallback).
+    (tests / "test_base.py").write_text(
+        "from base import core\n\n\ndef test_core():\n    assert core() == 2\n",
+        encoding="utf-8",
+    )
+    # names 'mid' only, NEVER 'base' -> substring selection SKIPS it, but it
+    # transitively exercises base.core (use() -> core()). This is the affected
+    # test the old selector wrongly dropped.
+    (tests / "test_mid.py").write_text(
+        "from mid import use\n\n\ndef test_use():\n    assert use() == 1\n",
+        encoding="utf-8",
+    )
+    base = git_ops.init_repo(r)
+    conn = db.init_db(tmp_path / "bb.db")
+    try:
+        run_index(conn, r)
+        wt = git_ops.add_worktree(r, "agent-break", base)
+        # base.core: return 1 -> 2. test_base (asserts 2) passes; test_mid
+        # (asserts use()==1, now 2) fails -- the transitively affected test.
+        (wt / "base.py").write_text("def core():\n    return 2\n", encoding="utf-8")
+        git_ops.commit_all(wt, "agent-break: core returns 2")
+
+        result = integrator.integrate(
+            conn, r, "agent-break", base_commit=base, agent_id="agent-break"
+        )
+        assert result.status == "merge_rejected"
+        assert result.reason == "impact tests failed"
+        assert "test_mid" in result.test_log  # the affected test really ran
+    finally:
+        conn.close()
 
 
 # --- U15: frozen-contract change detection + contract_change event ----------------

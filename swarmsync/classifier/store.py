@@ -54,6 +54,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Union
 
+from swarmsync.blackboard import db as _db
 from swarmsync.blackboard.models import Contract, Parcel
 from swarmsync.classifier.graph import (
     FREEZE_THRESHOLD,
@@ -124,14 +125,12 @@ def upsert_parcels(conn: sqlite3.Connection, parcels: list[Parcel]) -> None:
     are inserted. Never touches `state_summary`."""
     if not parcels:
         return
-    conn.execute("BEGIN")
-    try:
+    # ONE IMMEDIATE transaction on THIS connection (db.transaction): a rollback
+    # here can only ever undo this batch, never a concurrent single-statement
+    # writer -- that writer lives on its own per-request connection (S4). See
+    # db.transaction's docstring for why BEGIN IMMEDIATE + the no-nesting guard.
+    with _db.transaction(conn):
         conn.executemany(_UPSERT_PARCEL_SQL, [_parcel_params(p) for p in parcels])
-    except BaseException:
-        conn.execute("ROLLBACK")
-        raise
-    else:
-        conn.execute("COMMIT")
 
 
 _UPSERT_CONTRACT_SQL = """
@@ -154,8 +153,7 @@ def upsert_contracts(conn: sqlite3.Connection, contracts: list[Contract]) -> Non
     its `version` bumped; an unchanged symbol keeps its existing version."""
     if not contracts:
         return
-    conn.execute("BEGIN")
-    try:
+    with _db.transaction(conn):
         conn.executemany(
             _UPSERT_CONTRACT_SQL,
             [
@@ -169,11 +167,6 @@ def upsert_contracts(conn: sqlite3.Connection, contracts: list[Contract]) -> Non
                 for c in contracts
             ],
         )
-    except BaseException:
-        conn.execute("ROLLBACK")
-        raise
-    else:
-        conn.execute("COMMIT")
 
 
 def run_index(
