@@ -667,3 +667,148 @@ def test_gate_timeout_is_bounded_even_when_a_descendant_escapes_the_group_kill(
         f"gate took {elapsed:.1f}s: a descendant that escaped the group kill still "
         f"wedges the gate (and the global integrate_lock) on the drain"
     )
+
+
+def test_timed_out_gate_is_actually_killed_not_just_abandoned(tmp_path, monkeypatch):
+    """The timeout must KILL the gate's process tree, not merely stop waiting on it.
+
+    R4's mutation dimension replaced `_kill_process_group(proc)` with `pass` and the
+    whole suite stayed green: the sibling test asserts only the (ok, log) verdict and
+    the elapsed bound, and the bounded drain added alongside the kill MASKS its
+    deletion -- with no kill, `communicate(timeout=...)` simply expires, `_close_streams`
+    runs, and the function still returns False, so every assertion still held while a
+    runaway pytest tree survived. Each timed-out /integrate would then permanently leak
+    a process running the agent-authored branch's arbitrary test code, reparented to
+    init, holding the repo and burning CPU forever.
+
+    So assert the thing that actually matters: after the timeout, the gate's process
+    group is gone.
+    """
+    repo = tmp_path / "killrepo"
+    (repo / "tests").mkdir(parents=True)
+    (repo / "mod_a.py").write_text("def helper(x):\n    return x\n", encoding="utf-8")
+    (repo / "tests" / "test_hang.py").write_text(
+        "import time\n\n\ndef test_hangs():\n    time.sleep(120)\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("SWARMSYNC_GATE_TIMEOUT", "2")
+
+    spawned: list = []
+    real_popen = integrator.subprocess.Popen
+
+    def recording_popen(*a, **kw):
+        proc = real_popen(*a, **kw)
+        spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(integrator.subprocess, "Popen", recording_popen)
+
+    ok, log = integrator.run_impact_tests(repo, ["mod_a.py"])
+    assert ok is False
+    assert spawned, "no gate process was spawned"
+
+    proc = spawned[0]
+    # The direct child must be dead...
+    assert proc.poll() is not None, "the timed-out gate process is still running"
+    # ...and so must its whole group: `os.killpg(pgid, 0)` raises once the group is
+    # gone. (`start_new_session=True` makes the child its own group leader, so its
+    # pid IS the pgid.)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(proc.pid, 0)
+        except (ProcessLookupError, PermissionError):
+            break
+        time.sleep(0.1)
+    else:
+        raise AssertionError(
+            "the gate's process group survived the timeout: the runaway test tree is "
+            "still running and will never be reaped"
+        )
+
+
+def test_gate_runs_with_its_containment_flags(tmp_path, monkeypatch):
+    """The gate's sandbox flags must actually reach the subprocess.
+
+    R4's mutation dimension deleted PYTEST_DISABLE_PLUGIN_AUTOLOAD, `-p no:cacheprovider`
+    and `--import-mode=importlib` -- each left the suite green, because nothing asserted
+    the gate's command line or environment at all.
+
+    Scoped honestly: the gate runs the merged branch's code BY DESIGN (README says so),
+    so these are defense-in-depth narrowing WHAT it does -- not a security boundary.
+    But they are silently droppable in a refactor, and then the gate auto-loads
+    third-party plugins and conftest side effects from $PATH while running an untrusted
+    branch, and prepend-import mutates the parent's sys.path.
+    """
+    repo = tmp_path / "flagrepo"
+    (repo / "tests").mkdir(parents=True)
+    (repo / "mod_a.py").write_text("def helper(x):\n    return x\n", encoding="utf-8")
+    (repo / "tests" / "test_a.py").write_text(
+        "from mod_a import helper\n\n\ndef test_h():\n    assert helper(1) == 1\n",
+        encoding="utf-8",
+    )
+
+    seen: dict = {}
+    real_popen = integrator.subprocess.Popen
+
+    def recording_popen(cmd, *a, **kw):
+        seen["cmd"] = list(cmd)
+        seen["env"] = dict(kw.get("env") or {})
+        seen["new_session"] = kw.get("start_new_session")
+        return real_popen(cmd, *a, **kw)
+
+    monkeypatch.setattr(integrator.subprocess, "Popen", recording_popen)
+    integrator.run_impact_tests(repo, ["mod_a.py"])
+
+    assert seen["env"].get("PYTEST_DISABLE_PLUGIN_AUTOLOAD") == "1", (
+        "gate would auto-load third-party pytest plugins while running an untrusted branch"
+    )
+    assert "no:cacheprovider" in seen["cmd"], "gate would write .pytest_cache into the repo"
+    assert "--import-mode=importlib" in seen["cmd"], (
+        "prepend import-mode lets the branch mutate the parent's sys.path/module namespace"
+    )
+    # start_new_session is what makes the timeout's process-GROUP kill possible.
+    assert seen["new_session"] is True, (
+        "without start_new_session the gate shares our process group: the timeout's "
+        "killpg would target our own group, and a runaway tree could not be killed"
+    )
+
+
+def test_kill_process_group_never_signals_our_own_group(tmp_path, monkeypatch):
+    """A gate timeout must never SIGKILL the server itself.
+
+    `_kill_process_group` SIGKILLs the group `getpgid(child)` reports. That is safe
+    only while the gate is spawned with `start_new_session=True` so it LEADS its own
+    group. If that stops holding, the child is in OUR group and the killpg takes the
+    coordinator down with it -- the server dies to reap a hanging test.
+
+    Not hypothetical: a mutation run that flipped `start_new_session` to False had its
+    own harness SIGKILLed by this code path.
+    """
+    # A child deliberately spawned in OUR process group (start_new_session absent).
+    proc = integrator.subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdout=integrator.subprocess.PIPE,
+        stderr=integrator.subprocess.PIPE,
+    )
+    assert os.getpgid(proc.pid) == os.getpgrp(), "setup: child should share our group"
+
+    killed_groups: list = []
+    real_killpg = os.killpg
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: killed_groups.append(pgid))
+
+    try:
+        integrator._kill_process_group(proc)
+        assert os.getpgrp() not in killed_groups, (
+            "_kill_process_group signalled OUR OWN process group: a gate timeout would "
+            "SIGKILL the coordinator"
+        )
+    finally:
+        monkeypatch.setattr(os, "killpg", real_killpg)
+        try:
+            proc.kill()
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+
+    # ...and the child is still killed directly, so the timeout still does its job.
+    assert proc.poll() is not None
