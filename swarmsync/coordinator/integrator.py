@@ -210,14 +210,32 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
     Best-effort by design: the process (or group) may already be gone, and a gate
     that has timed out must never turn its own cleanup into an exception that
     escapes into `integrate`'s error path.
+
+    NEVER signals our OWN process group. The gate is spawned with
+    `start_new_session=True` so it leads its own group, and this SIGKILLs that group.
+    But if that ever stops holding -- a refactor drops the flag, a platform ignores it,
+    someone reuses this helper for a plainly-spawned child -- then `getpgid(child)`
+    IS our group, and a gate timeout would SIGKILL the server itself: the coordinator
+    dies to reap a hanging test. Observed for real: a mutation run that flipped
+    `start_new_session` to False killed the harness that was running it. The child is
+    still killed directly in that case, so the timeout still works; it just stops
+    taking us with it.
     """
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError):
+        pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, OSError):
+        pgid = None
+
+    if pgid is not None and pgid != os.getpgrp():
         try:
-            proc.kill()
-        except ProcessLookupError:
+            os.killpg(pgid, signal.SIGKILL)
+            return
+        except (ProcessLookupError, PermissionError, OSError):
             pass
+    try:
+        proc.kill()
+    except (ProcessLookupError, OSError):
+        pass
 
 
 def run_impact_tests(

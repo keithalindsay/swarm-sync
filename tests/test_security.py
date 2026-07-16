@@ -254,3 +254,60 @@ def test_token_gated_server_accepts_correct_bearer_end_to_end(monkeypatch, tmp_p
             "/lease",
             json={"agent_id": "a2", "parcel_id": "mod_a.py::<module>", "mode": "write"},
         ).status_code == 401
+
+
+# --- R4 mutation finding: the auth guards were present but UNDEFENDED --------------
+
+# Every mutating route, with a minimal valid body. Kept as data so the test below can
+# assert the list is COMPLETE against the running app -- a new mutating route added
+# without a guard must fail here rather than ship silently.
+MUTATING_ROUTES = [
+    ("/index", {"root": "/tmp/nonexistent-for-auth-check"}),
+    ("/intent", {"agent_id": "a", "task": "t", "target_parcels": ["x.py::<module>"]}),
+    ("/lease", {"agent_id": "a", "parcel_id": "x.py::<module>", "mode": "write"}),
+    ("/heartbeat", {"agent_id": "a", "lease_id": 1}),
+    ("/release", {"agent_id": "a", "lease_id": 1}),
+    ("/parcel/update", {"agent_id": "a", "parcel_id": "x.py::<module>", "content_hash": "h"}),
+    ("/integrate", {"agent_id": "a", "branch": "b", "repo": "/tmp/nonexistent-for-auth-check"}),
+]
+
+
+@pytest.mark.parametrize("path, body", MUTATING_ROUTES, ids=[r[0] for r in MUTATING_ROUTES])
+def test_every_mutating_route_401s_without_a_token(monkeypatch, client, path, body):
+    """EVERY mutating route must reject an unauthenticated caller -- not just the two
+    that happened to have a test.
+
+    R4's mutation dimension deleted `dependencies=[Depends(require_token)]` from
+    /heartbeat, /release, /parcel/update and /integrate, one at a time, and the full
+    suite stayed GREEN each time: only /index and /lease had any negative auth
+    assertion. The guards were present in source, so this was never a live hole -- it
+    was a hole in the net that is supposed to keep them present. R3 reported three of
+    these as undefended and they were still undefended two rounds later, which is
+    exactly how a guard gets dropped by a refactor and ships.
+
+    Asserting 401 (not 403/422): auth must be decided BEFORE the body is validated or
+    the work is done, so a bogus path/lease_id in the body must not change the answer.
+    """
+    monkeypatch.setenv("SWARMSYNC_TOKEN", "s3cr3t")
+
+    r = client.post(path, json=body)
+    assert r.status_code == 401, f"{path} accepted a request with NO token"
+
+    r = client.post(path, json=body, headers={"Authorization": "Bearer wrong"})
+    assert r.status_code == 401, f"{path} accepted a WRONG token"
+
+
+def test_the_mutating_route_list_is_complete(client):
+    """Pins the list above against the real app, so a newly-added POST route cannot
+    quietly escape the auth check by simply not being listed here."""
+    app_posts = {
+        route.path
+        for route in client.app.routes
+        if getattr(route, "methods", None) and "POST" in route.methods
+    }
+    listed = {path for path, _ in MUTATING_ROUTES}
+    missing = app_posts - listed
+    assert not missing, (
+        f"POST route(s) {sorted(missing)} are not covered by the auth test. Add them to "
+        f"MUTATING_ROUTES (and give them a require_token guard) rather than deleting this."
+    )
