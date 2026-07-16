@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "swarm-sync"
+version = "0.1.0"
+description = "Stigmergic lease fabric so many AI coding agents can edit one codebase concurrently without colliding (Pheromesh architecture)."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Keith Lindsay" }]
+requires-python = ">=3.11"
+
+# Deliberately dependency-light so the overnight build is reproducible.
+# Classifier uses the stdlib `ast` module (no tree-sitter needed for the Python target).
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "httpx>=0.27",       # thin agent client + FastAPI TestClient
+    "pydantic>=2.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+swarm-sync = "swarmsync.server.app:main"
+
+[tool.setuptools.packages.find]
+include = ["swarmsync*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
