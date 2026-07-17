@@ -80,7 +80,7 @@ python3 --version            # must be 3.11 or newer
 ```
 
 ```bash
-git clone https://github.com/Aigeninc/swarm-sync.git
+git clone https://github.com/keithalindsay/swarm-sync.git
 cd swarm-sync
 
 python3 -m venv .venv && source .venv/bin/activate
