@@ -172,6 +172,10 @@ def require_token(request: Request) -> None:
 # (os.pathsep-separated), defaulting to the server's launch cwd.
 
 
+class MultiRootError(ValueError):
+    """Raised at startup when more than one managed root is configured."""
+
+
 def _managed_roots() -> list[str]:
     raw = os.environ.get("SWARMSYNC_ROOTS")
     if raw:
@@ -179,6 +183,40 @@ def _managed_roots() -> list[str]:
     else:
         candidates = [os.getcwd()]
     return [os.path.realpath(r) for r in candidates]
+
+
+def check_single_root() -> str:
+    """One server coordinates ONE repo. Enforce that, loudly, at startup.
+
+    Parcel ids are `<relpath>::<symbol>` -- RELATIVE to the indexed root, with no repo
+    qualifier anywhere in the id or the schema. So two roots that both contain (say)
+    `utils.py` produce the SAME id `utils.py::helper` for two different files:
+    `upsert_parcels` overwrites one repo's rows with the other's, a write lease on that
+    id locks BOTH repos' files, and `integrate`'s re-index clobbers the other root's
+    parcels wholesale. Silently, in every case.
+
+    Multi-root is therefore not a supported mode -- it is data corruption with a
+    plural-looking config. `SWARMSYNC_ROOTS` is an allow-list bounding which paths the
+    one coordinated repo may touch, not a way to coordinate several. Fixing it properly
+    means putting the root in the parcel identity (a schema change, and there is no
+    migration system), so until someone wants that, refusing to start is the honest
+    behaviour: a config that cannot work should not appear to.
+
+    Returns the single managed root. Raises MultiRootError otherwise.
+    """
+    roots = _managed_roots()
+    if len(roots) > 1:
+        raise MultiRootError(
+            "swarm-sync coordinates ONE repo per server, but "
+            f"{len(roots)} managed roots are configured: {os.pathsep.join(roots)}.\n"
+            "Parcel ids are relative to the root and carry no repo qualifier, so two "
+            "roots sharing a filename (utils.py, __init__.py, conftest.py -- i.e. "
+            "always) collide on the same parcel id: their rows overwrite each other "
+            "and a lease on one repo's file locks the other's.\n"
+            "Set SWARMSYNC_ROOTS (or --root) to exactly one repo, and run a second "
+            "server on another port for a second repo."
+        )
+    return roots[0]
 
 
 def _validate_managed_path(path: str) -> str:
@@ -228,6 +266,12 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # Refuse to serve a multi-root config at all. Checked here (not in create_app)
+        # so it is evaluated when the server actually starts, against the environment
+        # it will actually run under -- and so tests/tools that build an app object
+        # without serving it are unaffected. See `check_single_root`.
+        check_single_root()
+
         # BEFORE serving anything: roll trunk back out of any integrate that died
         # mid-flight. `integrate` merges to trunk before it knows the verdict, and a
         # SIGKILL/OOM in that window (up to the 600s gate ceiling) cannot be caught in

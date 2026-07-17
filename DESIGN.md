@@ -23,7 +23,9 @@ Four sub-problems every design must answer, and where we answer them:
 Selected over Loom, ZLP, Ledger, and Plan-DAG-Contracts. All three judge panels ranked it #1.
 Rationale: it is the **best-of synthesis** of the field —
 
-- **git worktree physical isolation** (from Loom/ZLP): two agents can never share a working tree,
+- **git worktree physical isolation** (from Loom/ZLP): two broker-driven agents can never share a
+  working tree (§5.1 — but hook-driven Claude subagents *do* share one, where the lease is the
+  only protection),
   so same-file clobbering is structurally impossible.
 - **atomic SQLite CAS leases** (from ZLP): logical mutual exclusion on the unit of parallelism.
 - **frozen interface contracts** (from Plan-DAG): kills the worst real break — a signature changing
@@ -182,7 +184,7 @@ acting.
 | `GET /parcels` | The live parcel map (id, blast_radius, state_summary, lease status). |
 | `GET /leases` | Active leases. |
 | `POST /intent` | Declare `{agent_id, task, target_parcels}`; emits a `planned` pheromone + event. |
-| `POST /lease` | Atomic CAS acquire `{agent_id, parcel_id, mode}` → `granted|denied` (§5.2). |
+| `POST /lease` | Atomic CAS acquire `{agent_id, parcel_id, mode, ttl?, intent?, ensure_parcel?}` → `granted\|denied` (§5.2). `ensure_parcel` (hook path only) auto-creates a coarse whole-file parcel when the id is unknown, so a file the classifier never indexed is still coordinated — see §5.1's note on the shared working tree. Such a row carries NULL `content_hash`/byte span until a real `POST /index` fills it in, so **a `parcels` row does not imply a parsed span**. |
 | `POST /heartbeat` | `{agent_id, lease_id}` → bump `heartbeat_at` + `ttl_expires_at`. |
 | `POST /release` | Release a lease. |
 | `GET /contract/{symbol}` | Current frozen signature + version. |
@@ -205,9 +207,23 @@ Agents **never talk to each other** — all coordination is reads/writes against
 ## 5. Collision handling
 
 ### 5.1 Physical isolation (prevention)
-Every agent runs in its own `git worktree` on its own branch cut from a known `base_commit`
-(`swarmsync/worktree/git_ops.py`). Filesystem-level "two writers, one file" is **structurally
-impossible**, and each agent gets an independent build/test.
+Every **broker-driven** agent runs in its own `git worktree` on its own branch cut from a known
+`base_commit` (`swarmsync/worktree/git_ops.py`). On that path, filesystem-level "two writers,
+one file" is **structurally impossible**, and each agent gets an independent build/test.
+
+> **This does not hold on the Claude Code hook path**, and that distinction is load-bearing.
+> Hook-driven subagents all run in the **one working tree** the user's session is in
+> (`hooks/adapter.py` takes `_repo_root` from the hook payload's `cwd`); swarm-sync does not
+> place them in worktrees, and there is no integrator or test gate between them and the file.
+> There, §5.2's lease is the **only** thing preventing a collision — not a second line of
+> defence behind physical isolation, but the whole of it. Two consequences follow, and both
+> have bitten:
+> - any file the lease layer fails to cover on that path is *completely* ungated (a hook lease
+>   on an unindexed file therefore auto-creates a coarse whole-file parcel rather than failing
+>   open — `server/leases.py::_ensure_parcel`);
+> - the lease is only consulted for `Edit`/`Write`-family tools, so a `Bash` write (`sed -i`,
+>   `cat >`) bypasses it entirely. The hook path is a cooperative protocol among well-behaved
+>   agents, not a sandbox.
 
 ### 5.2 Logical mutual exclusion — atomic CAS lease (prevention)
 Acquire is a single SQLite transaction that inserts a lease **only if no conflicting active,
@@ -302,6 +318,26 @@ assertion the script checks and prints PASS/FAIL for:
 **Overall success criterion:** across a run with ≥3 concurrent agents on the sample repo, **zero
 same-file textual collisions reach the integration branch**, every landed commit leaves the sample
 repo's test suite green, and all five money-shot assertions print PASS.
+
+## 7a. Operational surface (env + launchers)
+
+The shipped configuration surface, which the rest of this spec otherwise assumes away. README
+has the operator-facing version; this is the contract.
+
+| Knob | Meaning |
+|---|---|
+| `SWARMSYNC_ROOTS` | The managed-root allow-list bounding which filesystem paths `POST /index` / `POST /integrate` may touch (403 otherwise). Defaults to the server's **launch cwd** — getting it wrong is silent: nothing indexes, so nothing leases, so the fail-open hook allows everything. **Exactly one root**: parcel ids are root-relative with no repo qualifier, so two roots collide on the same ids; the server refuses to start with more than one (`app.check_single_root`). |
+| `SWARMSYNC_TOKEN` | Bearer token required on every mutating route. **Unset = no auth** (the dev/demo default). |
+| `SWARMSYNC_GATE_TIMEOUT` | Wall-clock ceiling on the integrator's pytest gate (default 600s). The gate runs just-merged, agent-authored code while holding the global integrate lock, so this is what stops one non-terminating test wedging integration permanently. |
+| `SWARMSYNC_URL`, `SWARMSYNC_ACTIVE` | Hook adapter: blackboard base URL, and the per-repo activation switch (see README). |
+| `swarmsync-serve --db/--host/--port/--root` | The launcher README tells hook users to run (defaults to port **8787**, matching the adapter's default `SWARMSYNC_URL`). `swarm-sync` is the other entry point and defaults to port **8000** — mixing them up is a silent fail-open. |
+
+**Crash recovery.** `integrate` mutates trunk before it knows the verdict, so it emits
+`integrate_started` (carrying the sha to roll back to) before merging and a terminal
+`merged`/`merge_rejected` after. A start with no terminal event is an orphan: at startup
+`integrator.reconcile_orphaned_integrations` resets trunk back to the recorded sha and emits
+`integrate_orphaned`. This is what makes "trunk is always test-green" survive a SIGKILL/OOM
+mid-gate, which no in-process handler can catch.
 
 ## 8. Explicitly out of scope for the prototype
 Multi-language classifier (tree-sitter backend stubbed), live LLM agents (scripted mutators instead),

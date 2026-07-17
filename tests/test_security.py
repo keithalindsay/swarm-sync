@@ -311,3 +311,43 @@ def test_the_mutating_route_list_is_complete(client):
         f"POST route(s) {sorted(missing)} are not covered by the auth test. Add them to "
         f"MUTATING_ROUTES (and give them a require_token guard) rather than deleting this."
     )
+
+
+# --- R5: multi-root is data corruption, so the server must refuse to serve it ------
+
+
+def test_app_refuses_to_start_with_multiple_managed_roots(monkeypatch, tmp_path):
+    """The refusal must live in the SERVER, not only in the launcher.
+
+    Parcel ids are `<relpath>::<symbol>` relative to the indexed root and carry no repo
+    qualifier, so two roots that share a filename -- utils.py, __init__.py, conftest.py,
+    i.e. essentially always -- produce the SAME id for different files: upsert
+    overwrites one repo's rows with the other's, a write lease on that id locks BOTH
+    repos' files, and integrate's re-index clobbers the other root wholesale. Silently.
+
+    So it must fail at startup, on the path any deployment takes, not just via
+    `swarmsync-serve`'s argv (an operator setting SWARMSYNC_ROOTS and running uvicorn
+    directly must get the same answer).
+    """
+    from swarmsync.server.app import MultiRootError
+
+    a, b = tmp_path / "repoA", tmp_path / "repoB"
+    a.mkdir()
+    b.mkdir()
+    monkeypatch.setenv("SWARMSYNC_ROOTS", os.pathsep.join([str(a), str(b)]))
+
+    app = create_app(tmp_path / "bb.db")
+    with pytest.raises(MultiRootError, match="ONE repo per server"):
+        with TestClient(app):  # entering the context runs lifespan == startup
+            pass
+
+
+def test_app_starts_normally_with_exactly_one_root(monkeypatch, tmp_path):
+    """The other half: one root is the supported case and must keep working."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("SWARMSYNC_ROOTS", str(repo))
+
+    app = create_app(tmp_path / "bb.db")
+    with TestClient(app) as c:
+        assert c.get("/parcels").status_code == 200

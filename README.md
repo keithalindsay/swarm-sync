@@ -35,9 +35,19 @@ merges are gated.
 
 ## Quickstart (once built)
 
+**Requires Python 3.11+.** Check first — on 3.10 or older, `pip install` fails after a long
+dependency-resolver backtrack rather than telling you the version is the problem:
+
 ```bash
-python -m venv .venv && source .venv/bin/activate
+python3 --version     # must be 3.11 or newer
+```
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
+
+# Inside the venv, `python` now exists and is the venv's 3.11+.
+# (Use python3 before activating: most distros ship no bare `python`.)
 
 # Run the full 5-money-shot demo (boots server, indexes sample_repo, runs 3 agents)
 python demo/run_demo.py
@@ -115,17 +125,23 @@ hook call and agent talks to.
 #### `SWARMSYNC_ROOTS` — get this wrong and you get *silent* zero enforcement
 
 `POST /index` and `POST /integrate` take a filesystem path from the caller, so they are
-restricted to an allow-list of **managed roots**: a path must `realpath` to somewhere under
-`SWARMSYNC_ROOTS` (colon-separated) or it is rejected with `403`. **`SWARMSYNC_ROOTS` defaults to
-the server's launch cwd** — so if you start the server from anywhere that isn't an ancestor of
-the repo (another terminal, a systemd unit, `~`, or `/tmp` as in the `--db` example above),
-indexing that repo `403`s.
+restricted to a **managed root**: a path must `realpath` to somewhere under `SWARMSYNC_ROOTS`
+or it is rejected with `403`. **`SWARMSYNC_ROOTS` defaults to the server's launch cwd** — so if
+you start the server from anywhere that isn't an ancestor of the repo (another terminal, a
+systemd unit, `~`, or `/tmp` as in the `--db` example above), indexing that repo `403`s.
+
+**One server coordinates one repo.** `SWARMSYNC_ROOTS` bounds which paths that single repo may
+touch; it is not a multi-repo mode. Parcel ids are `<relpath>::<symbol>` *relative to the root*
+with no repo qualifier, so two roots that both contain `utils.py` would collide on the same
+`utils.py::helper` id — overwriting each other's rows and conflating their leases. The server
+therefore **refuses to start** if more than one root is configured, and `--root` is not
+repeatable. For a second repo, run a second server on another port with its own `--db`.
 
 That failure is quiet and total, in the same way as the port footgun below: no parcels get
 indexed → every lease request has no parcel to lease → the fail-open hook allows every edit →
 **no leasing whatsoever**, with nothing in the transcript to flag it. Always set
-`SWARMSYNC_ROOTS` explicitly to the repo (or repos) you intend to coordinate, and check the
-server's startup line naming its managed roots.
+`SWARMSYNC_ROOTS` explicitly to the repo you intend to coordinate, and check the server's
+startup line naming its managed root.
 
 ### 3. Turn coordination on/off per repo
 

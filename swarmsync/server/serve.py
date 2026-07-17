@@ -15,7 +15,7 @@ import os
 
 import uvicorn
 
-from swarmsync.server.app import _managed_roots, create_app
+from swarmsync.server.app import MultiRootError, check_single_root, create_app
 
 
 def main() -> None:
@@ -25,25 +25,31 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8787)
     parser.add_argument(
         "--root",
-        action="append",
-        dest="roots",
         metavar="PATH",
-        help="repo path this server may index/integrate (repeatable). Overrides "
-        "SWARMSYNC_ROOTS, which itself defaults to the launch cwd.",
+        help="the ONE repo path this server may index/integrate. Overrides "
+        "SWARMSYNC_ROOTS, which itself defaults to the launch cwd. Not repeatable: "
+        "one server coordinates one repo (parcel ids carry no repo qualifier, so two "
+        "roots would collide on the same ids). Run a second server for a second repo.",
     )
     args = parser.parse_args()
 
-    if args.roots:
-        os.environ["SWARMSYNC_ROOTS"] = os.pathsep.join(args.roots)
+    if args.root:
+        os.environ["SWARMSYNC_ROOTS"] = args.root
 
     # Say the managed roots out loud at boot. Getting them wrong does not raise --
     # it makes /index 403, which leaves the parcel map empty, which makes every hook
     # fail open, i.e. silently NO coordination at all. An operator who can see this
     # line next to the repo they meant to coordinate can spot that in one glance.
-    roots = _managed_roots()
-    print(f"swarm-sync: managed roots: {os.pathsep.join(roots)}", flush=True)
+    # Fail here, with a readable message, rather than letting the same check raise out
+    # of uvicorn's startup as a traceback.
+    try:
+        root = check_single_root()
+    except MultiRootError as exc:
+        raise SystemExit(f"swarm-sync: {exc}") from None
+
+    print(f"swarm-sync: managed root: {root}", flush=True)
     print(
-        "swarm-sync: /index and /integrate will 403 for any path outside those roots "
+        "swarm-sync: /index and /integrate will 403 for any path outside that root "
         "(set SWARMSYNC_ROOTS or pass --root).",
         flush=True,
     )
