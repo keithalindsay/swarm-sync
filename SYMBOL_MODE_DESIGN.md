@@ -173,7 +173,7 @@ Only if Stage 3's shadow data says the rejection rate is tolerable. Hook adapter
 ## Verified independently before recording (not taken on the panel's word)
 
 - **git's merge rule**: measured. 0 unchanged lines between edits → CONFLICT; 1 → CLEAN.
-  ROUND4.md §1's "3 lines of context" is diff's display padding, not the merge rule. Corrected.
+  (The "3 lines of context" you'll see in diffs is display padding, not the merge rule.)
 - **Parcel spans exclude the separators**: `alpha` = bytes[0:30], `beta` = bytes[33:62]; the two
   PEP 8 blank lines belong to no symbol parcel. So normally-formatted Python already satisfies
   git's rule for two-agents-one-file.
