@@ -35,6 +35,14 @@ EventType = Literal[
     "merge_rejected",
     "reindexed",
     "needs_rebase",  # U10: optimistic re-check (DESIGN §5.5) found a stale read-dep
+    # R5: `integrate` mutates trunk BEFORE it knows the verdict (merge, then gate,
+    # then keep-or-reset). That window was in-memory only, so a crash inside it left
+    # an un-gated merge on trunk with nothing recording that it was ever provisional.
+    # `integrate_started` is written before the merge and carries the sha to roll back
+    # to; a start with no terminal event is an orphan, which startup reconciliation
+    # resets out and records as `integrate_orphaned`.
+    "integrate_started",
+    "integrate_orphaned",
 ]
 
 

@@ -228,6 +228,26 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # BEFORE serving anything: roll trunk back out of any integrate that died
+        # mid-flight. `integrate` merges to trunk before it knows the verdict, and a
+        # SIGKILL/OOM in that window (up to the 600s gate ceiling) cannot be caught in
+        # process -- it leaves an UN-GATED merge on trunk with no event and no
+        # rollback, silently falsifying "trunk is always test-green" forever. This is
+        # the only thing that can detect it, and it must run before a new integrate can
+        # build on the poisoned trunk. Never raises; a repo that moved or vanished must
+        # not stop the server booting.
+        try:
+            for record in integrator.reconcile_orphaned_integrations(conn):
+                print(
+                    f"swarm-sync: reconciled orphaned integrate "
+                    f"{record['branch']!r} -> {record['into']!r} in {record['repo']!r}: "
+                    f"{record['action']}"
+                    + (f" (error: {record['error']})" if record["error"] else ""),
+                    flush=True,
+                )
+        except Exception as exc:  # noqa: BLE001 -- startup must never be blocked
+            print(f"swarm-sync: startup reconciliation failed: {exc!r}", flush=True)
+
         task = None
         reaper_conn = None
         if reaper_interval is not None:

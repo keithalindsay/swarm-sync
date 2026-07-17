@@ -69,8 +69,10 @@ thin shell around this function, not a separate implementation.
 """
 from __future__ import annotations
 
+import json
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -419,6 +421,7 @@ def integrate(
                 {
                     "branch": branch,
                     "into": into,
+                    "repo": str(repo),
                     "stale_deps": stale,
                     "base_commit": base_commit,
                 },
@@ -481,7 +484,10 @@ def integrate(
                 run_index(conn, repo)
             except Exception as iexc:  # noqa: BLE001 - see above
                 rollback_error = f"blackboard re-index after rollback failed: {iexc!r}"
-        payload = {"branch": branch, "into": into, "reason": reason_code}
+        # `repo` closes this branch's `integrate_started` -- see the note on the
+        # `merged` emit. A rejection is a verdict: trunk is in a state we chose, so
+        # startup reconciliation must not treat it as an orphan and reset it again.
+        payload = {"branch": branch, "into": into, "repo": str(repo), "reason": reason_code}
         payload.update(payload_extra)
         full_reason = reason
         if rollback_error is not None:
@@ -497,6 +503,30 @@ def integrate(
         )
 
     # --- step 2: serialized merge -------------------------------------------
+    #
+    # Record the INTENT before touching trunk. `integrate` merges first and learns the
+    # verdict second, so between here and the terminal event trunk carries a merge that
+    # has not been gated. That window was in-memory only: a SIGKILL/OOM, or a
+    # BaseException (Ctrl-C, uvicorn shutdown) inside it, left the un-gated merge on
+    # trunk with no event, no rollback, and nothing on restart that could even tell it
+    # had happened -- silently falsifying "trunk is always test-green" from then on,
+    # permanently. This row is what makes the window a durable fact: it carries the sha
+    # to roll back to, and a start with no terminal event is an orphan that
+    # `reconcile_orphaned_integrations` resets out at startup.
+    events_mod.emit(
+        conn,
+        "integrate_started",
+        agent_id,
+        {
+            "branch": branch,
+            "into": into,
+            "base_commit": base_commit,
+            "trunk_sha_before": pre_merge_sha,
+            "repo": str(repo),
+        },
+        ts=now,
+    )
+
     try:
         ok, conflicts = git_ops.merge_branch(repo, branch, into=into)
     except git_ops.GitOpsError as exc:
@@ -505,24 +535,19 @@ def integrate(
         # pre_merge_sha -- surface it as a structured rejection, not a 500.
         return _reject_and_reset("merge_error", f"git merge failed: {exc}")
     if not ok:
-        events_mod.emit(
-            conn,
-            "merge_rejected",
-            agent_id,
-            {
-                "branch": branch,
-                "into": into,
-                "reason": "merge_conflict",
-                "conflicts": conflicts,
-            },
-            ts=now,
-        )
-        return IntegrateResult(
-            status="merge_rejected",
-            branch=branch,
-            into=into,
+        # Through `_reject_and_reset`, not a bespoke emit+return. This path used to
+        # hand-roll its own rejection, which meant it skipped the blackboard re-index
+        # that `_reject_and_reset` performs -- so a conflicted merge left the agent's
+        # self-reported `content_hash` (posted by `runner.py` BEFORE integrate) in the
+        # blackboard, describing a version of the file that exists in NO git ref. Every
+        # rejection route must reach the same sink, or the next one added skips the
+        # compensation again. `reset_hard` is a harmless no-op here: `merge_branch`
+        # already aborted the conflicted merge, so trunk is at `pre_merge_sha`.
+        return _reject_and_reset(
+            "merge_conflict",
+            "textual merge conflict (touch-set misprediction)",
+            result_fields={"conflicts": conflicts},
             conflicts=conflicts,
-            reason="textual merge conflict (touch-set misprediction)",
         )
 
     # From here the merge commit is ON trunk (`into`). Everything below --
@@ -626,6 +651,16 @@ def integrate(
         return _reject_and_reset(
             "integration_error", f"post-merge integration failed: {exc!r}"
         )
+    except BaseException as exc:
+        # `except Exception` does NOT catch KeyboardInterrupt/SystemExit -- i.e. the
+        # ordinary ways this process dies: an operator's Ctrl-C, or uvicorn's shutdown,
+        # during a gate that may legitimately run for 600s. Those inherited the
+        # un-gated merge on trunk. Roll trunk back, then RE-RAISE: the interrupt is not
+        # ours to swallow, we only decline to leave trunk poisoned on the way out.
+        # (A SIGKILL/OOM cannot be caught at all -- that is what startup
+        # reconciliation is for.)
+        _reject_and_reset("interrupted", f"integration interrupted: {exc!r}")
+        raise
 
     # --- success: the whole atomic block landed. Emit the trail now. --------
     events_mod.emit(
@@ -635,6 +670,11 @@ def integrate(
         {
             "branch": branch,
             "into": into,
+            # `repo` identifies WHICH integrate_started this closes. Without it
+            # reconciliation cannot match a verdict to its start and would treat a
+            # landed merge as an orphan -- resetting real work off trunk, which is the
+            # exact data loss it exists to prevent.
+            "repo": str(repo),
             "merged_commit": merged_commit,
             "changed_files": changed,
         },
@@ -660,3 +700,81 @@ def integrate(
         contract_changes=contract_changes,
         test_log=test_log,
     )
+
+
+# --- startup reconciliation (R5) ---------------------------------------------------
+
+# A terminal event for an `integrate_started` -- i.e. the integrate reached a verdict
+# and trunk is in a state it chose. Anything else means we died mid-flight.
+_INTEGRATE_TERMINAL_TYPES = frozenset({"merged", "merge_rejected", "needs_rebase"})
+
+
+def reconcile_orphaned_integrations(conn: sqlite3.Connection) -> list[dict]:
+    """Roll trunk back out of any integrate that died before reaching a verdict.
+
+    `integrate` merges to trunk BEFORE it knows whether the merge is good, so there is
+    a window -- as long as the gate, up to SWARMSYNC_GATE_TIMEOUT (600s default) --
+    where trunk carries an UN-GATED merge. In-process handlers cover the catchable
+    exits (see `integrate`'s `except Exception` / `except BaseException`). They cannot
+    cover SIGKILL, OOM, or the power going out. Without this, such a death left the
+    un-gated merge on trunk permanently, with no event, no rollback and nothing on
+    restart that could even detect it: "trunk is always test-green" -- the product's
+    headline guarantee -- silently false from then on.
+
+    Called at server startup. For each `integrate_started` with no terminal event, this
+    resets `into` back to the `trunk_sha_before` that event recorded and emits
+    `integrate_orphaned`. Returns one dict per orphan reconciled, for the caller to log.
+
+    Deliberately conservative:
+      - Only rolls back when trunk's CURRENT sha differs from `trunk_sha_before` (if it
+        already matches, the merge never landed and there is nothing to undo).
+      - Never raises: a repo that has moved on, been deleted, or is not reachable from
+        this process must not stop the server from booting. Each failure is reported in
+        the returned record instead.
+    """
+    started: dict[tuple[str, str, str], dict] = {}
+    for event in events_mod.tail(conn, since_seq=0, limit=1_000_000):
+        if event.type not in _INTEGRATE_TERMINAL_TYPES and event.type != "integrate_started":
+            continue
+        try:
+            payload = json.loads(event.payload) if event.payload else {}
+        except (ValueError, TypeError):  # pragma: no cover - defensive
+            continue
+        key = (
+            str(payload.get("repo") or ""),
+            str(payload.get("branch") or ""),
+            str(payload.get("into") or ""),
+        )
+        if event.type == "integrate_started":
+            started[key] = payload
+        else:
+            # A verdict for this (repo, branch, into) closes the most recent start.
+            started.pop(key, None)
+
+    reconciled: list[dict] = []
+    for (repo, branch, into), payload in started.items():
+        record = {"repo": repo, "branch": branch, "into": into, "action": None, "error": None}
+        sha_before = payload.get("trunk_sha_before")
+        if not repo or not into or not sha_before:
+            record["action"] = "skipped: incomplete integrate_started payload"
+            reconciled.append(record)
+            continue
+        try:
+            current = git_ops.current_commit(repo, ref=into)
+            if current == sha_before:
+                # The process died before the merge actually landed. Nothing to undo.
+                record["action"] = "no-op: trunk never moved"
+            else:
+                git_ops.reset_hard(repo, sha_before, branch=into)
+                record["action"] = f"reset {into} {current[:8]} -> {sha_before[:8]}"
+        except Exception as exc:  # noqa: BLE001 -- must never block startup
+            record["error"] = repr(exc)
+            record["action"] = "FAILED"
+        events_mod.emit(
+            conn,
+            "integrate_orphaned",
+            None,
+            {**payload, "reconciliation": record["action"], "error": record["error"]},
+        )
+        reconciled.append(record)
+    return reconciled
