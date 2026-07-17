@@ -57,11 +57,11 @@ You should see:
 
 ```
 RESULTS
-  PASS: money-shot #1 (three agents on three files land concurrently, clean)
-  PASS: money-shot #2 (contended whole-file parcel serializes)
-  PASS: money-shot #3 (frozen-contract change notifies + dependent re-plans)
-  PASS: money-shot #4 (crash mid-edit is recovered)
-  PASS: money-shot #5 (serial gated integration rejects a bad edit)
+  PASS: case #1 (three agents on three files land concurrently, clean)
+  PASS: case #2 (contended whole-file parcel serializes)
+  PASS: case #3 (frozen-contract change notifies + dependent re-plans)
+  PASS: case #4 (crash mid-edit is recovered)
+  PASS: case #5 (serial gated integration rejects a bad edit)
   PASS: overall (zero collisions, trunk green throughout)
 ```
 
