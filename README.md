@@ -14,9 +14,11 @@ This is the **Pheromesh** architecture. See [`DESIGN.md`](DESIGN.md) for the ful
 
 ## How it works (one paragraph)
 
-A **classifier** parses the repo (Python via stdlib `ast`) into *parcels* — leasable units at
+A **classifier** parses the repo (Python via stdlib `ast`) into *parcels* — indexed at
 function/method granularity with file-level fallback — computes each parcel's **blast radius**, and
-freezes high-fan-in **interface contracts**. A **blackboard** (SQLite in WAL mode) holds the parcel map,
+freezes high-fan-in **interface contracts**. **Leases are taken at whole-file granularity** (the
+parcel map is finer than the lock; see [Granularity](#granularity-swarm-sync-locks-whole-files)). A
+**blackboard** (SQLite in WAL mode) holds the parcel map,
 leases, contracts, decaying **pheromone** trails, and an append-only event log; each parcel carries a
 live `state_summary` of what it now does. Agents declare intent, acquire an **atomic CAS write-lease**,
 edit inside their **own git worktree**, heartbeat, then submit their branch to a **serial, test-gated
@@ -29,8 +31,8 @@ merges are gated.
 | Layer | Mechanism | Guarantees |
 |---|---|---|
 | Physical | git worktree per agent | same-file clobbering is structurally impossible — **broker-driven agents only**; hook-driven Claude subagents share one working tree, where the lease is the only protection |
-| Logical | atomic SQLite CAS lease per parcel | one writer per parcel; mispredictions serialize. Covers `Edit`/`Write`-family tools — a `Bash` write (`sed -i`, `cat >`) bypasses it |
-| Interface | frozen contracts + `contract_change` events | a landed signature change is **detected and announced** to dependents, *after* it merges (DESIGN §5.3) — dependents with in-flight work are notified and re-plan; they are not prevented from building against a stale signature in the first place |
+| Logical | atomic SQLite CAS lease, **one whole file per lock** | one writer per file, on both the broker and hook paths; mispredictions serialize. Two agents never edit one file concurrently — the second is denied and waits. Covers `Edit`/`Write`-family tools — a `Bash` write (`sed -i`, `cat >`) bypasses it |
+| Interface | frozen contracts + `contract_change` events | a landed signature change is **detected and announced** to dependents, *after* it merges (DESIGN §5.3) — dependents with in-flight work are notified and re-plan; they are not prevented from building against a stale signature in the first place. Detection is all that ships: the *preventive* half (upgrading a frozen symbol's lease to `exclusive`) never fires at file granularity, since frozen ids are symbol ids and every lease is a file id (DESIGN §5.3) |
 | Integration | serial pytest-gated merge | trunk stays green: a branch is merged, tested, and **rolled back if red**, so a break is caught before it *survives* on trunk — not before it lands. Semantic conflicts that no test covers are the honest hard limit (DESIGN §6) |
 
 ## Quickstart (once built)
@@ -178,28 +180,41 @@ through with **no leasing whatsoever**, no error, no denial, nothing in the tran
 Always either run `swarmsync-serve --port 8787` for hook-enforced sessions, or explicitly export
 `SWARMSYNC_URL` to match whichever launcher/port you actually used.
 
-### Granularity note: money-shot #1 vs. the hook's default
+### Granularity: swarm-sync locks whole files
 
-`DESIGN.md` §2's de-risking decision is that the **enforced** lease granularity defaults to
-**whole-file**, and that's exactly what `swarmsync/hooks/adapter.py` does for every Claude-Code-hook
-session — it always leases the one synthetic per-file parcel, never a symbol inside it, regardless
-of how finely the classifier parsed the file. **Money-shot #1** (two agents editing different
-functions in the same file, both landing clean) is demonstrated by `demo/run_demo.py` using the
-**broker** (`coordinator/broker.py`) in `mode="symbol"` — an opt-in, finer-grained leasing mode the
-demo/broker path supports but the hook path does not. Under hook enforcement, two subagents editing
-different functions in the *same file* at the same time will **not** both proceed: the second is
-denied the whole-file lease and must pick different work or wait, rather than co-editing the file
-the way the demo's symbol-mode broker run shows.
+**The unit of parallelism is the file.** Every lease the broker (`coordinator/broker.py`) and the
+Claude Code hook adapter (`hooks/adapter.py`) take is on the one synthetic per-file parcel
+(`<relpath>::<module>`), regardless of how finely the classifier parsed the file. So **two agents
+never edit the same file at the same time**: the second is denied the lease and must wait or pick
+different work. Parallelism comes from working on *different files*. (`POST /lease` itself will lock
+whatever parcel id you hand it — the file-granularity rule lives in the two clients above, and in
+the `Bash`-shaped hole noted below.)
+
+The classifier still indexes parcels at function/class granularity, and that is not decoration —
+blast radius and the frozen-contract surface are built on those symbol parcels. What is *not*
+available is symbol granularity as a **lease/scheduling** mode: requesting it raises
+(`classifier/graph.py::check_file_granularity`), rather than appearing to work.
+
+That is a deliberate park, not an omission — the reasoning and the revival plan are in
+[`SYMBOL_MODE_DESIGN.md`](SYMBOL_MODE_DESIGN.md). The short version: symbol mode is **unsafe today**
+(the lease store's conflict rule is a plain string match on `parcel_id` with no notion of
+containment, so a whole-file lease and a symbol lease *inside that same file* are different strings
+and are both granted — reproduced); it could only ever work on the **broker** path, never the hook
+path this README leads with (no worktree isolation, no integrator, so no point at which a
+non-conforming edit can be refused); and the concurrency it buys is narrower than it sounds, since
+any edit that touches an import escalates to the whole file anyway. File mode is safe *by
+construction*: every id it leases is `<file>::<module>`, so ids are always same-shaped and string
+equality is a sound conflict rule.
 
 ## The demo proves
 
-1. Two agents edit **different functions in the same file** concurrently → both land clean.
-2. A third agent hitting a leased parcel is **serialized** (denied → waits → lands).
-3. A **frozen-contract change** notifies a dependent, which re-plans.
+1. Three agents edit **different files** concurrently → all land clean, zero conflicts.
+2. A second agent hitting a leased file is **serialized** (denied → waits → lands).
+3. A **frozen-contract change** is detected on merge and notifies a dependent, which re-plans.
 4. An agent **killed mid-edit** is reaped; its task is reassigned; trunk untouched.
 5. A test-breaking edit is **rejected** at the gate and never lands.
 
-Success criterion: **zero same-file textual collisions reach the integration branch**, every landed
+Success criterion: **zero textual collisions reach the integration branch**, every landed
 commit leaves the sample repo's tests green, all five assertions print PASS.
 
 ## Security & trust model — read before exposing this to anything

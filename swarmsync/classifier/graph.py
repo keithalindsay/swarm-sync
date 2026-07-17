@@ -13,9 +13,12 @@ Core API:
       becomes a frozen contract: record signature (name + params + defaults for functions;
       public method signatures for classes) + type_hash.
   co_schedulable(a, b, mode="file", graph=None, frozen_ids=None) -> bool
-    - file mode: file(a) != file(b); symbol mode: spans disjoint; AND (when graph/frozen_ids
-      are supplied) neither is a frozen contract the other depends on. This is the
-      parallel-safety relation (DESIGN §3).
+    - file mode: file(a) != file(b); AND (when graph/frozen_ids are supplied) neither is a
+      frozen contract the other depends on. This is the parallel-safety relation (DESIGN §3).
+    - mode="symbol" (spans disjoint) is PARKED and refuses -- `check_file_granularity`
+      raises `SymbolModeError`. The branch is kept intact behind the guard; the reasons and
+      the revival plan are in SYMBOL_MODE_DESIGN.md. Symbol-level *parcels* are unaffected:
+      the indexer still emits them and frozen contracts are still built on them.
 
 FREEZE_THRESHOLD default 3. Fall back to FILE granularity when name resolution is
 uncertain (dynamic dispatch / string imports) -- conservative, backstopped by the test gate.
@@ -353,6 +356,54 @@ def extract_contracts(
     return sorted(contracts, key=lambda c: c.symbol)
 
 
+class SymbolModeError(ValueError):
+    """Raised when symbol granularity is requested. Parked, not deleted -- see
+    `check_file_granularity` and SYMBOL_MODE_DESIGN.md."""
+
+
+def check_file_granularity(mode: str) -> str:
+    """swarm-sync leases at FILE granularity. Enforce that, loudly, at every entry point.
+
+    Symbol granularity is PARKED and UNSAFE TODAY. `server/leases.py::acquire`'s entire
+    conflict rule is a string match on `parcel_id`, and it understands nothing about
+    containment: `m.py::<module>` (the whole file) and `m.py::alpha` (a function inside it)
+    are different strings, so two agents can hold BOTH in write mode at once and edit the
+    same file with no mutual exclusion. Reproduced, not theorized. File mode is safe by
+    construction precisely because every id it ever leases is `<file>::<module>`, so ids
+    are always same-shaped and string equality is a sound conflict rule. `co_schedulable`
+    is the only code here that understands containment, and it is advisory, broker-only,
+    and never consulted by `POST /lease` or the hook path.
+
+    So symbol mode is not a supported mode -- it is a silent double-write with a
+    finer-grained-looking flag. Same call as multi-root (`server/app.py::check_single_root`):
+    a config that cannot work should not appear to. The symbol code paths below are left
+    INTACT behind this guard; SYMBOL_MODE_DESIGN.md is the plan to revive them (and the
+    reasoning for why they are broker-only in the first place).
+
+    Note this guards the *lease/scheduling* granularity only. Symbol-level parcels are
+    still indexed, and the frozen-contract subsystem still rides on them, untouched.
+
+    Returns `mode` unchanged when it is "file". Raises `SymbolModeError` for "symbol",
+    `ValueError` for anything unrecognized.
+    """
+    if mode == "symbol":
+        raise SymbolModeError(
+            "swarm-sync leases at FILE granularity; mode='symbol' is parked and refuses.\n"
+            "The lease store's conflict rule is a plain string match on parcel_id with no "
+            "notion of containment, so a whole-file lease ('m.py::<module>') and a symbol "
+            "lease inside that same file ('m.py::alpha') are different strings and are BOTH "
+            "granted in write mode -- two agents editing one file with no mutual exclusion "
+            "(reproduced). File mode is safe by construction: every id is '<file>::<module>', "
+            "so string matching is a sound conflict rule.\n"
+            "Use mode='file' (the default). Symbol-level parcels are still indexed and frozen "
+            "contracts still work. The revival plan -- and why symbol mode can never work on "
+            "the Claude Code hook path -- is in SYMBOL_MODE_DESIGN.md."
+        )
+    if mode != "file":
+        raise ValueError(f"unknown granularity mode: {mode!r}")
+    return mode
+
+
 def co_schedulable(
     a: Parcel,
     b: Parcel,
@@ -361,7 +412,12 @@ def co_schedulable(
     frozen_ids: Optional[set[str]] = None,
 ) -> bool:
     """The parallel-safety relation (DESIGN §3): structurally disjoint (per `mode`) AND
-    (when `graph`/`frozen_ids` are supplied) neither is a frozen contract the other depends on."""
+    (when `graph`/`frozen_ids` are supplied) neither is a frozen contract the other depends on.
+
+    `mode="symbol"` raises `SymbolModeError` -- parked, see `check_file_granularity`. The
+    symbol branch below is kept for that revival, deliberately unreachable meanwhile.
+    """
+    check_file_granularity(mode)
     if mode == "file":
         disjoint = a.path != b.path
     elif mode == "symbol":

@@ -21,10 +21,13 @@ resolve_task(conn, task, mode="file") -> list[parcel_id]
   default *enforced lease granularity*: every hint collapses to its file's
   whole-file `"<module>"` interstitial parcel, regardless of which symbol
   was named -- two tasks in the same file share one lock and can never even
-  race at symbol granularity. `mode="symbol"` leases the specific named
-  symbol (falling back to the file id when no symbol was given or that exact
-  symbol parcel doesn't exist -- the classifier's own conservative fallback,
-  DESIGN §6).
+  race at symbol granularity. It is now the ONLY mode: `mode="symbol"` (lease
+  the specific named symbol) is PARKED and raises `SymbolModeError` from every
+  entry point here -- the lease store's conflict rule is a string match on
+  parcel_id, so a whole-file lease and a symbol lease on the same file are
+  both granted. See `classifier.graph.check_file_granularity` and
+  SYMBOL_MODE_DESIGN.md. The symbol code paths are left intact behind the
+  guard for that revival.
 
 schedulable(conn, task_a, task_b, mode="file", graph=None, frozen_ids=None) -> bool
   True iff task_a's and task_b's resolved target-parcel sets are pairwise
@@ -63,7 +66,13 @@ Design notes (this unit's own decisions):
   regardless of what `lease_mode` the task/caller otherwise defaults to.
   This is what makes "to change a frozen contract you must take an
   exclusive lease" an enforced runtime invariant rather than a convention a
-  scripted mutator/demo has to remember to opt into by hand. Detecting that
+  scripted mutator/demo has to remember to opt into by hand. NOTE it is
+  currently INERT: contracts are only ever extracted for function/class
+  parcels, while file granularity (now the only mode) resolves every target
+  to its `<module>` parcel, so no target is ever in `frozen_ids`. It is
+  parked alongside symbol mode, kept intact and unit-tested for the revival
+  (SYMBOL_MODE_DESIGN.md). Contract *detection* is unaffected and still
+  ships: `integrate` emits `contract_change` on merge regardless. Detecting that
   a change actually landed and announcing it (`contract_change`) is a
   separate, later step -- see `coordinator/integrator.py`'s own docstring --
   since only a genuinely landed before/after `type_hash` diff is trustworthy
@@ -118,7 +127,12 @@ from typing import Any, Callable, Optional, Union
 
 from swarmsync.agent.runner import AgentResult, run_agent
 from swarmsync.blackboard.models import Parcel
-from swarmsync.classifier.graph import DepGraph, build_graph, co_schedulable
+from swarmsync.classifier.graph import (
+    DepGraph,
+    build_graph,
+    check_file_granularity,
+    co_schedulable,
+)
 from swarmsync.coordinator import reaper
 
 StrPath = Union[str, Path]
@@ -166,13 +180,14 @@ def resolve_task(conn: sqlite3.Connection, task: Task, mode: str = "file") -> li
     parcel ids (DESIGN §3's parcel map is the source of truth -- this never
     invents an id the classifier didn't already emit).
 
-    Raises `ValueError` on an unrecognized `mode`, or if a hinted file has no
-    parcel at all in the blackboard yet (i.e. it hasn't been indexed) -- both
-    are caller bugs, not races, so they fail loudly rather than silently
-    scheduling against a phantom id.
+    Raises `SymbolModeError` on `mode="symbol"` (parked -- see
+    `classifier.graph.check_file_granularity`), `ValueError` on an otherwise
+    unrecognized `mode`, or if a hinted file has no parcel at all in the
+    blackboard yet (i.e. it hasn't been indexed) -- all are caller bugs, not
+    races, so they fail loudly rather than silently scheduling against a
+    phantom id (or, for symbol mode, against a lease that doesn't exclude).
     """
-    if mode not in ("file", "symbol"):
-        raise ValueError(f"unknown granularity mode: {mode!r}")
+    check_file_granularity(mode)
 
     ids: list[str] = []
     for file, symbol in task.targets:
@@ -234,7 +249,10 @@ def schedulable(
 ) -> bool:
     """True iff every parcel `task_a` targets is `co_schedulable` with every
     parcel `task_b` targets (DESIGN §3: "two tasks are safely parallel iff
-    their whole target-parcel sets are pairwise co-schedulable")."""
+    their whole target-parcel sets are pairwise co-schedulable").
+
+    `mode="symbol"` refuses (parked -- `classifier.graph.check_file_granularity`)."""
+    check_file_granularity(mode)
     parcels_a = _resolved_parcels(conn, task_a, mode=mode)
     parcels_b = _resolved_parcels(conn, task_b, mode=mode)
     return all(
@@ -254,7 +272,13 @@ def group_schedulable(
     """Greedily partition `tasks` (input order preserved) into dispatch
     "waves": each wave is a maximal run of mutually co-schedulable tasks. A
     task that conflicts with anything already placed in a wave tries the
-    next wave, else starts a new one. This is the schedule `run` dispatches."""
+    next wave, else starts a new one. This is the schedule `run` dispatches.
+
+    `mode="symbol"` refuses (parked -- `classifier.graph.check_file_granularity`).
+    Guarded HERE and not only in `resolve_task`, since an empty/one-task
+    `tasks` list reaches neither `schedulable` nor `resolve_task`: the guard
+    must not depend on the input happening to be big enough to trip it."""
+    check_file_granularity(mode)
     waves: list[list[Task]] = []
     for task in tasks:
         for wave in waves:
@@ -380,7 +404,13 @@ def run(
 
     Returns `{task_id: AgentResult}` for every task in `tasks`, keyed by
     `task.task_id` (its LAST attempt's result if it needed retries).
+
+    `mode="symbol"` refuses before ANY side effect (parked -- see
+    `classifier.graph.check_file_granularity`): guarded on entry rather than
+    left to the downstream `group_schedulable`/`resolve_task` calls so a
+    refused run cannot first index, spawn, or lease anything.
     """
+    check_file_granularity(mode)
     graph: Optional[DepGraph] = None
     frozen_ids: Optional[set[str]] = None
     if contract_aware:

@@ -54,9 +54,15 @@ def test_real_cross_file_import_or_call_edge_exists(classified):
     assert cross_file, "expected an edge that actually crosses a file boundary"
 
 
-def test_calc_has_two_independent_functions_for_money_shot_1(classified):
-    """Money-shot #1's precondition: >=2 functions in ONE file with disjoint byte
-    spans, so symbol-mode leasing can let two agents edit them at once."""
+def test_calc_has_two_symbol_parcels_with_disjoint_spans(classified):
+    """The indexer emits >=2 function parcels in ONE file with disjoint byte spans.
+
+    This used to be phrased as money-shot #1's precondition ("so symbol-mode leasing can
+    let two agents edit them at once") and asserted via `co_schedulable(..., mode="symbol")`.
+    Symbol granularity is parked (SYMBOL_MODE_DESIGN.md) so that call now refuses -- but the
+    structural fact is orthogonal to leasing and must KEEP holding: symbol-level parcels are
+    still indexed, and the frozen-contract subsystem is built on them. So this asserts the
+    spans directly rather than through the parked scheduling relation."""
     parcels, graph, blast, contracts = classified
     calc_funcs = sorted(
         (p for p in parcels if p.path == "calc.py" and p.kind == "function"),
@@ -65,7 +71,10 @@ def test_calc_has_two_independent_functions_for_money_shot_1(classified):
     assert len(calc_funcs) >= 2, calc_funcs
     a, b = calc_funcs[0], calc_funcs[1]
     assert a.byte_start is not None and b.byte_start is not None
-    assert co_schedulable(a, b, mode="symbol")
+    assert a.byte_end is not None and b.byte_end is not None
+    assert a.byte_end <= b.byte_start or b.byte_end <= a.byte_start, (a, b)
+    # File granularity (the only enforced mode) serializes them regardless -- same file.
+    assert co_schedulable(a, b, mode="file") is False
 
 
 def test_at_least_one_high_fan_in_frozen_contract(classified):
