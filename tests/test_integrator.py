@@ -812,3 +812,232 @@ def test_kill_process_group_never_signals_our_own_group(tmp_path, monkeypatch):
 
     # ...and the child is still killed directly, so the timeout still does its job.
     assert proc.poll() is not None
+
+
+# --- R5 P0: a crash mid-integrate must not leave an un-gated merge on trunk --------
+
+
+def test_integrate_records_its_intent_before_touching_trunk(conn, repo):
+    """`integrate_started` must be durable BEFORE the merge, carrying the rollback sha.
+
+    integrate merges to trunk and learns the verdict afterwards, so trunk carries an
+    un-gated merge for as long as the gate runs (up to 600s). Without a durable record
+    of that window, a SIGKILL in it is undetectable after the fact -- there is nothing
+    that says a merge was ever provisional, or what to roll back to.
+    """
+    r, base = repo
+    run_index(conn, r)
+    pre = git_ops.current_commit(r, ref="integration")
+
+    worktree = git_ops.add_worktree(r, "agent-i", base)
+    (worktree / "mod_a.py").write_text(
+        "def helper(x):\n    return x + 5\n", encoding="utf-8"
+    )
+    git_ops.commit_all(worktree, "agent-i: edit")
+    result = integrator.integrate(conn, r, "agent-i", base_commit=base, agent_id="agent-i")
+    assert result.status == "merged"
+
+    events = events_mod.tail(conn, since_seq=0)
+    starts = [e for e in events if e.type == "integrate_started"]
+    assert len(starts) == 1, "no durable record of the un-gated window"
+    payload = json.loads(starts[0].payload)
+    assert payload["trunk_sha_before"] == pre, "the recorded rollback point is wrong"
+    assert payload["branch"] == "agent-i"
+
+    # ...and the start is ordered BEFORE the verdict, or it proves nothing.
+    types = [e.type for e in events]
+    assert types.index("integrate_started") < types.index("merged")
+
+
+def test_reconcile_rolls_trunk_back_out_of_an_orphaned_integrate(conn, repo):
+    """A crash between the merge and the verdict must be undone at startup.
+
+    Simulates exactly what SIGKILL/OOM leaves behind: an `integrate_started` event, a
+    merge commit on trunk, and NO terminal event. R4's verifiers reproduced this
+    against a real server with kill -9 -- trunk permanently carried the un-gated merge
+    and nothing on restart could tell.
+    """
+    r, base = repo
+    run_index(conn, r)
+    pre = git_ops.current_commit(r, ref="integration")
+
+    # Hand-build the orphan: intent recorded, merge landed, process died.
+    worktree = git_ops.add_worktree(r, "agent-dead", base)
+    (worktree / "mod_a.py").write_text(
+        "def helper(x):\n    return 'never gated'\n", encoding="utf-8"
+    )
+    git_ops.commit_all(worktree, "agent-dead: un-gated edit")
+    events_mod.emit(
+        conn,
+        "integrate_started",
+        "agent-dead",
+        {
+            "branch": "agent-dead",
+            "into": "integration",
+            "base_commit": base,
+            "trunk_sha_before": pre,
+            "repo": str(r),
+        },
+    )
+    ok, _conflicts = git_ops.merge_branch(r, "agent-dead", into="integration")
+    assert ok
+    assert git_ops.current_commit(r, ref="integration") != pre
+    assert "never gated" in (r / "mod_a.py").read_text(encoding="utf-8")
+
+    reconciled = integrator.reconcile_orphaned_integrations(conn)
+
+    assert len(reconciled) == 1
+    assert git_ops.current_commit(r, ref="integration") == pre, (
+        "the un-gated merge is STILL on trunk after reconciliation"
+    )
+    assert "never gated" not in (r / "mod_a.py").read_text(encoding="utf-8")
+    orphaned = [e for e in events_mod.tail(conn, since_seq=0) if e.type == "integrate_orphaned"]
+    assert len(orphaned) == 1, "the rollback left no audit trail"
+
+
+def test_reconcile_leaves_completed_integrates_alone(conn, repo):
+    """Reconciliation must never touch an integrate that reached a verdict -- a
+    `merged` merge is trunk's real history, and resetting it would be the very data
+    loss this is meant to prevent."""
+    r, base = repo
+    run_index(conn, r)
+
+    worktree = git_ops.add_worktree(r, "agent-ok", base)
+    (worktree / "mod_a.py").write_text(
+        "def helper(x):\n    return x + 3\n", encoding="utf-8"
+    )
+    git_ops.commit_all(worktree, "agent-ok: edit")
+    assert integrator.integrate(
+        conn, r, "agent-ok", base_commit=base, agent_id="agent-ok"
+    ).status == "merged"
+    landed = git_ops.current_commit(r, ref="integration")
+
+    reconciled = integrator.reconcile_orphaned_integrations(conn)
+
+    assert reconciled == [], "reconciliation tried to undo a completed integrate"
+    assert git_ops.current_commit(r, ref="integration") == landed
+    assert "x + 3" in (r / "mod_a.py").read_text(encoding="utf-8")
+
+
+def test_reconcile_is_a_noop_when_the_crash_beat_the_merge(conn, repo):
+    """If the process died before the merge landed, trunk is already correct and
+    reconciliation must not rewrite history it did not cause."""
+    r, base = repo
+    run_index(conn, r)
+    pre = git_ops.current_commit(r, ref="integration")
+
+    events_mod.emit(
+        conn,
+        "integrate_started",
+        "agent-early",
+        {
+            "branch": "agent-early",
+            "into": "integration",
+            "base_commit": base,
+            "trunk_sha_before": pre,
+            "repo": str(r),
+        },
+    )
+
+    reconciled = integrator.reconcile_orphaned_integrations(conn)
+
+    assert len(reconciled) == 1
+    assert "no-op" in reconciled[0]["action"]
+    assert git_ops.current_commit(r, ref="integration") == pre
+
+
+def test_reconcile_never_raises_on_a_repo_that_is_gone(conn, tmp_path):
+    """A vanished/moved repo must not stop the server booting."""
+    events_mod.emit(
+        conn,
+        "integrate_started",
+        "agent-x",
+        {
+            "branch": "b",
+            "into": "integration",
+            "trunk_sha_before": "0" * 40,
+            "repo": str(tmp_path / "does-not-exist"),
+        },
+    )
+    reconciled = integrator.reconcile_orphaned_integrations(conn)
+    assert len(reconciled) == 1
+    assert reconciled[0]["error"] is not None
+    assert reconciled[0]["action"] == "FAILED"
+
+
+@pytest.mark.parametrize(
+    "rejection",
+    ["merge_conflict", "gate_red", "integration_error"],
+    ids=["conflict", "red-gate", "post-merge-error"],
+)
+def test_every_rejection_route_leaves_the_blackboard_matching_trunk(
+    conn, repo, monkeypatch, rejection
+):
+    """No rejection route may leave the blackboard describing code that isn't on trunk.
+
+    R3 fixed this for the routes that go through `_reject_and_reset`. R4 found the
+    merge-CONFLICT path hand-rolled its own emit+return and therefore skipped the
+    re-index -- so `runner.py`'s pre-integrate `/parcel/update` self-report survived a
+    rejected conflict, leaving the blackboard holding a `content_hash` for a version of
+    the file that exists in NO git ref. That is R3's own fix, applied to the path it
+    happened to be looking at and not to its sibling.
+
+    So this asserts the CLASS: parametrised over every way integrate can reject. Adding
+    a new rejection reason without routing it through the compensation fails here.
+    """
+    r, base = repo
+    run_index(conn, r)
+
+    def _hash_of(pid):
+        row = conn.execute("SELECT content_hash FROM parcels WHERE id = ?", (pid,)).fetchone()
+        return row["content_hash"] if row else None
+
+    truth = _hash_of("mod_a.py::helper")
+    assert truth is not None
+
+    if rejection == "merge_conflict":
+        # Land one edit, then fork a conflicting one from the original base.
+        wt_a = git_ops.add_worktree(r, "agent-a", base)
+        (wt_a / "mod_a.py").write_text("def helper(x):\n    return x + 111\n", encoding="utf-8")
+        git_ops.commit_all(wt_a, "agent-a: change helper")
+        assert integrator.integrate(
+            conn, r, "agent-a", base_commit=base, agent_id="agent-a"
+        ).status == "merged"
+        truth = _hash_of("mod_a.py::helper")  # trunk moved; this is the new truth
+
+        wt = git_ops.add_worktree(r, "agent-b", base)
+        (wt / "mod_a.py").write_text("def helper(x):\n    return x + 222\n", encoding="utf-8")
+        git_ops.commit_all(wt, "agent-b: conflicting change")
+        branch = "agent-b"
+    elif rejection == "gate_red":
+        wt = git_ops.add_worktree(r, "agent-c", base)
+        (wt / "mod_c.py").write_text(
+            "def broken():\n    raise RuntimeError('boom')\n", encoding="utf-8"
+        )
+        git_ops.commit_all(wt, "agent-c: break the test")
+        branch = "agent-c"
+    else:
+        wt = git_ops.add_worktree(r, "agent-d", base)
+        (wt / "mod_a.py").write_text("def helper(x):\n    return x + 999\n", encoding="utf-8")
+        git_ops.commit_all(wt, "agent-d: fine edit that blows up post-merge")
+        monkeypatch.setattr(
+            integrator, "regenerate_summary", lambda *a, **k: (_ for _ in ()).throw(
+                RuntimeError("simulated post-reindex failure")
+            )
+        )
+        branch = "agent-d"
+
+    # The agent's premature self-report: runner.py posts /parcel/update BEFORE
+    # integrate, so a hash for code that may never land is already in the blackboard.
+    conn.execute(
+        "UPDATE parcels SET content_hash = 'agent-self-reported-never-landed' WHERE id = ?",
+        ("mod_a.py::helper",),
+    )
+
+    result = integrator.integrate(conn, r, branch, base_commit=base, agent_id=branch)
+    assert result.status == "merge_rejected", f"expected a rejection for {rejection}"
+
+    assert _hash_of("mod_a.py::helper") == truth, (
+        f"after a {rejection} rejection the blackboard still holds a hash for code that "
+        f"is not on trunk: agents now plan against a state that never landed"
+    )
