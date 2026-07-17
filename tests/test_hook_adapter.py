@@ -764,3 +764,61 @@ def test_unreachable_blackboard_still_fails_open(monkeypatch, repo):
     assert code == 0
     assert out == ""
     assert "failing open" in err
+
+
+# --- R5: an in-repo symlink alias is ONE file, so it takes ONE lease ---------------
+
+
+def test_in_repo_symlink_alias_shares_one_lease_with_its_target(
+    monkeypatch, tmp_path, tmp_path_factory
+):
+    """Editing `link.py` and editing `real.py` must contend for the SAME lease.
+
+    R4 found the hook keyed leases on the unresolved leaf name, so two paths aliasing
+    ONE inode produced two different parcel ids and therefore two independent write
+    leases on one physical file -- in the ONE working tree hook subagents share, where
+    the lease is the only protection. Last writer wins, silently: the exact collision
+    this system exists to prevent.
+    """
+    repo_dir = tmp_path_factory.mktemp("repo_alias")
+    (repo_dir / "real.py").write_text("def helper(x):\n    return x\n", encoding="utf-8")
+    (repo_dir / "link.py").symlink_to(repo_dir / "real.py")
+
+    app = create_app(tmp_path / "bb.db")
+    with TestClient(app) as c:
+        assert c.post("/index", json={"root": str(repo_dir)}).status_code == 200
+        parcel_ids = {p["id"] for p in c.get("/parcels").json()}
+
+        # The alias is not a second file: only the canonical name is a parcel.
+        assert f"real.py::{MODULE_SYMBOL}" in parcel_ids
+        assert not any(pid.startswith("link.py") for pid in parcel_ids), (
+            f"the alias got its own parcels -- one inode, two leases: {sorted(parcel_ids)}"
+        )
+
+        monkeypatch.setenv("SWARMSYNC_ACTIVE", "1")
+        factory = _http_factory(c)
+
+        # A edits via the real name...
+        code_a, out_a, _ = _run(
+            "precheck",
+            _payload("Edit", file_path=str(repo_dir / "real.py"), cwd=str(repo_dir), agent_id="A"),
+            http_factory=factory,
+        )
+        assert (code_a, out_a) == (0, "")
+
+        # ...B edits via the alias and must be DENIED: it is the same file.
+        code_b, out_b, _ = _run(
+            "precheck",
+            _payload("Edit", file_path=str(repo_dir / "link.py"), cwd=str(repo_dir), agent_id="B"),
+            http_factory=factory,
+        )
+        assert code_b == 0
+        assert out_b != "", (
+            "B was ALLOWED to edit the same inode A holds, via a symlink alias -- "
+            "last writer wins and A's edit is silently destroyed"
+        )
+        assert json.loads(out_b)["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+        held = c.get("/leases").json()
+        assert len(held) == 1, f"one inode took {len(held)} leases: {held}"
+        assert held[0]["parcel_id"] == f"real.py::{MODULE_SYMBOL}"

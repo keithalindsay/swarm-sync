@@ -179,24 +179,36 @@ def _relpath(file_path: Optional[str], repo_root: Path) -> Optional[str]:
     `None` if `file_path` is missing or resolves outside `repo_root`
     (nothing to lease -- treated as ALLOW/no-op by every caller).
 
-    Symlink policy (S5): resolve the PARENT directory (canonicalizes `..` and
-    symlinked parent dirs, so a genuine escape out of the repo still returns
-    None) but KEEP the leaf name -- do NOT follow a leaf symlink to its target.
-    `classifier.indexer.index_repo` walks the tree and records each `.py` file's
-    ON-DISK location relative to the repo root (an indexed symlinked `.py` gets a
-    parcel id under its own name, not its target's), so the hook must map the
-    same way or the parcel-id lookup misses and the edit silently bypasses the
-    lease. The old `abs_p.resolve()` followed the leaf symlink, which either
-    escaped the repo (ValueError -> None -> no lease at all) or mapped to a
-    different path than the indexer used (lease check on the wrong parcel).
+    Symlink policy -- it depends on where the link POINTS, and both halves matter:
+
+    * Leaf symlink to a file INSIDE this repo (an alias): map to the CANONICAL target,
+      so editing `link.py` and editing `real.py` take the SAME lease. Two paths naming
+      one inode are one file, and one file is one writer. Keying on the unresolved leaf
+      gave them two different parcel ids, hence two independent write leases on one
+      physical file in the ONE working tree hook subagents share -- a silently lost
+      edit. `indexer.index_repo` skips in-repo aliases for the same reason, so the two
+      agree that the canonical file is the parcel.
+    * Leaf symlink to a file OUTSIDE the repo (S5): KEEP the leaf name. The indexer
+      records it under its own in-repo name -- that is the only name this repo has for
+      it -- so the hook must too. Resolving it here would land outside the repo, return
+      None, and let the edit through with no lease at all: the exact pre-S5 bug.
+
+    The parent directory is always resolved (canonicalizing `..` and symlinked parent
+    dirs), so a genuine escape out of the repo still returns None.
     """
     if not file_path:
         return None
     p = Path(file_path)
     abs_p = p if p.is_absolute() else (repo_root / p)
+    root = repo_root.resolve()
     try:
         resolved = abs_p.parent.resolve() / abs_p.name
-        rel = resolved.relative_to(repo_root.resolve())
+        # An in-repo alias collapses onto its target; anything else keeps its own name.
+        if resolved.is_symlink():
+            target = resolved.resolve()
+            if target.is_relative_to(root):
+                resolved = target
+        rel = resolved.relative_to(root)
     except (ValueError, OSError):
         return None
     return rel.as_posix()
