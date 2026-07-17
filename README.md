@@ -237,10 +237,9 @@ network you don't control.
 
 ## Status
 
-Prototype / overnight build, since hardened. Scope is intentionally tight: Python target,
+Prototype build. Scope is intentionally tight: Python target,
 deterministic scripted agents (a real Claude Agent SDK worker is a drop-in), serial integrator, no
-TUI. See `DESIGN.md` §8 for what's deliberately out of scope, and `SYMBOL_MODE_DESIGN.md` for the
-parked per-function-locking ambition.
+TUI.
 
 ## License
 
