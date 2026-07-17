@@ -9,244 +9,238 @@
 > **blackboard** — a live SQLite representation of the current state of the code. Coordination is
 > *stigmergic*: agents read and write the environment, never each other.
 
-This is the **Pheromesh** architecture. See [`DESIGN.md`](DESIGN.md) for the full spec and
-[`BUILD_PLAN.md`](BUILD_PLAN.md) for the ordered build units.
+This is the **Pheromesh** architecture. For the full spec see [`DESIGN.md`](DESIGN.md); this README
+is the usage guide.
+
+---
+
+## Two ways to use it
+
+Pick the one that matches how your agents run — the setup is different:
+
+1. **Claude Code hooks (recommended for real use).** You run Claude Code agents/subagents normally;
+   swarm-sync's hooks gate every edit *transparently* in the background. No wiring agents by hand.
+   → [Jump to the Claude Code setup](#use-with-claude-code).
+2. **The scripted broker/demo.** A Python harness (`coordinator/broker.py`) drives agents directly
+   against the blackboard. This is what the demo and test suite use, and how you'd embed swarm-sync
+   in your own orchestrator. → Start with **Try it in 2 minutes** below.
+
+Either way, **the unit of the lock is a whole file**: two agents never edit the same file at once —
+the second waits. Parallelism comes from working on *different* files. (More in
+[Granularity](#granularity-swarm-sync-locks-whole-files).)
+
+---
+
+## Try it in 2 minutes
+
+**Requires Python 3.11+.** Check first — on 3.10 or older, `pip install` backtracks for a long time
+instead of telling you the version is the problem:
+
+```bash
+python3 --version            # must be 3.11 or newer
+```
+
+```bash
+git clone https://github.com/Aigeninc/swarm-sync.git
+cd swarm-sync
+
+python3 -m venv .venv && source .venv/bin/activate
+# (use python3 to create the venv — most distros ship no bare `python`;
+#  inside the venv, `python` then exists and is your 3.11+.)
+pip install -e ".[dev]"
+
+python demo/run_demo.py      # the whole thing, standalone
+```
+
+The demo boots a blackboard, indexes a sample repo, and runs a 3-agent swarm through five scenarios.
+You should see:
+
+```
+RESULTS
+  PASS: money-shot #1 (three agents on three files land concurrently, clean)
+  PASS: money-shot #2 (contended whole-file parcel serializes)
+  PASS: money-shot #3 (frozen-contract change notifies + dependent re-plans)
+  PASS: money-shot #4 (crash mid-edit is recovered)
+  PASS: money-shot #5 (serial gated integration rejects a bad edit)
+  PASS: overall (zero collisions, trunk green throughout)
+```
+
+That's the product in one command: three agents editing three different files land cleanly and
+concurrently; a fourth hitting a file someone already holds waits its turn; a signature change is
+detected and its dependents re-plan; a crashed agent's work is reclaimed; and a test-breaking edit
+is rejected before it can reach trunk.
+
+Run the test suite the same way:
+
+```bash
+pytest
+```
+
+---
 
 ## How it works (one paragraph)
 
-A **classifier** parses the repo (Python via stdlib `ast`) into *parcels* — indexed at
-function/method granularity with file-level fallback — computes each parcel's **blast radius**, and
-freezes high-fan-in **interface contracts**. **Leases are taken at whole-file granularity** (the
-parcel map is finer than the lock; see [Granularity](#granularity-swarm-sync-locks-whole-files)). A
-**blackboard** (SQLite in WAL mode) holds the parcel map,
-leases, contracts, decaying **pheromone** trails, and an append-only event log; each parcel carries a
-live `state_summary` of what it now does. Agents declare intent, acquire an **atomic CAS write-lease**,
-edit inside their **own git worktree**, heartbeat, then submit their branch to a **serial, test-gated
-integrator** that merges (conflict-free by construction, since only disjoint work runs concurrently),
-runs pytest, and re-indexes. Crashes are reclaimed by a **TTL reaper**; trunk is never poisoned because
-merges are gated.
+A **classifier** parses the repo (Python via the stdlib `ast` module) into *parcels* — one per
+function, method, and class, plus a synthetic per-file parcel for the glue — computes each parcel's
+**blast radius** (how much breaks if it changes), and freezes high-fan-in **interface contracts**.
+A **blackboard** (SQLite in WAL mode) holds the parcel map, leases, contracts, decaying **pheromone**
+trails, and an append-only event log. Each agent declares intent, acquires an **atomic write-lease**
+on a file, edits inside its **own git worktree**, heartbeats, then submits its branch to a **serial,
+test-gated integrator** that merges, runs `pytest`, and re-indexes — rolling the merge back if the
+tests go red, so trunk is never poisoned. A **TTL reaper** reclaims the leases of agents that crash.
 
-## Collision handling at a glance
+---
 
-| Layer | Mechanism | Guarantees |
-|---|---|---|
-| Physical | git worktree per agent | same-file clobbering is structurally impossible — **broker-driven agents only**; hook-driven Claude subagents share one working tree, where the lease is the only protection |
-| Logical | atomic SQLite CAS lease, **one whole file per lock** | one writer per file, on both the broker and hook paths; mispredictions serialize. Two agents never edit one file concurrently — the second is denied and waits. Covers `Edit`/`Write`-family tools — a `Bash` write (`sed -i`, `cat >`) bypasses it |
-| Interface | frozen contracts + `contract_change` events | a landed signature change is **detected and announced** to dependents, *after* it merges (DESIGN §5.3) — dependents with in-flight work are notified and re-plan; they are not prevented from building against a stale signature in the first place. Detection is all that ships: the *preventive* half (upgrading a frozen symbol's lease to `exclusive`) never fires at file granularity, since frozen ids are symbol ids and every lease is a file id (DESIGN §5.3) |
-| Integration | serial pytest-gated merge | trunk stays green: a branch is merged, tested, and **rolled back if red**, so a break is caught before it *survives* on trunk — not before it lands. Semantic conflicts that no test covers are the honest hard limit (DESIGN §6) |
+## Use with Claude Code
 
-## Quickstart (once built)
+Instead of wiring agents in by hand, let Claude Code's own hooks enforce leasing **transparently**:
+every `Edit`/`Write` a (sub)agent makes is gated by a real-time lease check, and its lease is
+released automatically when the agent stops. When two agents reach for the same file, the second is
+denied with a message like:
 
-**Requires Python 3.11+.** Check first — on 3.10 or older, `pip install` fails after a long
-dependency-resolver backtrack rather than telling you the version is the problem:
-
-```bash
-python3 --version     # must be 3.11 or newer
+```
+swarm-sync: payments.py is leased by agent-a; pick different work or retry shortly.
 ```
 
-```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
+### Setup
 
-# Inside the venv, `python` now exists and is the venv's 3.11+.
-# (Use python3 before activating: most distros ship no bare `python`.)
-
-# Run the full 5-money-shot demo (boots server, indexes sample_repo, runs 3 agents)
-python demo/run_demo.py
-
-# Or run the server standalone
-swarm-sync            # uvicorn on :8000
-pytest                # test suite
-```
-
-## Use with Claude Code (hook-enforced coordination)
-
-The other way to run swarm-sync (besides the scripted demo/broker) is to let Claude Code's own
-hooks enforce leasing **transparently**, so you don't wire agents in by hand: every `Edit`/`Write`
-a (sub)agent makes is gated by a real-time lease check, and its lease is released automatically
-when the agent stops.
-
-### 1. Wire the hooks in `settings.json`
-
-Add this to `~/.claude/settings.json` (global) or `<project>/.claude/settings.json`
-(project-scoped), pointing the `command` paths at your actual swarm-sync checkout:
+**1 — Wire the hooks.** Add this to `~/.claude/settings.json` (global) or
+`<project>/.claude/settings.json` (project-scoped), pointing the `command` paths at your actual
+swarm-sync checkout:
 
 ```json
 {
   "hooks": {
     "PreToolUse": [
-      {
-        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
-        "hooks": [
-          { "type": "command", "command": "/path/to/swarm-sync/scripts/swarmsync-hook-guard precheck", "timeout": 10 }
-        ]
-      }
+      { "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [ { "type": "command", "command": "/path/to/swarm-sync/scripts/swarmsync-hook-guard precheck", "timeout": 10 } ] }
     ],
     "PostToolUse": [
-      {
-        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
-        "hooks": [
-          { "type": "command", "command": "/path/to/swarm-sync/scripts/swarmsync-hook-guard postupdate", "timeout": 10 }
-        ]
-      }
+      { "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [ { "type": "command", "command": "/path/to/swarm-sync/scripts/swarmsync-hook-guard postupdate", "timeout": 10 } ] }
     ],
     "SubagentStop": [
-      {
-        "hooks": [
-          { "type": "command", "command": "/path/to/swarm-sync/scripts/swarmsync-hook-guard release", "timeout": 10 }
-        ]
-      }
+      { "hooks": [ { "type": "command", "command": "/path/to/swarm-sync/scripts/swarmsync-hook-guard release", "timeout": 10 } ] }
     ],
     "SessionStart": [
-      {
-        "hooks": [
-          { "type": "command", "command": "/path/to/swarm-sync/scripts/swarmsync-hook-guard session-start", "timeout": 15 }
-        ]
-      }
+      { "hooks": [ { "type": "command", "command": "/path/to/swarm-sync/scripts/swarmsync-hook-guard session-start", "timeout": 15 } ] }
     ]
   }
 }
 ```
 
-Wire `scripts/swarmsync-hook-guard`, **not** `swarmsync-hook` directly. The guard is the
-zero-overhead opt-in shim in front of the real adapter: when swarm-sync isn't activated (see
-below) it exits `0` immediately without ever starting Python, so normal, non-coordinated editing
-pays no cost. It only `exec`s the real `swarmsync-hook <subcommand>` adapter when a session is
-active.
+Wire `scripts/swarmsync-hook-guard`, **not** `swarmsync-hook` directly. The guard is a zero-overhead
+shim: when swarm-sync isn't active for a repo (step 3) it exits `0` immediately without even starting
+Python, so normal, non-coordinated editing pays nothing. It only launches the real adapter when a
+session is active.
 
-### 2. Start the blackboard server
+**2 — Start the blackboard server**, pointed at the repo you're coordinating:
 
 ```bash
-# SWARMSYNC_ROOTS must contain the repo you're coordinating (see below).
-SWARMSYNC_ROOTS=/path/to/your/repo swarmsync-serve --db /tmp/swarmsync.db --port 8787
+swarmsync-serve --root /path/to/your/repo --db /tmp/swarmsync.db --port 8787
 ```
 
-Leave it running for the duration of the coordinated session — it's the shared blackboard every
-hook call and agent talks to.
+Leave it running for the session — it's the shared blackboard every hook call and agent talks to. It
+prints the repo it's managing at startup; **check that line matches the repo you mean to coordinate**
+(this is the single most common misconfiguration — see [Troubleshooting](#troubleshooting)).
 
-#### `SWARMSYNC_ROOTS` — get this wrong and you get *silent* zero enforcement
+**3 — Turn coordination on for the repo.** Enforcement is opt-in per repo:
 
-`POST /index` and `POST /integrate` take a filesystem path from the caller, so they are
-restricted to a **managed root**: a path must `realpath` to somewhere under `SWARMSYNC_ROOTS`
-or it is rejected with `403`. **`SWARMSYNC_ROOTS` defaults to the server's launch cwd** — so if
-you start the server from anywhere that isn't an ancestor of the repo (another terminal, a
-systemd unit, `~`, or `/tmp` as in the `--db` example above), indexing that repo `403`s.
+```bash
+touch /path/to/your/repo/.swarmsync-active     # on
+rm    /path/to/your/repo/.swarmsync-active     # off
+```
 
-**One server coordinates one repo.** `SWARMSYNC_ROOTS` bounds which paths that single repo may
-touch; it is not a multi-repo mode. Parcel ids are `<relpath>::<symbol>` *relative to the root*
-with no repo qualifier, so two roots that both contain `utils.py` would collide on the same
-`utils.py::helper` id — overwriting each other's rows and conflating their leases. The server
-therefore **refuses to start** if more than one root is configured, and `--root` is not
-repeatable. For a second repo, run a second server on another port with its own `--db`.
+(Or set `SWARMSYNC_ACTIVE=1` in the environment — handy for CI. When neither is set, the hooks are a
+no-op and every edit is allowed, so installing the hooks never interferes with ordinary work.)
 
-That failure is quiet and total, in the same way as the port footgun below: no parcels get
-indexed → every lease request has no parcel to lease → the fail-open hook allows every edit →
-**no leasing whatsoever**, with nothing in the transcript to flag it. Always set
-`SWARMSYNC_ROOTS` explicitly to the repo you intend to coordinate, and check the server's
-startup line naming its managed root.
+**4 — Run your agents.** That's it. Edits to free files proceed silently; edits to a file another
+agent holds are denied with the message above until it's released.
 
-### 3. Turn coordination on/off per repo
+### Troubleshooting
 
-Enforcement is **opt-in** and **fail-open**, controlled by:
+Two failure modes are quiet by design (the hooks *fail open* so they never block ordinary work), so
+they're worth knowing before they bite:
 
-- **`.swarmsync-active`** — a marker file at the repo root. Its mere presence activates the
-  hooks for that repo; `touch .swarmsync-active` to turn on, `rm .swarmsync-active` to turn off.
-- **`SWARMSYNC_ACTIVE=1`** — an env-var alternative to the marker file (wins outright if set,
-  e.g. for CI/demo runs that should always be active regardless of what's on disk).
-- **`SWARMSYNC_URL`** — the blackboard base URL the hook adapter talks to (default
-  `http://127.0.0.1:8787`, i.e. it assumes you started the server with `swarmsync-serve` per
-  step 2 — see the port-mismatch warning below if you didn't).
+- **The server's managed root must contain your repo.** `swarmsync-serve` restricts `/index` and
+  `/integrate` to paths under its root (`--root`, or `SWARMSYNC_ROOTS`, defaulting to the launch
+  directory). If it's pointed anywhere that isn't an ancestor of your repo, indexing is refused,
+  nothing gets a parcel, and — because the hooks fail open — **every edit is allowed with no
+  coordination at all**, silently. The fix is always: pass `--root` explicitly and confirm the
+  startup line. One server coordinates **one** repo; for a second repo, run a second server on
+  another port.
+- **The hook talks to port 8787 by default.** The adapter's default `SWARMSYNC_URL` is
+  `http://127.0.0.1:8787`, which assumes you started the server with `swarmsync-serve`. There's a
+  second launcher, `swarm-sync`, that defaults to port **8000** — if you use that one for a
+  hook-enforced session without also setting `SWARMSYNC_URL`, the hook can't reach the server and
+  (failing open) allows every edit. For hook sessions, use `swarmsync-serve --port 8787`, or export
+  `SWARMSYNC_URL` to match whatever you started.
 
-When neither `.swarmsync-active` nor `SWARMSYNC_ACTIVE` is set, or the blackboard is unreachable,
-the guard/adapter is a no-op and every edit is allowed — swarm-sync never blocks normal,
-uncoordinated work.
-
-### Two launchers, two different default ports — don't mix them up
-
-swarm-sync ships **two** ways to boot the same FastAPI blackboard, with **different default
-ports**:
-
-| Launcher | Entry point | Default port |
+| Launcher | Default port | Use for |
 |---|---|---|
-| `swarm-sync` | `swarmsync.server.app:main` | **8000** |
-| `swarmsync-serve` | `swarmsync.server.serve:main` | **8787** |
+| `swarmsync-serve` | **8787** | Claude Code hook sessions (matches the hook's default URL) |
+| `swarm-sync` | **8000** | direct/uvicorn use; set `SWARMSYNC_URL` if you use it with hooks |
 
-The Claude Code hook adapter's own default `SWARMSYNC_URL` is `http://127.0.0.1:8787` — it
-assumes the server was started with **`swarmsync-serve`**, not plain `swarm-sync`. This is a real
-footgun: if you boot the server with `swarm-sync` (port 8000, its own default) for a hook-enforced
-session and don't also set `SWARMSYNC_URL`, the adapter will try (and fail) to reach `:8787`, and
-because it's **fail-open by construction**, that failure is silent — every edit is simply allowed
-through with **no leasing whatsoever**, no error, no denial, nothing in the transcript to flag it.
-Always either run `swarmsync-serve --port 8787` for hook-enforced sessions, or explicitly export
-`SWARMSYNC_URL` to match whichever launcher/port you actually used.
+---
+
+## What swarm-sync guarantees
+
+| Layer | Mechanism | What it gives you |
+|---|---|---|
+| Physical | git worktree per agent | same-file clobbering is structurally impossible — for **broker-driven** agents. (Hook-driven Claude subagents share one working tree, so there the lease below is the only protection.) |
+| Logical | atomic SQLite CAS lease, **one whole file per lock** | one writer per file, on both the broker and hook paths; the loser of a race is denied and waits. Covers `Edit`/`Write`-family tools — a raw `Bash` write (`sed -i`, `cat >`) bypasses it (see [Security](#security-and-trust-model-read-before-exposing-this-to-anything)). |
+| Interface | frozen contracts + `contract_change` events | a landed signature change is **detected and announced** to its dependents so they re-plan. Detection is what ships; it does not *prevent* an in-flight dependent from having built against the old signature (DESIGN §5.3). |
+| Integration | serial pytest-gated merge | trunk stays green: every branch is merged, tested, and **rolled back if red**. A break is caught before it *survives* on trunk. Semantic conflicts no test covers are the honest hard limit (DESIGN §6). |
 
 ### Granularity: swarm-sync locks whole files
 
-**The unit of parallelism is the file.** Every lease the broker (`coordinator/broker.py`) and the
-Claude Code hook adapter (`hooks/adapter.py`) take is on the one synthetic per-file parcel
-(`<relpath>::<module>`), regardless of how finely the classifier parsed the file. So **two agents
-never edit the same file at the same time**: the second is denied the lease and must wait or pick
-different work. Parallelism comes from working on *different files*. (`POST /lease` itself will lock
-whatever parcel id you hand it — the file-granularity rule lives in the two clients above, and in
-the `Bash`-shaped hole noted below.)
+**The unit of parallelism is the file.** Every lease the broker and the Claude Code hook take is on
+the one synthetic per-file parcel (`<relpath>::<module>`), regardless of how finely the classifier
+parsed the file. So two agents never edit the same file at the same time — the second is denied and
+must wait or pick different work. Parallelism comes from working on *different files*.
 
-The classifier still indexes parcels at function/class granularity, and that is not decoration —
+The classifier still indexes parcels at function/class granularity, and that isn't decoration —
 blast radius and the frozen-contract surface are built on those symbol parcels. What is *not*
-available is symbol granularity as a **lease/scheduling** mode: requesting it raises
-(`classifier/graph.py::check_file_granularity`), rather than appearing to work.
+available is symbol granularity as a **lease/scheduling** mode: requesting it raises an error rather
+than appearing to work. That's a deliberate park, with the reasoning and a revival plan in
+[`SYMBOL_MODE_DESIGN.md`](SYMBOL_MODE_DESIGN.md) — the short version is that per-function locking is
+unsafe with today's lease store, only ever workable on the broker path (never the hook path), and
+buys narrower concurrency than it sounds since any edit touching an import escalates to the whole
+file anyway. File-level locking is safe *by construction*.
 
-That is a deliberate park, not an omission — the reasoning and the revival plan are in
-[`SYMBOL_MODE_DESIGN.md`](SYMBOL_MODE_DESIGN.md). The short version: symbol mode is **unsafe today**
-(the lease store's conflict rule is a plain string match on `parcel_id` with no notion of
-containment, so a whole-file lease and a symbol lease *inside that same file* are different strings
-and are both granted — reproduced); it could only ever work on the **broker** path, never the hook
-path this README leads with (no worktree isolation, no integrator, so no point at which a
-non-conforming edit can be refused); and the concurrency it buys is narrower than it sounds, since
-any edit that touches an import escalates to the whole file anyway. File mode is safe *by
-construction*: every id it leases is `<file>::<module>`, so ids are always same-shaped and string
-equality is a sound conflict rule.
+---
 
-## The demo proves
-
-1. Three agents edit **different files** concurrently → all land clean, zero conflicts.
-2. A second agent hitting a leased file is **serialized** (denied → waits → lands).
-3. A **frozen-contract change** is detected on merge and notifies a dependent, which re-plans.
-4. An agent **killed mid-edit** is reaped; its task is reassigned; trunk untouched.
-5. A test-breaking edit is **rejected** at the gate and never lands.
-
-Success criterion: **zero textual collisions reach the integration branch**, every landed
-commit leaves the sample repo's tests green, all five assertions print PASS.
-
-## Security & trust model — read before exposing this to anything
+## Security and trust model (read before exposing this to anything)
 
 swarm-sync is a **local developer tool for a semi-trusted swarm**: your own agents, on your own
-machine, editing your own repo. It is not hardened for untrusted input, and it must not be
-exposed to a network you don't control.
+machine, editing your own repo. It is not hardened for untrusted input, and must not be exposed to a
+network you don't control.
 
-- **The blackboard executes code from the branches it integrates.** The `/integrate` gate's whole
-  job is to run the repo's pytest suite against a just-merged, agent-authored branch. Any
-  `conftest.py` or `test_*.py` on that branch runs as your user, with your environment. This is
-  the point of the design (nothing else can prove trunk stays green), not an oversight — but it
-  means *submitting a branch is equivalent to running code on the server*. The gate is bounded by
-  `SWARMSYNC_GATE_TIMEOUT` (default 600s), not sandboxed.
-- **Mutating routes are unauthenticated by default.** Set **`SWARMSYNC_TOKEN`** to require a
-  bearer token on `/index`, `/intent`, `/lease`, `/heartbeat`, `/release`, `/parcel/update` and
-  `/integrate`. With it unset, anyone who can reach the port can merge a branch and run its tests.
-  Read routes (`/parcels`, `/leases`, `/events`, `/contract/{symbol}`) are unauthenticated
-  regardless and expose your code's structure — symbol names, signatures, file paths.
+- **The blackboard runs code from the branches it integrates.** The `/integrate` gate's whole job is
+  to run the repo's `pytest` suite against a just-merged, agent-authored branch — so any `conftest.py`
+  or `test_*.py` on that branch runs as your user, with your environment. This is the point of the
+  design (nothing else can prove trunk stays green), but it means *submitting a branch is equivalent
+  to running code on the server*. The gate is time-bounded (`SWARMSYNC_GATE_TIMEOUT`, default 600s),
+  not sandboxed.
+- **Mutating routes are unauthenticated by default.** Set **`SWARMSYNC_TOKEN`** to require a bearer
+  token on `/index`, `/intent`, `/lease`, `/heartbeat`, `/release`, `/parcel/update`, and
+  `/integrate`. Unset, anyone who can reach the port can merge a branch and run its tests. Read routes
+  (`/parcels`, `/leases`, `/events`, `/contract/{symbol}`) are unauthenticated regardless and expose
+  your code's structure — symbol names, signatures, file paths.
 - **Bind to localhost.** The default host is `127.0.0.1`; keep it there.
-- **`SWARMSYNC_ROOTS`** bounds which filesystem paths `/index` and `/integrate` will touch. It is
-  a blast-radius limit on *your own* callers, not a defence against a hostile one.
-- **Bash-mediated edits are not gated.** The hook adapter's `PreToolUse` matcher covers
-  `Edit|Write|MultiEdit|NotebookEdit`. An agent that writes through `Bash` (`sed -i`, `cat >`,
-  `patch`, `git checkout`) bypasses the lease check entirely — the coordination is a cooperative
-  protocol among well-behaved agents, not a sandbox that constrains a determined one.
+- **Bash-mediated edits are not gated.** The hook matcher covers `Edit|Write|MultiEdit|NotebookEdit`;
+  an agent that writes through `Bash` (`sed -i`, `cat >`, `patch`, `git checkout`) bypasses the lease
+  check. Coordination is a cooperative protocol among well-behaved agents, not a sandbox that
+  constrains a determined one.
+
+---
 
 ## Status
 
-Prototype / overnight build. Scope intentionally tight: Python target, deterministic scripted agents
-(real Claude Agent SDK worker is a drop-in), serial integrator, no TUI. See `DESIGN.md` §8 for what's
-deliberately out of scope.
+Prototype / overnight build, since hardened. Scope is intentionally tight: Python target,
+deterministic scripted agents (a real Claude Agent SDK worker is a drop-in), serial integrator, no
+TUI. See `DESIGN.md` §8 for what's deliberately out of scope, and `SYMBOL_MODE_DESIGN.md` for the
+parked per-function-locking ambition.
 
 ## License
 
