@@ -259,6 +259,25 @@ def index_repo(
         rel_path_obj = py_file.relative_to(root_path)
         if _is_skipped(rel_path_obj.parts[:-1]):
             continue
+        # Skip a symlink that ALIASES another file in this same repo. Two paths that
+        # name one inode are one file, and one file must be one parcel: indexing both
+        # produced `real.py::helper` AND `link.py::helper` for a single inode, hence two
+        # independent write leases on one physical file. On the hook path -- where
+        # subagents share one working tree and the lease is the ONLY protection -- that
+        # is a silently lost edit, exactly the collision this system exists to prevent.
+        # The target is already indexed under its real name, so nothing is lost.
+        #
+        # A symlink pointing OUT of the repo is deliberately still indexed, under its own
+        # in-repo name (S5): it is the only name this repo has for that file, and it must
+        # stay leasable or an edit through it bypasses coordination entirely.
+        # `hooks/adapter._relpath` maps the same way, so the two agree on identity.
+        try:
+            if py_file.is_symlink():
+                target = py_file.resolve()
+                if target.is_relative_to(root_path.resolve()):
+                    continue
+        except (OSError, ValueError):  # pragma: no cover - broken link / unreadable
+            pass
         considered += 1
         if considered > max_files:
             raise IndexLimitError(
