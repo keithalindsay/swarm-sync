@@ -12,8 +12,10 @@ import pytest
 
 from swarmsync.classifier.graph import (
     FREEZE_THRESHOLD,
+    SymbolModeError,
     build_graph,
     blast_radius,
+    check_file_granularity,
     co_schedulable,
     extract_contracts,
 )
@@ -183,14 +185,37 @@ def test_co_schedulable_symbol_mode_disjoint_spans_in_same_file(graph_and_parcel
     _, parcels = graph_and_parcels
     a = _find(parcels, "mod_b.py::use_b")
     b = _find(parcels, "mod_b.py::unused_local")
-    # Different, non-overlapping concrete spans in the same file -> symbol mode allows it.
-    assert co_schedulable(a, b, mode="symbol") is True
+    # These two used to be co-schedulable under mode="symbol" (disjoint concrete spans in
+    # one file). Symbol granularity is now parked and refuses -- the exact pair the parked
+    # mode existed to allow is the sharpest input to prove the refusal on.
+    with pytest.raises(SymbolModeError, match="parked"):
+        co_schedulable(a, b, mode="symbol")
+    # ...and at file granularity (the only mode) they share a file, so they serialize.
+    assert co_schedulable(a, b, mode="file") is False
 
 
-def test_co_schedulable_symbol_mode_false_for_identical_span(graph_and_parcels):
+def test_co_schedulable_false_for_a_parcel_against_itself(graph_and_parcels):
+    """Orthogonal to granularity: a parcel is never co-schedulable with itself. Used to be
+    asserted via mode="symbol" (identical spans overlap); file mode gives it too (same path)."""
     _, parcels = graph_and_parcels
     a = _find(parcels, "mod_b.py::use_b")
-    assert co_schedulable(a, a, mode="symbol") is False
+    assert co_schedulable(a, a, mode="file") is False
+
+
+def test_check_file_granularity_accepts_file_and_refuses_symbol():
+    assert check_file_granularity("file") == "file"
+    with pytest.raises(SymbolModeError, match="parked"):
+        check_file_granularity("symbol")
+    # ...and an unrecognized mode is still a plain ValueError, not a symbol-mode refusal.
+    with pytest.raises(ValueError) as exc:
+        check_file_granularity("bogus")
+    assert not isinstance(exc.value, SymbolModeError)
+
+
+def test_symbol_mode_error_is_a_valueerror_so_existing_callers_still_catch_it():
+    """`resolve_task`/`co_schedulable` have always documented ValueError for a bad mode, and
+    callers catch that. The refusal must not escape a `except ValueError` handler."""
+    assert issubclass(SymbolModeError, ValueError)
 
 
 def test_co_schedulable_rejects_unknown_mode(graph_and_parcels):

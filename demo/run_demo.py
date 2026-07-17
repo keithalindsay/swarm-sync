@@ -4,6 +4,11 @@ Built in Unit U14 (money shots #1, #2, #4, #5); money-shot #3 (frozen-contract
 change + dependent re-plan, DESIGN §5.3) was added on top of this file by U15.
 All five money shots now print PASS/FAIL and the final summary says so.
 
+This demo drives the SHIPPING product: file-granularity locking. Every lease is
+a whole-file `<file>::<module>` lock (symbol granularity is parked -- see
+SYMBOL_MODE_DESIGN.md), so `broker.run` is always called at its `mode="file"`
+default and every claim printed below is true of file-granularity coordination.
+
 Flow:
   1. copy `sample_repo/` into a fresh temp dir and `git init` it as the shared
      "integration" trunk checkout (`worktree.git_ops.init_repo`).
@@ -18,45 +23,55 @@ Flow:
      per assertion, then a final summary block.
 
 Money shots exercised here (DESIGN §7):
-  #1 two agents edit different functions (`calc.py`'s `sub`/`mul`) in the SAME
-     file concurrently, symbol-mode leased -> two `merged` events, zero
-     conflicts, both edits present on trunk. Proven with a genuine wall-clock
-     overlap check (not just "both eventually ran"), mirroring the same
-     technique `tests/test_broker.py` already uses and validates.
-  #2 a third task (`calc.py`'s `div`) contends against an externally-held
-     write-lease (a stand-in for "another agent is already editing this
-     parcel") -> `lease_denied`, then -- after the holder releases (not
-     crashes; that's #4's story) -- `lease_granted` + `merged` for the same
-     parcel. Driven through the SAME `broker.run` call as #1, matching U12's
-     own handoff note for this unit.
+  #1 THREE agents edit three DIFFERENT files -- `calc.py`'s `sub`,
+     `formats.py`'s `money`, `api.py`'s `apply_discount` -- concurrently, each
+     under its own whole-file `<file>::<module>` lease (file granularity, the
+     shipping default) -> three `merged` events, zero conflicts, all three
+     edits present on trunk. Proven with a genuine wall-clock overlap check
+     (there is an instant at which all three edits are simultaneously in
+     flight, not just "all three eventually ran"), mirroring the same technique
+     `tests/test_broker.py` already uses and validates. Three files means three
+     distinct whole-file locks, so file granularity is enough for real
+     concurrency here -- no symbol-level locking needed.
+  #2 a task targeting `calc.py`'s `div` contends against another agent already
+     holding calc.py's WHOLE-FILE write-lease (`calc.py::<module>` -- at file
+     granularity the whole file is one lock; a stand-in for "another agent is
+     already editing this file") -> `lease_denied`, then -- after the holder
+     releases (not crashes; that's #4's story) -- `lease_granted` + `merged`
+     for the same whole-file parcel. Driven through `broker.run`'s own retry
+     loop.
   #4 a REAL subprocess (`demo/_crash_agent.py`) is SIGKILLed while holding a
-     write-lease and mid-`mutators.slow_edit` (real, uncommitted work already
-     on disk in its own worktree) -> the reaper (running in this process's own
-     live server) reclaims the lease past its TTL, emits `reaped`; a fresh
-     agent is dispatched for the same task and lands it; trunk never contains
-     the dead process's edit.
+     whole-file write-lease (`formats.py::<module>`) and mid-`mutators.slow_edit`
+     (real, uncommitted work already on disk in its own worktree) -> the reaper
+     (running in this process's own live server) reclaims the lease past its
+     TTL, emits `reaped`; a fresh agent is dispatched for the same task and
+     lands it; trunk never contains the dead process's edit.
   #5 `mutators.break_a_test` deliberately breaks `api.py::summarize`'s
-     behavior -> the integrator's impact-selected pytest gate on `test_api.py`
-     fails -> `merge_rejected`, the merge commit is reset out, trunk stays
-     green and unchanged.
+     behavior (under a whole-file `api.py::<module>` lease) -> the integrator's
+     impact-selected pytest gate on `test_api.py` fails -> `merge_rejected`,
+     the merge commit is reset out, trunk stays green and unchanged.
   #3 (U15) one task changes `calc.py::add`'s frozen signature (`def add(a, b)`
-     -> `def add(a, b, rounding=None)`, `mutators.change_signature`) under an
-     EXCLUSIVE lease -- auto-enforced by `coordinator.broker.run` (U15) since
-     `calc.py::add` is already a registered frozen contract (blast_radius >=
-     FREEZE_THRESHOLD across `formats.py`/`api.py`/their tests, per U13's own
-     fixture design). Once that lands, the integrator's own before/after
-     `type_hash` diff (U15, `coordinator/integrator.py`) emits a real
-     `contract_change` event. Two more tasks -- real dependents that already
-     call `calc.add` (`formats.py::total_with_tax`, `api.py::summarize`) --
-     declare `calc.py::add` as a `read_deps` contract, so their `run_agent`
-     call re-reads it (`AgentResult.contract_snapshot`) and sees the NEW
-     signature, then land a `mutators.fix_call_site` call-site fix
-     (`rounding=2`) via the SAME `broker.run` call -- `co_schedulable`'s
-     frozen-contract clause (DESIGN §3, built in U3/U12) already forces the
-     signature-change task into its own earlier wave, so the two dependents
-     only ever see the contract AFTER it changed. Tests stay green throughout
-     (the new parameter is optional, so nothing ever actually breaks -- the
-     demo proves the NOTIFY + RE-PLAN protocol, not a crash).
+     -> `def add(a, b, rounding=None)`, `mutators.change_signature`) under a
+     whole-file write-lease on `calc.py::<module>`. NOTE the frozen-contract
+     EXCLUSIVE-lease upgrade (DESIGN §5.3) is INERT at file granularity --
+     contracts are symbol ids (`calc.py::add`) while every lease is a file id
+     (`calc.py::<module>`), so no target is ever in `frozen_ids` -- and is
+     parked alongside symbol mode (SYMBOL_MODE_DESIGN.md). Contract DETECTION,
+     though, is granularity-INDEPENDENT and still ships: once the signature
+     change lands, the integrator's own before/after `type_hash` diff (U15,
+     `coordinator/integrator.py`) emits a real `contract_change` event
+     regardless of lease granularity. Because the auto-scheduling that once
+     forced the change ahead of its dependents (`co_schedulable`'s frozen
+     clause) is inert too, the demo instead dispatches the signature change
+     FIRST (its own `broker.run`), lets it LAND and announce `contract_change`,
+     THEN dispatches the two real dependents that call `calc.add`
+     (`formats.py::total_with_tax`, `api.py::summarize`) in a second
+     `broker.run`. Each declares `calc.py::add` as a `read_deps` contract, so
+     its `run_agent` call re-reads it (`AgentResult.contract_snapshot`) and
+     sees the NEW signature -- fetched from live state AFTER the change landed,
+     not a hardcoded guess -- then lands a `mutators.fix_call_site` call-site
+     fix (`rounding=2`). The new parameter is optional, so nothing ever breaks;
+     the demo proves the NOTIFY + RE-PLAN protocol, not a crash.
 
 OVERALL: zero same-file textual collisions (git merge conflicts) reached
 `integration` across the whole run, every landed commit left `sample_repo`'s
@@ -93,8 +108,8 @@ SAMPLE_REPO_SRC = REPO_ROOT / "sample_repo"
 CRASH_AGENT_SCRIPT = Path(__file__).resolve().with_name("_crash_agent.py")
 
 SHOT_LABELS = {
-    "shot1": "money-shot #1 (concurrent disjoint edits land clean)",
-    "shot2": "money-shot #2 (contended parcel serializes)",
+    "shot1": "money-shot #1 (three agents on three files land concurrently, clean)",
+    "shot2": "money-shot #2 (contended whole-file parcel serializes)",
     "shot3": "money-shot #3 (frozen-contract change notifies + dependent re-plans)",
     "shot4": "money-shot #4 (crash mid-edit is recovered)",
     "shot5": "money-shot #5 (serial gated integration rejects a bad edit)",
@@ -219,16 +234,34 @@ def _print_event_stream(client: BlackboardClient) -> None:
         print(f"  seq={ev['seq']:>4}  {ev['type']:<16} agent={agent:<28} {payload}")
 
 
-# --- money shots #1 + #2: driven through ONE broker.run() call ---------------------
+# --- money shot #1: three agents on three DIFFERENT files, concurrently -------------
 
 _timeline_lock = threading.Lock()
+
+# Whole-file lock ids (file granularity, the shipping default) for the parcels
+# this demo contends on directly.
+CALC_MODULE = "calc.py::<module>"
+
+# Money-shot #1's three concurrent tasks -- one per file, each a real,
+# behavior-preserving edit its own test suite still passes:
+#   calc.py::sub   -> body rewritten, still `a - b`   (test_sub: sub(5,3)==2)
+#   formats.py::money -> body rewritten, same output  (test_money: money(12.5)=="$12.50")
+#   api.py::apply_discount -> body rewritten, same    (test_apply_discount: ...==$180.00)
+SHOT1_EDITS = [
+    ("shot1-calc", "calc.py", "sub", "result = a - b\nreturn result", "calc.py::sub body"),
+    ("shot1-formats", "formats.py", "money",
+     'formatted = f"{currency}{amount:.2f}"\nreturn formatted', "formats.py::money body"),
+    ("shot1-api", "api.py", "apply_discount",
+     "discount = calc.mul(price, discount_pct / 100)\n"
+     "return formats.money(calc.sub(price, discount))", "api.py::apply_discount body"),
+]
 
 
 def _timed_edit(worktree, path, symbol, new_body, label, timeline, hold=0.0):
     """`edit_function_body`, with (label, "start"/"end", monotonic-clock) entries
-    recorded around it so the demo can PROVE two edits' wall-clock windows
-    genuinely overlapped, not just "both eventually landed" (same technique
-    `tests/test_broker.py` already uses)."""
+    recorded around it so the demo can PROVE the concurrent edits' wall-clock
+    windows genuinely overlapped, not just "all eventually landed" (same
+    technique `tests/test_broker.py` already uses)."""
     with _timeline_lock:
         timeline.append((label, "start", time.monotonic()))
     if hold:
@@ -238,15 +271,112 @@ def _timed_edit(worktree, path, symbol, new_body, label, timeline, hold=0.0):
         timeline.append((label, "end", time.monotonic()))
 
 
-def _run_shots_1_and_2(conn, repo: Path, client: BlackboardClient, reporter: _Reporter) -> None:
-    # Money-shot #2's "already write-leased" holder: a stand-in for a fourth
-    # agent already mid-edit on calc.py::div when our task tries for it. Long
-    # TTL (it must NOT merely time out -- that's shot #4's story) + an explicit
-    # release on a delay simulates "the holder finishes and releases".
-    holder = leases_mod.acquire(
-        conn, "calc.py::div", "manual-editor", mode="write", ttl=20.0, intent="manual-div-edit"
+def _run_shot1(conn, repo: Path, client: BlackboardClient, reporter: _Reporter) -> None:
+    """Three agents edit three DIFFERENT files at once. At file granularity each
+    file is one whole-file lock, so three files means three disjoint locks and
+    the three tasks land in a SINGLE co-schedulable wave -- genuinely
+    concurrent, zero contention, zero collisions."""
+    timeline: list[tuple[str, str, float]] = []
+
+    tasks = [
+        broker.Task(
+            task_id=task_id,
+            targets=[(path, symbol)],
+            mutator=_timed_edit,
+            mutator_kwargs={
+                "path": path,
+                "symbol": symbol,
+                "new_body": new_body,
+                "label": task_id,
+                "timeline": timeline,
+                # A shared hold so all three edit-windows line up in wall-clock
+                # time -- there must be an instant when all three are in flight.
+                "hold": 0.5,
+            },
+        )
+        for task_id, path, symbol, new_body, _desc in SHOT1_EDITS
+    ]
+
+    # No mode= -> file granularity (the shipping default). Three files, one wave.
+    results = broker.run(conn, repo, tasks, client, n_agents=3, retry_backoff=0.4)
+
+    events = client.events(since=0)
+
+    all_merged = all(
+        results[task_id].status == "done"
+        and (results[task_id].integrate_result or {}).get("status") == "merged"
+        for task_id, *_ in SHOT1_EDITS
     )
-    assert holder.granted, "test setup: holder lease on calc.py::div must be granted"
+    reporter.check(
+        "shot1", "all three agents (calc.py, formats.py, api.py) landed merged", all_merged
+    )
+
+    # Real concurrency: there is a single instant at which all three edit windows
+    # are simultaneously open -- i.e. the latest start precedes the earliest end.
+    by_label: dict[str, dict[str, float]] = {}
+    for label, kind, ts in timeline:
+        by_label.setdefault(label, {})[kind] = ts
+    have_all = all(
+        task_id in by_label and "start" in by_label[task_id] and "end" in by_label[task_id]
+        for task_id, *_ in SHOT1_EDITS
+    )
+    overlapped = have_all and (
+        max(by_label[t]["start"] for t, *_ in SHOT1_EDITS)
+        < min(by_label[t]["end"] for t, *_ in SHOT1_EDITS)
+    )
+    reporter.check(
+        "shot1",
+        "all three edits were simultaneously in flight (real wall-clock concurrency)",
+        overlapped,
+    )
+
+    calc_src = (repo / "calc.py").read_text()
+    formats_src = (repo / "formats.py").read_text()
+    api_src = (repo / "api.py").read_text()
+    all_present = (
+        "result = a - b" in calc_src
+        and "formatted = f" in formats_src
+        and "return formats.money(calc.sub(price, discount))" in api_src
+    )
+    reporter.check("shot1", "all three edits present on trunk (integration branch)", all_present)
+
+    # Three whole-file locks, all disjoint -> exactly one dispatch wave.
+    lease_parcels = {
+        pid
+        for task_id, *_ in SHOT1_EDITS
+        for pid in results[task_id].lease_modes_used
+    }
+    reporter.check(
+        "shot1",
+        "each agent held its own whole-file lock (three disjoint <module> parcels)",
+        lease_parcels == {"calc.py::<module>", "formats.py::<module>", "api.py::<module>"},
+    )
+
+    conflict_events = [e for e in events if e["type"] == "merge_rejected"]
+    reporter.check(
+        "shot1", "zero textual merge conflicts reached integration for this wave",
+        not any(json.loads(e["payload"] or "{}").get("reason") == "merge_conflict" for e in conflict_events),
+    )
+
+
+# --- money shot #2: a contended whole-file parcel serializes ------------------------
+
+
+def _run_shot2(conn, repo: Path, client: BlackboardClient, reporter: _Reporter) -> None:
+    """A task wanting calc.py's `div` contends against another agent already
+    holding calc.py's WHOLE-FILE write-lease. At file granularity every lease is
+    a `<file>::<module>` lock, so "the div task is blocked" is literally "the
+    whole calc.py file is locked by someone else". The task is denied, backs
+    off, and lands once the holder releases -- serialization, proven end to end.
+    """
+    # The "already editing calc.py" holder: a stand-in for another agent mid-edit
+    # somewhere in calc.py when our div task tries for it. Long TTL (it must NOT
+    # merely time out -- that's shot #4's story) + an explicit release on a delay
+    # simulates "the holder finishes and releases".
+    holder = leases_mod.acquire(
+        conn, CALC_MODULE, "manual-editor", mode="write", ttl=20.0, intent="manual-calc-edit"
+    )
+    assert holder.granted, f"test setup: holder lease on {CALC_MODULE} must be granted"
 
     def _release_holder_later(delay: float) -> None:
         time.sleep(delay)
@@ -255,34 +385,6 @@ def _run_shots_1_and_2(conn, repo: Path, client: BlackboardClient, reporter: _Re
     releaser = threading.Thread(target=_release_holder_later, args=(1.5,), daemon=True)
     releaser.start()
 
-    timeline: list[tuple[str, str, float]] = []
-
-    task_sub = broker.Task(
-        task_id="shot1-sub",
-        targets=[("calc.py", "sub")],
-        mutator=_timed_edit,
-        mutator_kwargs={
-            "path": "calc.py",
-            "symbol": "sub",
-            "new_body": "result = a - b\nreturn result",
-            "label": "sub",
-            "timeline": timeline,
-            "hold": 0.5,
-        },
-    )
-    task_mul = broker.Task(
-        task_id="shot1-mul",
-        targets=[("calc.py", "mul")],
-        mutator=_timed_edit,
-        mutator_kwargs={
-            "path": "calc.py",
-            "symbol": "mul",
-            "new_body": "product = a * b\nreturn product",
-            "label": "mul",
-            "timeline": timeline,
-            "hold": 0.5,
-        },
-    )
     task_div = broker.Task(
         task_id="shot2-div",
         targets=[("calc.py", "div")],
@@ -295,46 +397,11 @@ def _run_shots_1_and_2(conn, repo: Path, client: BlackboardClient, reporter: _Re
         max_attempts=20,
     )
 
-    results = broker.run(
-        conn, repo, [task_sub, task_mul, task_div], client,
-        n_agents=3, mode="symbol", retry_backoff=0.4,
-    )
+    results = broker.run(conn, repo, [task_div], client, n_agents=1, retry_backoff=0.4)
     releaser.join(timeout=5.0)
 
     events = client.events(since=0)
 
-    # --- shot #1 -----------------------------------------------------------
-    sub_ok = results["shot1-sub"].status == "done" and (
-        results["shot1-sub"].integrate_result or {}
-    ).get("status") == "merged"
-    mul_ok = results["shot1-mul"].status == "done" and (
-        results["shot1-mul"].integrate_result or {}
-    ).get("status") == "merged"
-    reporter.check("shot1", "agent A (sub) and agent B (mul) both landed merged", sub_ok and mul_ok)
-
-    by_label: dict[str, dict[str, float]] = {}
-    for label, kind, ts in timeline:
-        by_label.setdefault(label, {})[kind] = ts
-    overlapped = (
-        "sub" in by_label and "mul" in by_label
-        and by_label["sub"]["start"] < by_label["mul"]["end"]
-        and by_label["mul"]["start"] < by_label["sub"]["end"]
-    )
-    reporter.check(
-        "shot1", "sub's and mul's edits genuinely overlapped in wall-clock time (real concurrency)", overlapped
-    )
-
-    calc_src = (repo / "calc.py").read_text()
-    both_present = "result = a - b" in calc_src and "product = a * b" in calc_src
-    reporter.check("shot1", "both edits present on trunk (integration branch)", both_present)
-
-    conflict_events = [e for e in events if e["type"] == "merge_rejected"]
-    reporter.check(
-        "shot1", "zero textual merge conflicts reached integration for this wave",
-        not any(json.loads(e["payload"] or "{}").get("reason") == "merge_conflict" for e in conflict_events),
-    )
-
-    # --- shot #2 -------------------------------------------------------------
     div_ok = results["shot2-div"].status == "done" and (
         results["shot2-div"].integrate_result or {}
     ).get("status") == "merged"
@@ -342,17 +409,19 @@ def _run_shots_1_and_2(conn, repo: Path, client: BlackboardClient, reporter: _Re
 
     div_denied = [
         e for e in events
-        if e["type"] == "lease_denied" and json.loads(e["payload"] or "{}").get("parcel_id") == "calc.py::div"
+        if e["type"] == "lease_denied" and json.loads(e["payload"] or "{}").get("parcel_id") == CALC_MODULE
     ]
-    reporter.check("shot2", "a real lease_denied was observed against calc.py::div", len(div_denied) >= 1)
+    reporter.check(
+        "shot2", "a real lease_denied was observed against calc.py's whole-file lock", len(div_denied) >= 1
+    )
 
     div_granted = [
         e for e in events
-        if e["type"] == "lease_granted" and json.loads(e["payload"] or "{}").get("parcel_id") == "calc.py::div"
+        if e["type"] == "lease_granted" and json.loads(e["payload"] or "{}").get("parcel_id") == CALC_MODULE
         and e["agent_id"] != "manual-editor"
     ]
     reporter.check(
-        "shot2", "the contending agent later acquired the SAME parcel", len(div_granted) >= 1
+        "shot2", "the contending agent later acquired the SAME whole-file parcel", len(div_granted) >= 1
     )
     if div_denied and div_granted:
         reporter.check(
@@ -376,25 +445,33 @@ NEW_ADD_SIGNATURE = "def add(a, b, rounding=None)"
 def _run_shot3(conn, repo: Path, client: BlackboardClient, reporter: _Reporter) -> None:
     """DESIGN §5.3/§7 money-shot #3: `calc.py::add` is sample_repo's registered
     frozen contract (U13's fixture design; `blast_radius >= FREEZE_THRESHOLD`
-    across `formats.py`, `api.py`, and their own test suites). One task
-    changes its signature; two more -- REAL dependents that already call
-    `calc.add` -- fix their call sites to match. All three run through one
-    `broker.run` call (symbol-mode leasing, same as shots #1/#2):
-    `co_schedulable`'s frozen-contract clause (DESIGN §3) forces the
-    signature-change task into its own wave ahead of the two dependents
-    (`load_scheduling_graph`'s `frozen_ids` already contains `calc.py::add`,
-    and `formats.py::total_with_tax` / `api.py::summarize` are real
-    call-graph dependents of it), and the broker (U15) auto-upgrades the
-    signature-change task's lease to `exclusive` because it targets a known
-    frozen contract -- nobody has to remember to ask for that by hand.
+    across `formats.py`, `api.py`, and their own test suites). One task changes
+    its signature; two more -- REAL dependents that already call `calc.add` --
+    re-read the changed contract and fix their call sites to match.
+
+    File-granularity note: the frozen-contract EXCLUSIVE-lease upgrade and
+    `co_schedulable`'s frozen clause (both DESIGN §5.3/§3) are INERT here --
+    contracts are symbol ids (`calc.py::add`) but every lease is a whole-file id
+    (`calc.py::<module>`), so no target is ever in `frozen_ids`. Both are parked
+    with symbol mode (SYMBOL_MODE_DESIGN.md). What still SHIPS -- and is what
+    this shot proves -- is contract DETECTION, which is granularity-independent:
+    the integrator's own before/after `type_hash` diff (`coordinator/
+    integrator.py`) emits a real `contract_change` on the landed merge no matter
+    the lease granularity.
+
+    Since nothing auto-orders the change ahead of its dependents at file
+    granularity, the demo sequences it explicitly: dispatch the signature change
+    in its OWN `broker.run` first, let it LAND and announce `contract_change`,
+    THEN dispatch the two dependents in a second `broker.run`. Each dependent
+    declares `calc.py::add` as a `read_deps` contract, so it re-reads the
+    contract from LIVE state (after the change landed and was re-indexed) and
+    sees the NEW signature before fixing its own call site.
 
     The new parameter (`rounding=None`, unused by `add`'s own body) is
     deliberately backward-compatible: `sample_repo/tests/test_calc.py` calls
     `add(2, 3)` directly and must keep passing on the signature-change task's
-    OWN impact-selected test gate (which only re-checks tests reachable from
-    `calc.py`, i.e. before either dependent has fixed anything) -- this shot
-    proves the NOTIFY + RE-PLAN protocol, not a crash-and-recover story
-    (that is money-shot #4's job).
+    OWN impact-selected test gate -- this shot proves the NOTIFY + RE-PLAN
+    protocol, not a crash-and-recover story (that is money-shot #4's job).
     """
     task_change = broker.Task(
         task_id="shot3-change-add-signature",
@@ -427,19 +504,27 @@ def _run_shot3(conn, repo: Path, client: BlackboardClient, reporter: _Reporter) 
         read_deps=[CONTRACT_SYMBOL],
     )
 
-    results = broker.run(
-        conn, repo, [task_change, task_fix_formats, task_fix_api], client,
-        n_agents=3, mode="symbol",
+    # Wave 1: the signature change lands and announces `contract_change` FIRST
+    # (its own broker.run -- see docstring on why the demo orders this by hand
+    # at file granularity). Wave 2: the two dependents, now that the contract
+    # has actually changed on trunk, re-read it and land their call-site fixes.
+    change_results = broker.run(conn, repo, [task_change], client, n_agents=1)
+    dependent_results = broker.run(
+        conn, repo, [task_fix_formats, task_fix_api], client, n_agents=2
     )
+    results = {**change_results, **dependent_results}
     events = client.events(since=0)
 
     change_result = results["shot3-change-add-signature"]
     change_landed = change_result.status == "done" and (
         change_result.integrate_result or {}
     ).get("status") == "merged"
+    # At file granularity the change takes a whole-file WRITE lease on
+    # calc.py::<module> (the exclusive-upgrade is parked/inert -- see docstring).
     reporter.check(
-        "shot3", "the signature-change task landed merged under an exclusive lease",
-        change_landed and change_result.lease_modes_used.get(CONTRACT_SYMBOL) == "exclusive",
+        "shot3",
+        "the signature-change task landed merged, holding calc.py's whole-file write-lease",
+        change_landed and change_result.lease_modes_used.get(CALC_MODULE) == "write",
     )
 
     contract_change_events = [
@@ -527,7 +612,10 @@ def _run_shot4(
     base_commit = git_ops.current_commit(repo)
     crash_agent_id = "crash-agent"
     task_id = "shot4-percent"
-    parcel_id = "formats.py::percent"
+    # File granularity: the crash agent holds calc.py's sibling -- formats.py's
+    # WHOLE-FILE lock -- while it edits `percent`. Symbol-level parcels are never
+    # leased (parked); every lease in this demo is a `<file>::<module>` lock.
+    parcel_id = "formats.py::<module>"
     ttl = 3.0
     # Trunk's formats.py right before this shot's crash-agent starts -- NOT
     # sample_repo's static on-disk source: money-shot #3 (U15) legitimately
@@ -631,7 +719,8 @@ def _run_shot5(repo: Path, client: BlackboardClient, reporter: _Reporter) -> Non
         client=client,
         repo=repo,
         task="shot5-break-summarize",
-        target_parcels=["api.py::summarize"],
+        # Whole-file lock (file granularity) -- see money-shot #4's note.
+        target_parcels=["api.py::<module>"],
         mutator=mutators.break_a_test,
         mutator_kwargs={"path": "api.py", "symbol": "summarize"},
         base_commit=base_commit,
@@ -678,8 +767,11 @@ def run_demo(workdir: Optional[Path] = None, keep: bool = False) -> dict[str, An
         conn = app.state.conn
         client = BlackboardClient(server.base_url)
 
-        print("\n=== money shot #1 + #2: concurrent disjoint edits + contended parcel ===")
-        _run_shots_1_and_2(conn, repo, client, reporter)
+        print("\n=== money shot #1: three agents on three files land concurrently ===")
+        _run_shot1(conn, repo, client, reporter)
+
+        print("\n=== money shot #2: a contended whole-file parcel serializes ===")
+        _run_shot2(conn, repo, client, reporter)
 
         print("\n=== money shot #3: frozen-contract change + dependent re-plan ===")
         _run_shot3(conn, repo, client, reporter)
@@ -725,10 +817,11 @@ def main() -> int:
         print(f"  {'PASS' if ok else 'FAIL'}: {SHOT_LABELS[key]}")
     print("=" * 72)
     if result["all_ok"]:
-        print("ALL FIVE MONEY SHOTS PASS (DESIGN §7): concurrent disjoint edits land "
-              "clean, a contended parcel serializes, a frozen-contract change notifies "
-              "its dependents and they re-plan, a crash mid-edit is recovered, and a "
-              "test-breaking edit is rejected by the gated integrator.")
+        print("ALL FIVE MONEY SHOTS PASS (DESIGN §7): three agents on three files land "
+              "clean and concurrently, a contended whole-file parcel serializes, a "
+              "frozen-contract change notifies its dependents and they re-plan, a crash "
+              "mid-edit is recovered, and a test-breaking edit is rejected by the gated "
+              "integrator -- all under file-granularity locking, the shipping default.")
     else:
         print("AT LEAST ONE MONEY SHOT FAILED.")
 

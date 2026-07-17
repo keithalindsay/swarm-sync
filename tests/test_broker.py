@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 
 from swarmsync.agent import mutators
 from swarmsync.agent.client import BlackboardClient
+from swarmsync.classifier.graph import SymbolModeError
 from swarmsync.coordinator import broker
 from swarmsync.server import leases as leases_mod
 from swarmsync.server.app import create_app
@@ -237,37 +238,28 @@ def test_broker_reassigns_task_after_original_agent_is_reaped(conn_and_client, r
 # --- unit-level coverage of resolve_task/schedulable/group_schedulable ------
 
 
-def test_resolve_task_symbol_mode_uses_the_named_symbol(conn_and_client):
+def test_resolve_task_refuses_symbol_mode_even_when_the_symbol_parcel_exists(conn_and_client):
+    """`mod_a.py::helper` is a real, indexed parcel -- the one input shape symbol mode used
+    to resolve to a symbol id (the other two shapes always fell back to the module id, so
+    they would 'pass' a broken guard by accident). It must refuse anyway."""
     conn, _client = conn_and_client
     task = broker.Task(
         task_id="t",
         targets=[("mod_a.py", "helper")],
         mutator=mutators.edit_function_body,
     )
-    assert broker.resolve_task(conn, task, mode="symbol") == ["mod_a.py::helper"]
+    assert broker._load_parcel(conn, "mod_a.py::helper") is not None
+    with pytest.raises(SymbolModeError, match="parked"):
+        broker.resolve_task(conn, task, mode="symbol")
+    # File granularity still collapses the same hint to the whole-file parcel.
+    assert broker.resolve_task(conn, task, mode="file") == ["mod_a.py::<module>"]
 
 
-def test_resolve_task_symbol_mode_falls_back_to_module_for_bare_file_hint(conn_and_client):
-    conn, _client = conn_and_client
-    task = broker.Task(
-        task_id="t",
-        targets=[("mod_a.py", None)],
-        mutator=mutators.edit_function_body,
-    )
-    assert broker.resolve_task(conn, task, mode="symbol") == ["mod_a.py::<module>"]
-
-
-def test_resolve_task_symbol_mode_falls_back_when_symbol_doesnt_exist(conn_and_client):
-    conn, _client = conn_and_client
-    task = broker.Task(
-        task_id="t",
-        targets=[("mod_a.py", "nonexistent_symbol")],
-        mutator=mutators.edit_function_body,
-    )
-    assert broker.resolve_task(conn, task, mode="symbol") == ["mod_a.py::<module>"]
-
-
-def test_resolve_task_symbol_mode_two_symbols_same_file_are_schedulable(conn_and_client):
+def test_two_symbols_in_one_file_serialize_at_file_granularity(conn_and_client):
+    """Was `..._symbol_mode_two_symbols_same_file_are_schedulable`. The file-mode half is
+    orthogonal and still the enforced guarantee, so it stays; the symbol half asserted the
+    exact capability that is now parked (two agents in one file at once), so it now asserts
+    the refusal instead."""
     conn, _client = conn_and_client
     task_helper = broker.Task(
         task_id="a", targets=[("mod_a.py", "helper")], mutator=mutators.edit_function_body
@@ -275,10 +267,10 @@ def test_resolve_task_symbol_mode_two_symbols_same_file_are_schedulable(conn_and
     task_other = broker.Task(
         task_id="b", targets=[("mod_a.py", "other")], mutator=mutators.edit_function_body
     )
-    # file mode: same file -> NOT co-schedulable (the enforced default).
+    # file mode: same file -> NOT co-schedulable (the enforced default, and now the only one).
     assert broker.schedulable(conn, task_helper, task_other, mode="file") is False
-    # symbol mode: disjoint byte spans in the same file -> co-schedulable.
-    assert broker.schedulable(conn, task_helper, task_other, mode="symbol") is True
+    with pytest.raises(SymbolModeError, match="parked"):
+        broker.schedulable(conn, task_helper, task_other, mode="symbol")
 
 
 def test_resolve_task_raises_on_unindexed_file(conn_and_client):
@@ -297,6 +289,107 @@ def test_resolve_task_raises_on_unknown_mode(conn_and_client):
     task = broker.Task(task_id="t", targets=[("mod_a.py", None)], mutator=mutators.edit_function_body)
     with pytest.raises(ValueError):
         broker.resolve_task(conn, task, mode="bogus")
+
+
+# --- symbol granularity is parked: it must refuse from EVERY public entry point ---------
+
+
+def test_symbol_mode_refuses_from_every_public_broker_entry_point(conn_and_client, repo):
+    """Every public function here that takes a granularity `mode` must refuse "symbol" --
+    a guard on one entry point is not a guard. `run`/`group_schedulable` are ALSO checked
+    with an empty task list: they must refuse on their own, not by luck of delegating to
+    `resolve_task` (which an empty list never reaches)."""
+    conn, client = conn_and_client
+    r, _base = repo
+    task_a = broker.Task(
+        task_id="a", targets=[("mod_a.py", "helper")], mutator=mutators.edit_function_body
+    )
+    task_b = broker.Task(
+        task_id="b", targets=[("mod_b.py", "compute")], mutator=mutators.edit_function_body
+    )
+
+    with pytest.raises(SymbolModeError):
+        broker.resolve_task(conn, task_a, mode="symbol")
+    with pytest.raises(SymbolModeError):
+        broker.schedulable(conn, task_a, task_b, mode="symbol")
+    with pytest.raises(SymbolModeError):
+        broker.group_schedulable(conn, [task_a, task_b], mode="symbol")
+    with pytest.raises(SymbolModeError):
+        broker.group_schedulable(conn, [], mode="symbol")
+    with pytest.raises(SymbolModeError):
+        broker.run(conn, r, [task_a], client, n_agents=1, mode="symbol")
+    with pytest.raises(SymbolModeError):
+        broker.run(conn, r, [], client, n_agents=1, mode="symbol")
+
+
+def test_refused_symbol_mode_run_leases_nothing_and_leaves_no_events(conn_and_client, repo):
+    """`run` must refuse BEFORE any side effect: a refusal that had already leased or
+    spawned would be worse than no guard, since the caller would think nothing happened."""
+    conn, client = conn_and_client
+    r, base = repo
+    before = len(client.events(since=0))
+    task = broker.Task(
+        task_id="a",
+        targets=[("mod_a.py", "helper")],
+        mutator=mutators.edit_function_body,
+        mutator_kwargs={"path": "mod_a.py", "symbol": "helper", "new_body": "return 0"},
+        base_commit=base,
+    )
+    with pytest.raises(SymbolModeError):
+        broker.run(conn, r, [task], client, n_agents=1, mode="symbol")
+    assert len(client.events(since=0)) == before
+    assert conn.execute("SELECT COUNT(*) FROM leases").fetchone()[0] == 0
+
+
+def test_symbol_mode_refusal_message_is_actionable(conn_and_client):
+    conn, _client = conn_and_client
+    task = broker.Task(
+        task_id="t", targets=[("mod_a.py", "helper")], mutator=mutators.edit_function_body
+    )
+    with pytest.raises(SymbolModeError) as exc:
+        broker.resolve_task(conn, task, mode="symbol")
+    msg = str(exc.value)
+    assert "parked" in msg
+    assert "string match" in msg  # WHY: the lease store's conflict rule
+    assert "SYMBOL_MODE_DESIGN.md" in msg  # where the revival plan lives
+    assert "mode='file'" in msg  # what to do instead
+
+
+def test_every_granularity_taking_entry_point_is_covered_by_the_guard_sweep():
+    """Tripwire: if someone adds a NEW public function that takes a granularity `mode`,
+    this fails until they add it to the sweep above. Without this, "unreachable from every
+    entry point" silently decays to "unreachable from the entry points that existed today".
+
+    Identified by the `mode: str = "file"` signature -- the granularity convention here.
+    (`agent.runner`/`agent.client`'s `mode` is the lease READ/WRITE mode, a different axis:
+    it defaults to "write" and so is correctly not matched.)
+    """
+    import inspect
+
+    from swarmsync.classifier import graph as graph_mod
+
+    covered = {
+        (graph_mod.__name__, "co_schedulable"),
+        (broker.__name__, "resolve_task"),
+        (broker.__name__, "schedulable"),
+        (broker.__name__, "group_schedulable"),
+        (broker.__name__, "run"),
+    }
+    found = set()
+    for module in (graph_mod, broker):
+        for name, fn in vars(module).items():
+            if name.startswith("_") or not inspect.isfunction(fn):
+                continue
+            if fn.__module__ != module.__name__:
+                continue  # imported symbol, not this module's own entry point
+            param = inspect.signature(fn).parameters.get("mode")
+            if param is not None and param.default == "file":
+                found.add((module.__name__, name))
+    assert found == covered, (
+        f"granularity entry points changed: {found ^ covered}. Add the new one to "
+        "test_symbol_mode_refuses_from_every_public_broker_entry_point (and guard it "
+        "with check_file_granularity) or update this tripwire."
+    )
 
 
 def test_group_schedulable_all_disjoint_is_one_wave(conn_and_client):
@@ -361,9 +454,23 @@ def frozen_conn_and_client(tmp_path, frozen_repo):
         yield app.state.conn, BlackboardClient(c)
 
 
-def test_broker_auto_upgrades_frozen_contract_target_to_exclusive_lease(
+def test_broker_run_still_detects_and_announces_a_contract_change_at_file_granularity(
     frozen_conn_and_client, frozen_repo
 ):
+    """Was `test_broker_auto_upgrades_frozen_contract_target_to_exclusive_lease`, which drove
+    this through `broker.run(..., mode="symbol")` and asserted BOTH halves of DESIGN §5.3:
+    the preventive half (a frozen-contract target is upgraded to an EXCLUSIVE lease) and the
+    detective half (a landed signature change emits `contract_change`).
+
+    Symbol granularity is parked, and the preventive half is inert without it: contracts are
+    only extracted for function/class parcels, while file mode resolves every target to its
+    `<module>` parcel, so no target is ever in `frozen_ids`. That half moves to the unit test
+    below, which pins the parked mechanism directly.
+
+    The detective half is NOT parked -- it still ships, because `integrate` re-indexes and
+    diffs `type_hash` on merge regardless of what was leased. So this test keeps it, now on
+    the mode the product actually ships (`mode="file"`), where it had no coverage before.
+    """
     conn, client = frozen_conn_and_client
     r, base = frozen_repo
     task = broker.Task(
@@ -374,21 +481,15 @@ def test_broker_auto_upgrades_frozen_contract_target_to_exclusive_lease(
         base_commit=base,
     )
 
-    results = broker.run(conn, r, [task], client, n_agents=1, mode="symbol")
+    results = broker.run(conn, r, [task], client, n_agents=1, mode="file")
     result = results["change-helper-signature"]
     assert result.status == "done"
-    assert result.lease_modes_used.get("mod_a.py::helper") == "exclusive"
+    # The whole file was leased, not the symbol -- that IS the parked decision, asserted.
+    assert "mod_a.py::<module>" in result.lease_modes_used
+    assert "mod_a.py::helper" not in result.lease_modes_used
 
     events = client.events(since=0)
-    granted = [
-        json.loads(e["payload"])
-        for e in events
-        if e["type"] == "lease_granted"
-        and json.loads(e["payload"]).get("parcel_id") == "mod_a.py::helper"
-    ]
-    assert granted and all(g["mode"] == "exclusive" for g in granted)
-
-    # ...and a real contract_change event landed for it (DESIGN §5.3).
+    # A real contract_change event landed for the symbol anyway (DESIGN §5.3).
     changes = [
         json.loads(e["payload"])
         for e in events
@@ -396,3 +497,44 @@ def test_broker_auto_upgrades_frozen_contract_target_to_exclusive_lease(
         and json.loads(e["payload"]).get("symbol") == "mod_a.py::helper"
     ]
     assert changes and "scale" in changes[0]["new_signature"]
+
+
+def test_frozen_contract_target_is_upgraded_to_an_exclusive_lease_parked_mechanism(
+    frozen_conn_and_client, frozen_repo
+):
+    """DESIGN §5.3's PREVENTIVE half, kept alive as a unit test while it is parked.
+
+    `_run_task_once` upgrades any target parcel that is in `frozen_ids` to an EXCLUSIVE
+    lease. Via `broker.run` this is now unreachable (see the test above), so this drives
+    `_run_task_once` directly with an injected `frozen_ids` -- the shape `load_scheduling_graph`
+    would produce if the resolved target were a symbol parcel. This is deliberately NOT a
+    claim that the upgrade fires in the shipping product: it pins the mechanism so the
+    SYMBOL_MODE_DESIGN.md revival has something that fails if someone deletes it meanwhile.
+    """
+    conn, client = frozen_conn_and_client
+    r, base = frozen_repo
+    task = broker.Task(
+        task_id="change-helper-signature",
+        targets=[("mod_a.py", "helper")],
+        mutator=mutators.change_signature,
+        mutator_kwargs={"path": "mod_a.py", "symbol": "helper", "new_sig": "def helper(x, scale=1)"},
+        base_commit=base,
+    )
+    # At file granularity the target resolves to the whole-file parcel; freeze THAT id so
+    # the upgrade has something to bite on without reaching for the parked symbol mode.
+    module_id = "mod_a.py::<module>"
+    assert broker.resolve_task(conn, task, mode="file") == [module_id]
+
+    result = broker._run_task_once(
+        conn, r, client, task, agent_id="upgrade-unit", mode="file", frozen_ids={module_id}
+    )
+    assert result.status == "done"
+    assert result.lease_modes_used.get(module_id) == "exclusive"
+
+    granted = [
+        json.loads(e["payload"])
+        for e in client.events(since=0)
+        if e["type"] == "lease_granted"
+        and json.loads(e["payload"]).get("parcel_id") == module_id
+    ]
+    assert granted and all(g["mode"] == "exclusive" for g in granted)

@@ -5,9 +5,13 @@ sample_repo, prints PASS for money-shots #1/#2/#4/#5, exits 0; zero same-file
 textual collisions reached `integration`; trunk green throughout.
 
 U15 done when (BUILD_PLAN.md): the demo shows an agent changing a frozen
-signature (exclusive lease + `contract_change` event), a dependent agent
+signature (emitting a real `contract_change` event), a dependent agent
 observing it, re-reading the contract, and landing a call-site fix with tests
 green; money-shot #3 prints PASS and the full demo exits 0 with all five PASS.
+(At file granularity -- the shipping mode -- the change takes a whole-file WRITE
+lease, not a symbol-level exclusive lease: the frozen-contract exclusive-upgrade
+is parked with symbol mode. Contract DETECTION is granularity-independent and
+is what this shot exercises; see SYMBOL_MODE_DESIGN.md.)
 
 S6 note: the five in-process assertions below all read ONE session-scoped
 `run_demo(keep=True)` (the `demo_run` fixture) rather than each spinning up its
@@ -167,7 +171,7 @@ def test_run_demo_shot3_emits_contract_change_and_lands_dependent_fixes(demo_run
         "SELECT seq, agent_id, payload FROM events WHERE type = 'contract_change' ORDER BY seq"
     ).fetchall()
     lease_rows = conn.execute(
-        "SELECT payload FROM events WHERE type = 'lease_granted'"
+        "SELECT agent_id, payload FROM events WHERE type = 'lease_granted'"
     ).fetchall()
     merged_rows = conn.execute(
         "SELECT seq, payload FROM events WHERE type = 'merged' ORDER BY seq"
@@ -182,14 +186,22 @@ def test_run_demo_shot3_emits_contract_change_and_lands_dependent_fixes(demo_run
     assert "rounding" not in change["old_signature"]
     assert "rounding" in change["new_signature"]
 
-    # The signature-change task really did take an EXCLUSIVE lease on the
-    # frozen contract (DESIGN §5.3), auto-enforced by coordinator.broker.run.
-    exclusive_grants = [
+    # File granularity (the shipping mode): the signature-change task takes a
+    # whole-file WRITE lease on calc.py::<module>, NOT a symbol-level exclusive
+    # lease on calc.py::add -- the frozen-contract exclusive-upgrade (DESIGN
+    # §5.3) is inert here and parked with symbol mode (SYMBOL_MODE_DESIGN.md).
+    # Contract detection below is what still ships, and is what this shot proves.
+    change_grants = [
         json.loads(r["payload"]) for r in lease_rows
-        if json.loads(r["payload"] or "{}").get("parcel_id") == "calc.py::add"
-        and json.loads(r["payload"] or "{}").get("mode") == "exclusive"
+        if r["agent_id"].startswith("shot3-change-add-signature")
     ]
-    assert exclusive_grants, "expected calc.py::add to be leased in exclusive mode"
+    assert change_grants, "expected the signature-change agent to acquire a lease"
+    assert all(g["parcel_id"] == "calc.py::<module>" for g in change_grants), (
+        f"signature-change task should lease the WHOLE FILE, got {change_grants!r}"
+    )
+    assert all(g["mode"] == "write" for g in change_grants), (
+        f"expected a whole-file write lease (exclusive-upgrade is parked), got {change_grants!r}"
+    )
 
     # Ordering: the contract_change event precedes both dependents' `merged`
     # events -- they could only have re-read the NEW contract after it changed.

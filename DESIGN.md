@@ -30,9 +30,11 @@ Rationale: it is the **best-of synthesis** of the field —
 - **atomic SQLite CAS leases** (from ZLP): logical mutual exclusion on the unit of parallelism.
 - **frozen interface contracts** (from Plan-DAG): kills the worst real break — a signature changing
   under a dependent.
-- **symbol granularity** (the good idea in Ledger) **without Ledger's fragility**: we lease at symbol
-  level but merge with **ordinary git**, so two agents editing different functions in one file just
-  produce non-overlapping hunks — no risky span-splice/reassembly step that could itself corrupt code.
+- **symbol-granular *classification*** (the good idea in Ledger) **without Ledger's fragility**: we
+  index parcels at symbol level — that is what blast radius and the frozen-contract surface are built
+  on — but we **lease at file granularity** and merge with **ordinary git**, so there is no risky
+  span-splice/reassembly step that could itself corrupt code. Symbol-granular *leasing* is parked;
+  see §2's de-risking decisions and `SYMBOL_MODE_DESIGN.md`.
 - **serial test-gated integrator** (from Loom's merge-train): trunk is never poisoned by a partial edit.
 
 What Pheromesh adds that the vision most explicitly demands and the others under-deliver: a **live
@@ -43,11 +45,24 @@ reality (not raw diffs) and can see who is working where. That is the literal re
 
 ### De-risking decisions (per judge advice, baked into this build)
 
-- **Granularity defaults to FILE, symbol-level is a stretch flag.** The classifier emits parcels at
-  function/method granularity where the AST is unambiguous, but the *enforced lease granularity* is
-  configurable and defaults to **file** for the first working build (matches ZLP's proven-buildable
-  core). Symbol-level leasing is enabled per-parcel only when two agents demonstrably need to co-edit
-  one file (money-shot #1). This keeps the overnight build honest: safe-and-simple first.
+- **Granularity is FILE. Symbol-level leasing is PARKED, not a flag.** The classifier emits parcels
+  at function/method granularity where the AST is unambiguous, but the *enforced lease granularity*
+  is **file**, everywhere: every lease the broker and the hook adapter take is on the file's
+  synthetic `<relpath>::<module>` parcel (`coordinator/broker.py::resolve_task`,
+  `hooks/adapter.py`). Requesting symbol granularity **raises**
+  (`classifier/graph.py::check_file_granularity`) rather than appearing to work — the same call as
+  §7a's single-root rule: a config that cannot work should not appear to.
+
+  Symbol mode is parked because it is **unsafe today**: §5.2's conflict rule is a plain string match
+  on `parcel_id` and knows nothing of containment, so `m.py::<module>` (the whole file) and
+  `m.py::alpha` (a function inside it) are different strings and are **both granted** in write mode
+  — reproduced. File mode is safe *by construction*: every id it leases is `<file>::<module>`, so
+  ids are always same-shaped and string equality is sound. It is also **broker-only by nature** (its
+  enforcement point would be a pre-merge refusal, and the hook path has no branch, no fork point and
+  no integrator — §5.1), and its concurrency is narrower than the pitch, since any edit touching an
+  import escalates to the whole file anyway. `SYMBOL_MODE_DESIGN.md` is the full reasoning and the
+  staged revival plan. **Symbol-level *parcels* are untouched** — they are still indexed and the
+  frozen-contract subsystem still rides on them (§5.3).
 - **Agents are deterministic scripted mutators for the prototype**, not live LLMs. This makes the demo
   reproducible and removes API-key/nondeterminism risk from the overnight loop. The agent client is a
   thin, swappable interface (`agent/client.py`) so a real Claude Agent SDK worker drops in later.
@@ -81,7 +96,10 @@ so a tree-sitter backend can replace `ast` later for multi-language support.
 5. **Frozen contracts** (`graph.py`): a parcel whose blast_radius ≥ `FREEZE_THRESHOLD` (default 3) and
    that is imported across module boundaries is a **frozen contract**. We record its `signature` (name +
    parameter list + defaults for functions; public method signatures for classes) and a `type_hash`.
-   Changing a frozen signature requires an exclusive lease + a broadcast `contract_change` event.
+   Changing a frozen signature broadcasts a `contract_change` event on merge (detection — this
+   ships). The design also calls for taking an *exclusive* lease on the frozen symbol before the
+   change; that preventive half is **parked and inert at file granularity** (frozen ids are symbol
+   ids, every lease is a file id, so the upgrade never fires) — see §5.3 and `SYMBOL_MODE_DESIGN.md`.
 6. **Territories** (optional stretch): weakly-connected components of the graph, used only as a hint to
    co-locate related tasks. Not load-bearing for safety.
 
@@ -89,10 +107,14 @@ so a tree-sitter backend can replace `ast` later for multi-language support.
 incremental per changed file: the integrator re-parses only the files a merged branch touched and updates
 those parcels' `content_hash`, `blast_radius`, and `state_summary`.
 
-**Parallel-safety relation.** Two parcels A, B are **co-schedulable** iff:
-`file(A) ≠ file(B)` (file mode) **or** `span(A) ∩ span(B) = ∅` (symbol mode), **and** neither is a
-frozen contract the other is about to modify. Two tasks are safely parallel iff their whole
-target-parcel sets are pairwise co-schedulable. This is the classifier's core product.
+**Parallel-safety relation.** Two parcels A, B are **co-schedulable** iff `file(A) ≠ file(B)`,
+**and** neither is a frozen contract the other is about to modify. Two tasks are safely parallel iff
+their whole target-parcel sets are pairwise co-schedulable. This is the classifier's core product.
+(`co_schedulable`'s span-disjoint `mode="symbol"` branch is parked behind a raise — §2,
+`SYMBOL_MODE_DESIGN.md`. Note the relation is **advisory** and broker-only: it informs the
+scheduler's wave grouping, and is never consulted by `POST /lease` or the hook adapter — §5.2's CAS
+is what actually excludes writers. Its frozen-contract clause is also inert at file granularity, for
+the reason given in §5.3.)
 
 ## 4. Shared memory: the Blackboard
 
@@ -240,15 +262,39 @@ WHERE NOT EXISTS (
     AND (l.mode IN ('write','exclusive') OR :mode IN ('write','exclusive'))
 );
 ```
-`changes() == 1` → granted; `0` → denied (another agent holds it). Read-leases are shared; write and
-exclusive are mutually exclusive. This is the safety net that makes trusting the planner's predicted
-touch-sets acceptable: a misprediction that double-targets a parcel simply loses the race and serializes.
+`changes() == 1` → granted; `0` → denied (another agent holds it). Read-leases are shared; `write` and
+`exclusive` each exclude every other lease on that parcel — and the predicate treats the two as
+**indistinguishable**, so `exclusive` buys no exclusion beyond `write` today. This
+is the safety net that makes trusting the planner's predicted touch-sets acceptable: a misprediction
+that double-targets a parcel simply loses the race and serializes.
+
+**The conflict rule is `l.parcel_id = :parcel_id` — a string match** (`server/leases.py::acquire`).
+The lease store has no notion of one parcel *containing* another. That is sound here only because
+§2's file granularity means every id it ever sees is `<file>::<module>`: same-shaped ids, so string
+equality is exactly containment. It is also why symbol granularity is parked rather than optional —
+mixing `m.py::<module>` with `m.py::alpha` gets both granted (§2, `SYMBOL_MODE_DESIGN.md`).
 
 ### 5.3 Contract freeze (detection, not prevention — POST-merge)
 **This is weaker than "prevention" and the implementation matches that, not the earlier draft's
 promise of a pre-merge broadcast.** An agent changing a frozen signature holds only the same
 **write/exclusive parcel lease** any edit requires (§5.2) — there is no separate "exclusive contract
-lease" step, and nothing stops the change from landing. Detection happens in the **integrator**
+lease" step, and nothing stops the change from landing.
+
+**Detection ships and works at file granularity; the preventive half is inert.** Contract
+**detection** is a property of the integrator and is indifferent to lease granularity: it diffs the
+`contracts` table across the re-index (below), so a genuine landed signature change emits
+`contract_change` on merge either way. What file granularity switches *off* is the **preventive**
+half. Frozen contracts are keyed by the *symbol* parcel id (`classifier/graph.py::extract_contracts`
+only emits contracts for `function`/`class` parcels), while file mode resolves every task to
+`<file>::<module>` — so the two id sets never intersect, and both preventive mechanisms that test
+`pid in frozen_ids` never fire: the broker's upgrade of a frozen target's lease to `exclusive`
+(`coordinator/broker.py::_run_task_once`) and `co_schedulable`'s frozen clause (§3). Neither is a
+loss of a *guarantee* — §5.2 already notes `exclusive` and `write` are the same predicate, and
+`co_schedulable` is advisory — but do not read "frozen contract" as anything more than a *label the
+integrator diffs against*. Reviving the preventive half is Stage 1 of `SYMBOL_MODE_DESIGN.md` and
+needs no symbol mode.
+
+Detection happens in the **integrator**
 (`coordinator/integrator.py`), *after* the merge has already gone through: bracketing the post-merge
 re-index (§5.4 step 4), it snapshots `contracts.type_hash` for every touched symbol **before**
 re-indexing and diffs it against the value **after**. Only a genuine, landed type_hash change emits
@@ -267,7 +313,7 @@ poll and re-plans in time), not a guarantee that every dependent will.
 ### 5.4 Serial test-gated integrator (detection + resolution)
 Merges are serialized through one integrator (`coordinator/integrator.py`). For each submitted branch:
 1. `git merge --no-ff` the agent branch into the integration branch. Because the scheduler only ran
-   file-disjoint (or span-disjoint) work concurrently, this is conflict-free **by construction**; a
+   file-disjoint work concurrently, this is conflict-free **by construction**; a
    textual conflict is treated as a hard signal of touch-set misprediction → reject + re-plan.
 2. Run **pytest** restricted to tests reachable from the changed parcels (impact selection; full-suite
    fallback if selection is uncertain). Green → land, emit `merged`, re-index the touched files
@@ -298,10 +344,12 @@ A single script `demo/run_demo.py` boots the server, indexes `sample_repo/`, and
 fixed task list, printing the event stream. It must demonstrate **five money shots**, each an
 assertion the script checks and prints PASS/FAIL for:
 
-1. **Concurrent disjoint edits land clean.** Two agents lease and edit **different functions in the same
-   file** (symbol-level leasing) at the same time; both branches merge green with **zero conflicts**.
-   *Proof:* two `merged` events, integration branch tests green, git log shows both commits.
-2. **Contended parcel serializes.** A third agent requests a write-lease on a parcel already
+1. **Concurrent disjoint edits land clean.** Three agents lease and edit **different files** at the
+   same time (file-granularity leasing, §2 — two agents in *one* file is what money-shot #2 shows
+   instead: it serializes); all three branches merge green with **zero conflicts**.
+   *Proof:* three `merged` events with overlapping work windows, integration branch tests green, git
+   log shows all three commits.
+2. **Contended parcel serializes.** A second agent requests a write-lease on a file already
    write-leased → `lease_denied`; it waits, then acquires and lands after the holder releases.
    *Proof:* a `lease_denied` event followed later by a `lease_granted` + `merged` for the same parcel.
 3. **Frozen-contract change notifies dependents.** One agent changes a frozen signature → `contract_change`
@@ -316,8 +364,10 @@ assertion the script checks and prints PASS/FAIL for:
    *Proof:* `merge_rejected` event, trunk tests stay green throughout.
 
 **Overall success criterion:** across a run with ≥3 concurrent agents on the sample repo, **zero
-same-file textual collisions reach the integration branch**, every landed commit leaves the sample
-repo's test suite green, and all five money-shot assertions print PASS.
+textual collisions reach the integration branch** (no two agents ever hold the same file at once —
+§2's file granularity is what makes that true, and money-shot #2 is the case where it bites), every
+landed commit leaves the sample repo's test suite green, and all five money-shot assertions print
+PASS.
 
 ## 7a. Operational surface (env + launchers)
 
@@ -340,6 +390,8 @@ has the operator-facing version; this is the contract.
 mid-gate, which no in-process handler can catch.
 
 ## 8. Explicitly out of scope for the prototype
-Multi-language classifier (tree-sitter backend stubbed), live LLM agents (scripted mutators instead),
+**Symbol-granularity leasing** (parked behind a raise, §2 — reasoning and staged revival in
+`SYMBOL_MODE_DESIGN.md`; symbol-level *parcels* and contract detection are unaffected and do ship),
+multi-language classifier (tree-sitter backend stubbed), live LLM agents (scripted mutators instead),
 Rich TUI pheromone dashboard, speculative/stacked merge-train (serial integrator only), Redis event bus
 (poll `events` every 1s), automatic semantic-conflict *reconciliation* (surfaced, not auto-fixed).
