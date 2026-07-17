@@ -9,8 +9,47 @@
 > **blackboard** — a live SQLite representation of the current state of the code. Coordination is
 > *stigmergic*: agents read and write the environment, never each other.
 
-This is the **Pheromesh** architecture. For the full spec see [`DESIGN.md`](DESIGN.md); this README
-is the usage guide.
+This is the **Pheromesh** architecture (the name is explained below). Three docs, by what you want:
+
+- **Use it** → this README.
+- **Understand or improve it** → [`ARCHITECTURE.md`](ARCHITECTURE.md) — how the pieces work, in plain
+  language, and where each lives in the code.
+- **The full build spec** → [`DESIGN.md`](DESIGN.md).
+
+---
+
+## The words this README uses
+
+swarm-sync borrows its vocabulary from ant colonies and databases. Read these once and the rest of
+the README (and the code) reads easily:
+
+- **Stigmergy** — coordination by leaving marks in a shared environment instead of messaging each
+  other. Ants drop pheromone trails and follow trails; they never hold meetings. swarm-sync's agents
+  work the same way: they only ever read and write the shared blackboard, never talk directly.
+- **Pheromesh** — the name for this whole architecture: *pheromone* + *mesh*. A mesh of agents
+  coordinating through one shared, decaying, stigmergic memory. It's the design this repo implements,
+  not a library you install.
+- **Blackboard** — that shared memory: a single SQLite database every agent reads and writes. It
+  holds the parcel map, the leases, the frozen contracts, the pheromone trails, and an append-only
+  event log.
+- **Parcel** — a leasable unit of code. The classifier parses the repo into one parcel per
+  function/method/class, plus one synthetic parcel for each whole file. (Today the lock is always
+  taken on the whole-file parcel — see [Granularity](#granularity-swarm-sync-locks-whole-files).)
+- **Lease** — a temporary, exclusive claim on a file. Holding it means you're the only agent allowed
+  to edit that file right now. It expires unless refreshed, so a crashed agent can't lock a file
+  forever.
+- **Worktree** — a private git checkout. Each broker-driven agent gets its own, so two agents can't
+  even physically write the same file on disk.
+- **Contract** — a heavily-depended-on function signature, "frozen" because so much breaks if it
+  changes. When one changes, dependents get a `contract_change` notice so they can re-plan.
+- **Pheromone trail** — the decaying "I'm planning/working here" signals in the event log, so agents
+  can see current activity without messaging each other.
+- **Integrator** — the single gatekeeper that merges each agent's branch one at a time, runs the
+  tests, and **rolls the merge back if they fail** — so the main branch is never broken.
+- **Reaper** — the background janitor that clears the leases of agents that died (stopped
+  heartbeating) and lets their work be reassigned.
+
+For how these fit together and where they live in the code, see [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ---
 
@@ -88,6 +127,9 @@ trails, and an append-only event log. Each agent declares intent, acquires an **
 on a file, edits inside its **own git worktree**, heartbeats, then submits its branch to a **serial,
 test-gated integrator** that merges, runs `pytest`, and re-indexes — rolling the merge back if the
 tests go red, so trunk is never poisoned. A **TTL reaper** reclaims the leases of agents that crash.
+
+For the expanded, plain-language version — how each piece works, the life of one edit end to end, and
+a map from every concept to the code that implements it — see [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ---
 
