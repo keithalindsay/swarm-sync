@@ -16,6 +16,8 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from swarmsync.blackboard.db import BUSY_TIMEOUT_SECONDS
+
 # --- TTL bounds (C9) ---------------------------------------------------------------
 # A lease TTL must be STRICTLY positive. A `ttl <= 0` makes
 # `ttl_expires_at = now + ttl` land in the past, so the lease is granted AND already
@@ -28,12 +30,14 @@ from pydantic import BaseModel, ConfigDict, Field
 LEASE_TTL_MAX_SECONDS = 86400.0  # 24h
 
 # Defense-in-depth floor (C13): a TTL should comfortably exceed the SQLite
-# `busy_timeout` (5s, see blackboard/db.py) -- ideally >= 2x it -- so the heartbeat
-# liveness predicate can never be raced by a lock wait that shrinks the live window
-# toward request latency. NOT enforced on the wire: the hook's own keepalive tests
-# deliberately use sub-second TTLs to exercise renewal quickly, so a hard floor would
-# be a false constraint here. Callers that can (the hook adapter) warn below it.
-LEASE_TTL_FLOOR_SECONDS = 10.0  # 2x the 5s busy_timeout
+# `busy_timeout` (see blackboard/db.py) -- >= 2x it -- so the heartbeat liveness
+# predicate can never be raced by a lock wait that shrinks the live window toward
+# request latency. DERIVED from the busy_timeout constant rather than hardcoded, so
+# retuning the timeout cannot silently strand this floor at a stale multiple. NOT
+# enforced on the wire: the hook's own keepalive tests deliberately use sub-second
+# TTLs to exercise renewal quickly, so a hard floor would be a false constraint
+# here. Callers that can (the hook adapter) warn below it.
+LEASE_TTL_FLOOR_SECONDS = 2 * BUSY_TIMEOUT_SECONDS
 
 # --- literals mirroring the CHECK-by-convention columns in schema.sql -------------
 

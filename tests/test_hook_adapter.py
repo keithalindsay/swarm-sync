@@ -244,7 +244,7 @@ def test_parcel_held_by_another_agent_denies_with_reason(monkeypatch, repo, inde
     # actionable pointer; and NOT the old misleading "retry shortly".
     assert "mod_a.py" in reason
     assert "agent-0" in reason
-    assert "renews while its holder is active" in reason
+    assert "renews while its holder stays active" in reason
     assert "/leases" in reason
     assert "retry shortly" not in reason
 
@@ -1193,6 +1193,81 @@ def test_fail_closed_tier_ignores_stale_contact(monkeypatch, repo):
     assert out == ""  # fail OPEN -- stale contact is not evidence of active coordination
 
 
+def test_zero_io_invocation_does_not_stamp_contact(monkeypatch, repo, tmp_path_factory):
+    """R6 adversarial review P1: completing a dispatch is NOT contact. A precheck whose
+    target resolves OUTSIDE the repo makes zero network calls, so it must NOT write the
+    last-contact stamp. The old unconditional post-dispatch stamp flipped a NEVER-started
+    server into fail-closed denials (a scratchpad Write stamped; the next in-repo Edit
+    found "recent contact" and denied) and the perpetual re-stamping defeated the 60s
+    self-heal after a deliberate server stop. Reverting the stamp-on-positive-contact
+    fix (`_ContactRecordingHttp`) makes both halves of this test fail."""
+    monkeypatch.setenv("SWARMSYNC_ACTIVE", "1")
+    outside = tmp_path_factory.mktemp("outside-the-repo") / "scratch.py"
+    outside.write_text("x = 1\n", encoding="utf-8")
+
+    def down_server(base_url):
+        return _ExplodingHttp()  # every REAL call would raise; zero-I/O paths never call
+
+    # 1) Out-of-repo Write completes with zero blackboard I/O -> must leave NO stamp.
+    payload = _payload("Write", file_path=str(outside), cwd=str(repo), agent_id="a1")
+    code, out, err = _run("precheck", payload, http_factory=down_server)
+    assert code == 0
+    assert not (repo / adapter.LAST_CONTACT_FILENAME).exists(), (
+        "zero-I/O invocation wrote a contact stamp -- fail-closed can now fire against "
+        "a server that was never up"
+    )
+
+    # 2) In-repo Edit against the never-up server: no stamp on record -> fail OPEN.
+    payload = _payload("Edit", file_path=str(repo / "mod_a.py"), cwd=str(repo), agent_id="a1")
+    code, out, err = _run("precheck", payload, http_factory=down_server)
+    assert code == 0
+    assert out == "", "never-started server must fail OPEN, not deny"
+
+
+def test_is_active_honors_marker_at_cwd_when_git_toplevel_differs(tmp_path):
+    """R6 adversarial review P2 (activation split): the guard checks the marker at
+    $CLAUDE_PROJECT_DIR while the adapter resolves repo_root to the git TOPLEVEL. With a
+    project dir that is a SUBDIR of a larger git repo, a marker at the project dir must
+    activate the adapter too -- previously no single marker location activated both
+    halves. Reverting the cwd check in `_is_active` fails this."""
+    toplevel = tmp_path / "monorepo"
+    (toplevel / ".git").mkdir(parents=True)
+    project = toplevel / "proj"
+    project.mkdir()
+    (project / ".swarmsync-active").touch()
+
+    assert adapter._is_active({}, toplevel, project) is True
+    # Sanity on both boundaries: no cwd arg -> old behavior (toplevel only, inactive
+    # here); marker at the toplevel alone still activates regardless of cwd.
+    assert adapter._is_active({}, toplevel) is False
+    (toplevel / ".swarmsync-active").touch()
+    assert adapter._is_active({}, toplevel, project) is True
+
+
+def test_marker_at_project_subdir_activates_dispatch_end_to_end(monkeypatch, tmp_path):
+    """End-to-end half of the activation-split fix: a payload whose cwd is a marker-
+    bearing SUBDIR of a bigger git repo must get past the opt-in gate (previously:
+    silent inactive no-op). The blackboard is down, so getting past the gate shows up
+    as the umbrella's fail-open stderr note instead of the inactive path's silence."""
+    monkeypatch.delenv("SWARMSYNC_ACTIVE", raising=False)
+    toplevel = tmp_path / "monorepo"
+    (toplevel / ".git").mkdir(parents=True)
+    project = toplevel / "proj"
+    project.mkdir()
+    (project / ".swarmsync-active").touch()
+    target = project / "x.py"
+    target.write_text("y = 2\n", encoding="utf-8")
+
+    payload = _payload("Edit", file_path=str(target), cwd=str(project), agent_id="a1")
+    code, out, err = _run("precheck", payload, http_factory=lambda base_url: _ExplodingHttp())
+    assert code == 0
+    assert out == ""  # no recent contact -> still fail OPEN, not a deny
+    assert err != "", (
+        "dispatch never engaged -- the marker at the project subdir did not activate "
+        "the adapter (activation split regressed)"
+    )
+
+
 # =====================================================================================
 # WP2.4 -- deny messages that inform (U3): consume LeaseResult.holder{,_ttl_expires_at}
 # =====================================================================================
@@ -1246,5 +1321,5 @@ def test_race_deny_consumes_acquire_result_without_second_leases_roundtrip(repo)
     reason = result["hookSpecificOutput"]["permissionDecisionReason"]
     assert "agent-Z" in reason
     assert "left on the current hold" in reason
-    assert "renews while its holder is active" in reason
+    assert "renews while its holder stays active" in reason
     assert client.leases_calls == 1, "deny path did a second /leases round-trip"
