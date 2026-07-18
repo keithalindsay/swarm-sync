@@ -65,6 +65,25 @@ CREATE TABLE IF NOT EXISTS intents (
   PRIMARY KEY (agent_id, task)
 );
 
+-- Projection of `integrate_started` events that have not yet reached a terminal
+-- verdict (merged | merge_rejected | integrate_orphaned). WP3.2, finding C3:
+-- startup crash-recovery (`coordinator.integrator.reconcile_orphaned_integrations`)
+-- reads THIS table -- O(open rows, in practice 0 or 1) -- instead of replaying the
+-- unbounded, heartbeat-dominated event log through a fixed window. Rows are
+-- INSERTed in the SAME transaction as the `integrate_started` emit and DELETEd in
+-- the same transaction as the terminal emit, so the table is exactly the set of
+-- integrates that died (or are still running) without a verdict; at startup --
+-- reconciliation runs before serving, integrate is serialized in-process -- any
+-- row present IS an orphan.
+CREATE TABLE IF NOT EXISTS open_integrations (
+  started_seq      INTEGER PRIMARY KEY,  -- seq of the integrate_started event
+  repo             TEXT NOT NULL,
+  branch           TEXT NOT NULL,
+  into_branch      TEXT NOT NULL,        -- the `into` trunk ("into" is an SQL keyword)
+  trunk_sha_before TEXT NOT NULL,        -- what to reset `into` back to
+  ts               REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS events (
   seq      INTEGER PRIMARY KEY AUTOINCREMENT,
   agent_id TEXT,
