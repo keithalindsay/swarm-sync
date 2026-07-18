@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Union
 
 from swarmsync.agent.client import BlackboardClient
+from swarmsync.blackboard.parcel_id import split as _split_parcel_id
 from swarmsync.classifier.indexer import parse_file
 from swarmsync.worktree import git_ops
 
@@ -117,12 +118,20 @@ class _Heartbeater:
             for lease_id in list(self._lease_ids):
                 try:
                     self._client.heartbeat(self._agent_id, lease_id)
-                except Exception:
+                except Exception as exc:
                     # A heartbeat failure (e.g. the server went away) must never
                     # crash the background thread -- it just means this beat is
                     # lost and the reaper may reclaim the lease, which is a
                     # legitimate outcome the runner's own protocol handles.
-                    pass
+                    # Logged (WP4.4/A8) so a blackboard dying mid-run leaves a
+                    # trace instead of silently losing every beat.
+                    logger.warning(
+                        "heartbeat for lease %s (agent %s) failed: %s -- beat "
+                        "lost; the reaper may reclaim the lease at TTL expiry",
+                        lease_id,
+                        self._agent_id,
+                        exc,
+                    )
 
     def stop(self) -> None:
         self._stop.set()
@@ -173,14 +182,27 @@ def _cleanup_worktree(
                 parked,
                 agent_id,
             )
-    except git_ops.GitOpsError:
+    except git_ops.GitOpsError as exc:
         # e.g. the branch was never created (the failure predates add_worktree);
         # nothing to park, and cleanup must never become the reason a run fails.
-        pass
+        logger.debug(
+            "cleanup for agent %s: park_branch failed (%s) -- usually the "
+            "branch was never created; continuing",
+            agent_id,
+            exc,
+        )
     try:
         git_ops.remove_worktree(repo, agent_id, delete_branch=delete_branch)
-    except git_ops.GitOpsError:
-        pass
+    except git_ops.GitOpsError as exc:
+        # Best-effort by design (there may be no worktree to remove, e.g. on
+        # the lease_denied path) -- but leave a trace (WP4.4/A8) instead of
+        # discarding the failure entirely.
+        logger.debug(
+            "cleanup for agent %s: remove_worktree failed (%s) -- there may "
+            "have been nothing to remove; continuing",
+            agent_id,
+            exc,
+        )
 
 
 def _state_summary(parcel, task: str) -> str:
@@ -342,7 +364,7 @@ def run_agent(
         # every lease held.
         updated_parcels: dict[str, str] = {}
         for parcel_id in target_parcels:
-            path, _, _symbol = parcel_id.partition("::")
+            path, _symbol = _split_parcel_id(parcel_id)
             fresh_parcels = parse_file(worktree / path, rel_path=path)
             match = next((p for p in fresh_parcels if p.id == parcel_id), None)
             if match is None:

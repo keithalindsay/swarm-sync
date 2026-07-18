@@ -261,5 +261,4 @@ class BlackboardClient:
             result = r.json()
         except ValueError:
             result = {"detail": r.text}
-        result["_status_code"] = r.status_code
         return result
