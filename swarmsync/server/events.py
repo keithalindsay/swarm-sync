@@ -20,6 +20,12 @@ tail(conn, since_seq=0, limit=1000) -> list[Event]
     schema column) -- callers that want the structured payload call
     `json.loads(ev.payload)` themselves.
 
+compact_events(conn, heartbeat_max_age=None, max_age=None, now=None) -> int
+    Retention/compaction for the `events` table (WP3.1, finding S2): prune
+    heartbeat-class events older than a short window and ANY event older than a
+    long horizon, never touching a seq referenced by
+    `open_integrations.started_seq`. See its docstring for the full contract.
+
 Also houses pheromone helpers (drop/decay) since they ride the same event
 stream (DESIGN §2's "decaying pheromone trails"):
 
@@ -42,6 +48,7 @@ decay_pheromone(conn, half_life, ts=None) -> int
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 from typing import Any, Optional, get_args
@@ -49,6 +56,49 @@ from typing import Any, Optional, get_args
 from swarmsync.blackboard.models import EventType, Event, Pheromone
 
 _VALID_EVENT_TYPES = frozenset(get_args(EventType))
+
+# --- WP3.1 (finding S2): events retention/compaction ------------------------------
+
+# The marker event one compaction pass leaves behind when it pruned anything.
+# NOT in `blackboard.models.EventType`: the registry (and the schema comment
+# mirroring it) is owned by models.py, which is frozen to a parallel work
+# package -- so `compact_events` INSERTs this row directly (bypassing `emit`'s
+# registry check, deliberately and only here) and `tail` constructs it without
+# Literal validation. The events table has no CHECK on `type`, so the row is
+# schema-legal.
+EVENTS_COMPACTED = "events_compacted"
+
+# Heartbeat-class event types: the per-renewal keepalive traffic that dominates
+# the log's growth. From reading every emit site: `heartbeat`
+# (`server/leases.py::heartbeat`) is emitted on EVERY successful TTL renewal --
+# each agent renews each held lease every few seconds for as long as it works,
+# so these rows outnumber everything else by orders of magnitude. Every other
+# type is per-action (planned / lease_granted / lease_denied / done / released /
+# reaped / merge verdicts / reindexed / needs_rebase / integrate_*) and carries
+# real audit value, so only `heartbeat` gets the short retention window.
+HEARTBEAT_EVENT_TYPES = frozenset({"heartbeat"})
+
+# Short window for heartbeat-class events, in seconds (default 1 hour).
+DEFAULT_HEARTBEAT_MAX_AGE = 3600.0
+HEARTBEAT_MAX_AGE_ENV = "SWARMSYNC_EVENTS_HEARTBEAT_MAX_AGE"
+
+# Long horizon for ANY event, in seconds (default 7 days).
+DEFAULT_EVENT_MAX_AGE = 7 * 86400.0
+EVENT_MAX_AGE_ENV = "SWARMSYNC_EVENTS_MAX_AGE"
+
+
+def _age_from_env(env_var: str, default: float) -> float:
+    """Positive float from `env_var`, else `default` (unset/garbage/non-positive
+    fall back rather than raise -- same posture as `app._max_body_bytes`)."""
+    raw = os.environ.get(env_var)
+    if raw:
+        try:
+            value = float(raw)
+        except ValueError:
+            return default
+        if value > 0:
+            return value
+    return default
 
 
 def emit(
@@ -97,7 +147,103 @@ def tail(
         "SELECT * FROM events WHERE seq > ? ORDER BY seq ASC LIMIT ?",
         (since_seq, limit),
     ).fetchall()
-    return [Event.model_validate(dict(row)) for row in rows]
+    out: list[Event] = []
+    for row in rows:
+        data = dict(row)
+        if data["type"] in _VALID_EVENT_TYPES:
+            out.append(Event.model_validate(data))
+        else:
+            # Maintenance rows (`events_compacted`) carry a type outside the frozen
+            # EventType registry (owned by models.py -- see EVENTS_COMPACTED above).
+            # They come from our own compactor writing our own table, so constructing
+            # without Literal validation is safe; dropping them instead would hide
+            # the compaction audit trail from every tailer.
+            out.append(Event.model_construct(**data))
+    return out
+
+
+def compact_events(
+    conn: sqlite3.Connection,
+    heartbeat_max_age: Optional[float] = None,
+    max_age: Optional[float] = None,
+    now: Optional[float] = None,
+) -> int:
+    """One retention/compaction pass over `events` (WP3.1, finding S2). Returns
+    the number of rows pruned (0 on a no-op).
+
+    Prunes, in ONE statement:
+      * heartbeat-class events (`HEARTBEAT_EVENT_TYPES` -- the keepalive renewals
+        that dominate growth) older than `heartbeat_max_age` (default
+        `SWARMSYNC_EVENTS_HEARTBEAT_MAX_AGE` env or 1 hour);
+      * ANY event older than `max_age` (default `SWARMSYNC_EVENTS_MAX_AGE` env or
+        7 days);
+      * NEVER an event whose `seq` appears in `open_integrations.started_seq`:
+        an `integrate_started` row with no terminal verdict is exactly what
+        startup crash-recovery resets trunk from, so those starts survive
+        unconditionally, however old.
+
+    When anything was pruned, ONE `events_compacted` marker event is inserted
+    carrying the pruned count and the [seq_min, seq_max] range; a no-op pass
+    inserts nothing (the compactor must not become its own growth source).
+
+    Recovery-safety: since WP3.2 (finding C3), crash recovery
+    (`coordinator.integrator.reconcile_orphaned_integrations`) reads the
+    `open_integrations` PROJECTION, not the event log -- so compaction cannot
+    break recovery. The events table is an audit log; SQLite table state is the
+    source of truth. The `started_seq` guard above additionally keeps the
+    audit row behind any still-open integrate intact.
+
+    Deletes are seq-keyed (the PRIMARY KEY), and the audit-valued history
+    (merged / integrate_orphaned / ...) younger than `max_age` is untouched --
+    only heartbeat-class types get the short window.
+    """
+    now = now if now is not None else time.time()
+    hb_age = (
+        heartbeat_max_age
+        if heartbeat_max_age is not None
+        else _age_from_env(HEARTBEAT_MAX_AGE_ENV, DEFAULT_HEARTBEAT_MAX_AGE)
+    )
+    horizon = (
+        max_age if max_age is not None else _age_from_env(EVENT_MAX_AGE_ENV, DEFAULT_EVENT_MAX_AGE)
+    )
+
+    type_marks = ",".join("?" * len(HEARTBEAT_EVENT_TYPES))
+    # RETURNING seq: the pruned count and seq range come off this statement's own
+    # result set (house style -- same reason emit uses RETURNING), no second read.
+    rows = conn.execute(
+        f"""
+        DELETE FROM events
+        WHERE ((type IN ({type_marks}) AND ts <= ?) OR ts <= ?)
+          AND seq NOT IN (SELECT started_seq FROM open_integrations)
+        RETURNING seq
+        """,  # noqa: S608 - type_marks is derived from a module constant, never caller input
+        (*sorted(HEARTBEAT_EVENT_TYPES), now - hb_age, now - horizon),
+    ).fetchall()
+    if not rows:
+        return 0
+
+    seqs = [row["seq"] for row in rows]
+    # Direct INSERT, not `emit`: EVENTS_COMPACTED is outside the models.py
+    # EventType registry (frozen to a parallel WP; see the constant's comment),
+    # and emit's registry check must stay strict for every other caller.
+    conn.execute(
+        "INSERT INTO events (agent_id, type, payload, ts) VALUES (?, ?, ?, ?)",
+        (
+            None,
+            EVENTS_COMPACTED,
+            json.dumps(
+                {
+                    "pruned": len(seqs),
+                    "seq_min": min(seqs),
+                    "seq_max": max(seqs),
+                    "heartbeat_max_age": hb_age,
+                    "max_age": horizon,
+                }
+            ),
+            now,
+        ),
+    )
+    return len(seqs)
 
 
 def drop_pheromone(

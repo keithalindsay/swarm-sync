@@ -38,7 +38,9 @@ externally (the broker's own lock, U12, is now belt-and-suspenders).
 The background reaper + pheromone-decay loop (U11) is wired into the app's
 lifespan: `create_app`'s lifespan starts `coordinator.reaper.run(conn,
 interval=reaper_interval, half_life=pheromone_half_life)` as an
-`asyncio.create_task` right after startup and cancels + awaits it on shutdown.
+`asyncio.create_task` right after startup; on shutdown it signals the reaper's
+stop event and AWAITS the task (WP3.1 P2 -- so an in-flight pass finishes before
+its connection closes; cancel is only the past-timeout fallback).
 Pass `reaper_interval=None` to `create_app` to disable the background loop
 entirely (e.g. a test that wants a fully quiet blackboard and drives
 `reaper.reap_once`/`decay_once` itself instead).
@@ -69,7 +71,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional, Union
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
@@ -110,6 +112,38 @@ class IndexBody(BaseModel):
 class ReleaseBody(BaseModel):
     agent_id: str
     lease_id: int
+
+
+class EventOut(Event):
+    """`GET /events` response row. Identical to `blackboard.models.Event` except
+    `type` is widened to `str`: the log legitimately contains maintenance rows
+    (`events.EVENTS_COMPACTED`) whose type is outside the frozen EventType
+    registry (models.py is owned by a parallel work package -- see
+    `server.events.EVENTS_COMPACTED`), and FastAPI re-validates the response
+    against this model, so the Literal would 500 any page containing one."""
+
+    type: str  # type: ignore[assignment]  # deliberate widening of the Literal
+
+
+# --- WP3.1 (finding S2): GET /events?limit= clamp ---------------------------------
+# The endpoint previously accepted ANY limit -- `?limit=999999999` materialized the
+# whole (unboundedly growing) events table into memory and one JSON response, and a
+# NEGATIVE limit did too (SQLite treats `LIMIT -1` as "no limit"). Out-of-range
+# values are now a 422 validation error, NOT a silent clamp: a caller that asked
+# for a million rows and silently got 1000 would believe it saw everything below
+# `since + 1_000_000` and skip ahead, silently dropping events; a loud 422 matches
+# how every other malformed field here already fails (e.g. LeaseRequest.ttl) and
+# tells the caller to page with `since` instead. Default stays 1000, unchanged.
+
+MAX_EVENTS_LIMIT = 1000
+
+# --- WP3.1 (P2): graceful-reaper-shutdown ceiling, in seconds ---------------------
+# How long lifespan shutdown waits for the reaper to finish its in-flight pass and
+# exit after the stop event is set, before falling back to task cancellation. A
+# pass is a handful of SQLite statements whose worst case is a few 5s busy-timeout
+# waits, so 30s is generous; past it the worker is presumed wedged and cancel is
+# the least-bad option.
+REAPER_SHUTDOWN_TIMEOUT = 30.0
 
 
 # --- WP3.3 (finding S5): request body-size cap -----------------------------------
@@ -274,7 +308,8 @@ def create_app(
     so `conn` is closed cleanly on shutdown for callers that do use it (or run
     the app under uvicorn) -- and that lifespan is also where the reaper +
     pheromone-decay loop (U11, `coordinator.reaper.run`) is started as a
-    background `asyncio` task and cleanly cancelled on shutdown.
+    background `asyncio` task and cleanly stopped (stop event + await, WP3.1 P2)
+    on shutdown.
 
     `reaper_interval=None` disables the background loop entirely (no task is
     created) -- useful for a test that wants full manual control over when
@@ -318,32 +353,52 @@ def create_app(
 
         task = None
         reaper_conn = None
+        reaper_stop: Optional[asyncio.Event] = None
         if reaper_interval is not None:
             # The reaper is a long-lived background task on the event loop thread;
             # give it its OWN connection so it never shares a handle with a request
             # handler or the inspection connection. WAL lets its periodic writes
             # (reaped rows + events) run concurrently with reader requests.
             reaper_conn = db.connect(db_path)
+            reaper_stop = asyncio.Event()
             task = asyncio.create_task(
                 reaper_mod.run(
                     reaper_conn,
                     interval=reaper_interval,
                     half_life=pheromone_half_life,
+                    stop=reaper_stop,
                 )
             )
         yield
-        if task is not None:
-            task.cancel()
+        if task is not None and reaper_stop is not None:
+            # WP3.1 P2: deterministic shutdown, NOT task.cancel(). Cancelling only
+            # interrupts the AWAIT on `asyncio.to_thread`, never the worker thread
+            # inside it -- run() would return while `reap_once`/`decay_once` was
+            # still executing on `reaper_conn`, and the close() below would yank the
+            # connection out from under that thread (`ProgrammingError: Cannot
+            # operate on a closed database` into a discarded future; closing a
+            # handle mid-`sqlite3_step` is documented SQLite misuse and has
+            # segfaulted the test suite). Instead: signal the stop event, then WAIT
+            # for run() to finish its in-flight pass and exit cleanly -- only after
+            # that do the connections close. The timeout is generous (worst-case
+            # pass is a few 5s busy_timeout waits, not 30s); cancellation survives
+            # only as the past-timeout last resort for a wedged worker.
+            reaper_stop.set()
             try:
-                await task
-            except asyncio.CancelledError:
-                pass
+                await asyncio.wait_for(task, timeout=REAPER_SHUTDOWN_TIMEOUT)
+            except asyncio.TimeoutError:
+                # wait_for already cancelled the task and awaited that cancellation;
+                # nothing more can be done safely -- log and fall through to close.
+                print(
+                    "swarm-sync: reaper did not stop within "
+                    f"{REAPER_SHUTDOWN_TIMEOUT}s; cancelled",
+                    flush=True,
+                )
             except Exception as exc:  # noqa: BLE001
                 # The reaper is hardened to never die on a transient error (finding
-                # C4), but if the task ever stored ANY exception, `await task`
-                # re-raises it here. Catching only CancelledError let that abort
-                # teardown BEFORE the connection closes below, leaking handles. Log
-                # and press on so the reaper/inspection connections always close.
+                # C4), but if the task ever stored ANY exception, awaiting it
+                # re-raises here. Aborting teardown would leak the connections
+                # below. Log and press on so they always close.
                 print(f"swarm-sync: reaper task exited with error: {exc!r}", flush=True)
         if reaper_conn is not None:
             reaper_conn.close()
@@ -656,8 +711,14 @@ def create_app(
 
     # --- GET /events?since= --------------------------------------------------------
 
-    @app.get("/events", response_model=list[Event])
-    def get_events(since: int = 0, limit: int = 1000, conn=Depends(get_conn)):
+    @app.get("/events", response_model=list[EventOut])
+    def get_events(
+        since: int = 0,
+        # WP3.1 S2: bounded surface -- see the MAX_EVENTS_LIMIT comment above.
+        # `since` semantics are untouched (any int, page forward from that seq).
+        limit: int = Query(default=1000, ge=0, le=MAX_EVENTS_LIMIT),
+        conn=Depends(get_conn),
+    ):
         return events_mod.tail(conn, since_seq=since, limit=limit)
 
     # --- POST /integrate -----------------------------------------------------------

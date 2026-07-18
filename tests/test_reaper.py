@@ -428,3 +428,137 @@ def test_reaper_interval_none_disables_background_loop(tmp_path):
         ).fetchone()
         # nothing is running the loop -> stays active (merely expired-but-unmarked)
         assert row["status"] == "active"
+
+
+# --- WP3.1 (S2): events compaction wired into the reaper cadence -------------------
+
+
+@pytest.mark.asyncio
+async def test_run_compacts_old_heartbeat_events(conn):
+    """End-to-end wiring: a bounded run() prunes stale heartbeat-class events and
+    leaves the events_compacted marker. (Pre-fix reproduction: 200+ month-old
+    heartbeat rows survived any number of reaper passes -- nothing pruned, ever.)"""
+    old = time.time() - 30 * 86400
+    for _ in range(20):
+        events.emit(conn, "heartbeat", "agent-x", {"lease_id": 1}, ts=old)
+
+    await reaper.run(conn, interval=0.0, half_life=60.0, iterations=1)
+
+    remaining = conn.execute(
+        "SELECT type, COUNT(*) AS n FROM events GROUP BY type"
+    ).fetchall()
+    by_type = {r["type"]: r["n"] for r in remaining}
+    assert "heartbeat" not in by_type
+    assert by_type == {events.EVENTS_COMPACTED: 1}
+
+
+@pytest.mark.asyncio
+async def test_run_throttles_compaction_to_one_per_interval(conn, monkeypatch):
+    """At most one compaction per compact_interval regardless of reaper cadence."""
+    calls = {"n": 0}
+    real = events.compact_events
+
+    def counting(*args, **kwargs):
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(events, "compact_events", counting)
+
+    await reaper.run(conn, interval=0.0, half_life=60.0, iterations=5,
+                     compact_interval=3600.0)
+    assert calls["n"] == 1  # first pass compacts; the throttle holds for the rest
+
+    calls["n"] = 0
+    await reaper.run(conn, interval=0.0, half_life=60.0, iterations=5,
+                     compact_interval=0.0)
+    assert calls["n"] == 5  # zero throttle -> every pass compacts
+
+
+def test_compact_interval_env_knob(monkeypatch):
+    monkeypatch.delenv(reaper.COMPACT_INTERVAL_ENV, raising=False)
+    assert reaper._compact_interval_from_env() == reaper.DEFAULT_COMPACT_INTERVAL
+    monkeypatch.setenv(reaper.COMPACT_INTERVAL_ENV, "5.5")
+    assert reaper._compact_interval_from_env() == 5.5
+    monkeypatch.setenv(reaper.COMPACT_INTERVAL_ENV, "garbage")
+    assert reaper._compact_interval_from_env() == reaper.DEFAULT_COMPACT_INTERVAL
+    monkeypatch.setenv(reaper.COMPACT_INTERVAL_ENV, "-1")
+    assert reaper._compact_interval_from_env() == reaper.DEFAULT_COMPACT_INTERVAL
+
+
+# --- WP3.1 (P2): deterministic shutdown -- stop event, no orphaned worker ----------
+
+
+@pytest.mark.asyncio
+async def test_run_stop_event_set_before_start_runs_no_pass(conn, monkeypatch):
+    calls = {"n": 0}
+
+    def counting_reap(c, now=None):
+        calls["n"] += 1
+        return []
+
+    monkeypatch.setattr(reaper, "reap_once", counting_reap)
+    stop = __import__("asyncio").Event()
+    stop.set()
+    await reaper.run(conn, interval=0.0, half_life=60.0, stop=stop)
+    assert calls["n"] == 0  # exited before any pass
+
+
+@pytest.mark.asyncio
+async def test_run_stop_event_wakes_sleep_and_exits(conn):
+    """Setting stop mid-sleep exits promptly -- no wait for a long interval."""
+    import asyncio
+
+    stop = asyncio.Event()
+    task = asyncio.create_task(
+        reaper.run(conn, interval=60.0, half_life=60.0, stop=stop)
+    )
+    await asyncio.sleep(0.2)  # first pass done; loop is in its 60s sleep
+    stop.set()
+    await asyncio.wait_for(task, timeout=2.0)  # would time out pre-fix (60s sleep)
+
+
+def test_lifespan_shutdown_lets_inflight_pass_finish(tmp_path, monkeypatch):
+    """P2 regression, reproduced with a PoC before the fix.
+
+    Pre-fix: lifespan shutdown did `task.cancel()`; the CancelledError interrupts
+    the AWAIT on `asyncio.to_thread`, not the WORKER thread inside it -- run()
+    returned while `reap_once` still executed on the reaper's connection, the
+    lifespan closed that connection, and the worker hit `sqlite3.ProgrammingError:
+    Cannot operate on a closed database` into a discarded future (worst case:
+    closing a handle mid-`sqlite3_step` is documented SQLite misuse; observed once
+    as a suite segfault). This PoC captured exactly that ProgrammingError on the
+    pre-fix code.
+
+    Post-fix: the lifespan sets the reaper's stop event and AWAITS the task, so
+    the in-flight pass completes against a live connection before close.
+    Mutation check: reverting the lifespan to plain task.cancel() fails this test.
+    """
+    import sqlite3 as sqlite3_mod
+    import threading
+
+    from fastapi.testclient import TestClient
+
+    errors: list[BaseException] = []
+    finished = threading.Event()
+
+    def slow_reap(c, now=None):
+        time.sleep(0.3)  # keep the pass in flight across the lifespan shutdown
+        try:
+            c.execute("SELECT 1").fetchone()  # touches the reaper's connection
+        except Exception as exc:  # pragma: no cover - the pre-fix failure path
+            errors.append(exc)
+        finally:
+            finished.set()
+        return []
+
+    monkeypatch.setattr(reaper, "reap_once", slow_reap)
+
+    app = create_app(tmp_path / "blackboard.db", reaper_interval=0.05)
+    with TestClient(app):
+        time.sleep(0.1)  # first pass is mid-sleep inside the to_thread worker
+
+    # Shutdown has returned. The worker must have FINISHED (not been orphaned past
+    # the close) and must never have seen a closed connection.
+    assert finished.wait(2.0), "in-flight reaper pass never completed"
+    assert errors == [], f"worker touched a closed connection: {errors!r}"
+    assert not any(isinstance(e, sqlite3_mod.ProgrammingError) for e in errors)
