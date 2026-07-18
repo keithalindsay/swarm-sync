@@ -80,6 +80,13 @@ EXPECTED_TABLES = (
 BUSY_TIMEOUT_SECONDS = 5.0
 
 
+def _pow_fallback(base: float, exponent: float) -> float:
+    """Python stand-in for SQLite's `pow()` on builds compiled without
+    SQLITE_ENABLE_MATH_FUNCTIONS (see `_configure`). Matches the built-in's
+    always-REAL result for the arguments the decay statement passes."""
+    return float(base) ** float(exponent)
+
+
 def _configure(conn: sqlite3.Connection) -> None:
     """Apply the pragmas + row factory every connection to the blackboard must use."""
     conn.row_factory = sqlite3.Row
@@ -98,6 +105,18 @@ def _configure(conn: sqlite3.Connection) -> None:
     # every earlier, single-threaded unit's tests (only engages under real
     # contention, which none of them exercised).
     conn.execute(f"PRAGMA busy_timeout = {int(BUSY_TIMEOUT_SECONDS * 1000)}")
+    # C15 (WP4.5): `events.decay_pheromone` decays every pheromone row in ONE
+    # UPDATE (`strength * pow(0.5, dt / half_life)`) so each row decays from its
+    # current committed value atomically. SQLite's `pow()` only exists when the
+    # library was compiled with SQLITE_ENABLE_MATH_FUNCTIONS -- true on this
+    # dev box, not guaranteed everywhere Python ships. Probe once per connection
+    # and register a deterministic Python fallback when the build lacks it, so
+    # every blackboard connection can run the decay statement. `deterministic=True`
+    # lets SQLite treat it like the built-in (safe in indexes/partial evaluation).
+    try:
+        conn.execute("SELECT pow(2.0, 2.0)")
+    except sqlite3.OperationalError:
+        conn.create_function("pow", 2, _pow_fallback, deterministic=True)
 
 
 def connect(path: StrPath) -> sqlite3.Connection:
