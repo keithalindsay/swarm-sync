@@ -48,11 +48,14 @@ run(conn, interval=1.0, half_life=DEFAULT_HALF_LIFE, iterations=None) -> None (a
 from __future__ import annotations
 
 import asyncio
+import logging
 import sqlite3
 import time
 from typing import Optional
 
 from swarmsync.server import events as events_mod
+
+logger = logging.getLogger(__name__)
 
 # Pheromone half-life, in seconds. Not prescribed by DESIGN.md (U6's handoff
 # note explicitly leaves this constant for U11 to pick) -- 60s means a signal
@@ -161,12 +164,41 @@ async def run(
     Each pass runs immediately (reap/decay first, sleep after) so a single-shot
     `iterations=1` call actually reaps/decays before returning, rather than only
     sleeping once and doing nothing.
+
+    Resilience (finding C4):
+
+    * Each pass runs OFF the event-loop thread via `asyncio.to_thread`. `reap_once`
+      and `decay_once` are blocking SQLite calls on a connection whose
+      `busy_timeout` is 5s (`db._configure`); running them inline on the loop
+      thread would freeze the entire ASGI server for up to that long on any
+      contended write, every interval. Offloading keeps the loop responsive. The
+      reaper's dedicated `conn` is used ONLY from these `to_thread` workers and the
+      passes are awaited sequentially, so at most one thread ever touches the
+      connection at a time -- the same "sequential hand-off across threadpool
+      workers" guarantee `server.app.get_conn` relies on, and safe because
+      `db.connect` opens the handle with `check_same_thread=False` under SQLite's
+      serialized threading mode.
+    * Each pass is wrapped in try/except: a transient error (e.g.
+      `sqlite3.OperationalError: database is locked` when a write loses the
+      busy-timeout race) is logged at WARNING with its traceback and the loop
+      CONTINUES. The reaper must never die on a transient error -- previously an
+      unguarded raise killed the task for the rest of the process lifetime (no
+      reaping, no pheromone decay, and nothing observed the dead task).
+      `asyncio.CancelledError` is a `BaseException`, not caught here, so the
+      documented `task.cancel()` shutdown path still propagates cleanly.
     """
     done = 0
     while True:
         now = time.time()
-        reap_once(conn, now)
-        decay_once(conn, half_life, ts=now)
+        try:
+            # Off-thread so a contended 5s busy_timeout write cannot stall the loop.
+            await asyncio.to_thread(reap_once, conn, now)
+            await asyncio.to_thread(decay_once, conn, half_life, now)
+        except Exception:
+            # Never let a transient error kill the reaper: log + continue. (Does not
+            # catch CancelledError, which is a BaseException -- cancellation still
+            # propagates out of run() as the intended shutdown path.)
+            logger.warning("reaper pass failed; continuing", exc_info=True)
         done += 1
         if iterations is not None and done >= iterations:
             return

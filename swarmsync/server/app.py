@@ -314,6 +314,13 @@ def create_app(
                 await task
             except asyncio.CancelledError:
                 pass
+            except Exception as exc:  # noqa: BLE001
+                # The reaper is hardened to never die on a transient error (finding
+                # C4), but if the task ever stored ANY exception, `await task`
+                # re-raises it here. Catching only CancelledError let that abort
+                # teardown BEFORE the connection closes below, leaking handles. Log
+                # and press on so the reaper/inspection connections always close.
+                print(f"swarm-sync: reaper task exited with error: {exc!r}", flush=True)
         if reaper_conn is not None:
             reaper_conn.close()
         conn.close()
