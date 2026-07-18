@@ -421,6 +421,13 @@ def test_empty_stdin_fails_open_allow(monkeypatch, repo, indexed_client):
 
 def test_postupdate_rehashes_file_and_updates_parcel(monkeypatch, repo, indexed_client):
     monkeypatch.setenv("SWARMSYNC_ACTIVE", "1")
+    # The real flow is PreToolUse (precheck acquires the write lease) -> edit ->
+    # PostToolUse (postupdate). /parcel/update now requires the caller to hold that
+    # lease (C5), so mirror the precheck by acquiring it as the same agent first.
+    assert indexed_client.post(
+        "/lease",
+        json={"agent_id": "agent-1", "parcel_id": f"mod_a.py::{MODULE_SYMBOL}", "mode": "write"},
+    ).json()["granted"]
     # Simulate the tool having already applied the edit on disk (PostToolUse
     # fires after the edit), then this hook re-derives the hash from it.
     (repo / "mod_a.py").write_text(
@@ -446,6 +453,13 @@ def test_postupdate_is_deterministic_for_unchanged_content(monkeypatch, repo, in
     second run (DESIGN's `state_summary` heuristic is deterministic, no
     wall-clock/random component)."""
     monkeypatch.setenv("SWARMSYNC_ACTIVE", "1")
+    # Hold the write lease so postupdate is actually allowed to mutate the parcel
+    # (C5) -- otherwise both updates are refused and `first == second` passes
+    # vacuously without exercising the state_summary heuristic at all.
+    assert indexed_client.post(
+        "/lease",
+        json={"agent_id": "agent-1", "parcel_id": f"mod_a.py::{MODULE_SYMBOL}", "mode": "write"},
+    ).json()["granted"]
     payload = _payload("Edit", file_path=str(repo / "mod_a.py"), cwd=str(repo), agent_id="agent-1")
 
     _run("postupdate", payload, http_factory=_http_factory(indexed_client))
@@ -458,6 +472,8 @@ def test_postupdate_is_deterministic_for_unchanged_content(monkeypatch, repo, in
         f"mod_a.py::{MODULE_SYMBOL}"
     ]["state_summary"]
 
+    # The update genuinely landed (not a vacuous refusal) AND is deterministic.
+    assert "agent-1" in first
     assert first == second
 
 
@@ -670,6 +686,11 @@ def test_postupdate_pushes_dirty_marker_when_edit_is_unparseable(
     good_hash = {p["id"]: p for p in indexed_client.get("/parcels").json()}[parcel_id][
         "content_hash"
     ]
+    # Real flow holds the write lease from the PreToolUse precheck; /parcel/update
+    # requires it (C5), so acquire it as the same agent before postupdate.
+    assert indexed_client.post(
+        "/lease", json={"agent_id": "a1", "parcel_id": parcel_id, "mode": "write"}
+    ).json()["granted"]
 
     # simulate the edit having left mod_a.py with a syntax error on disk.
     (repo / "mod_a.py").write_text(
