@@ -161,6 +161,13 @@ swarm-sync coordinates agents two ways, and a contributor must not confuse them:
   for `Edit`/`Write`-family tools, so a `Bash` write (`sed -i`, `cat >`) bypasses it entirely. The
   hook path is a cooperative protocol among well-behaved agents, not a sandbox.
 
+  One configuration constraint follows from how the hook keys its parcel ids: it resolves them
+  relative to the **git toplevel** of the edited file's repo, so on the hook path the server's
+  managed root (`swarmsync-serve --root`) must **be** that git toplevel. Serving a *subdirectory*
+  of a larger git repo as the managed root is a broker-path-only configuration today — the hook
+  would key ids off the toplevel and mint parcels the server doesn't recognize. (Teaching the hook
+  to discover the server's root at session start is the planned lift; see IMPROVEMENT_PLAN Phase 5.)
+
 ### Hook coordination identity has a Claude Code version floor
 
 The hook derives each edit's lease identity from the payload (`hooks/adapter.py::_agent_id`): a

@@ -230,17 +230,25 @@ _USAGE = (
 # --- activation ----------------------------------------------------------------
 
 
-def _is_active(env: Mapping[str, str], repo_root: Path) -> bool:
+def _is_active(env: Mapping[str, str], repo_root: Path, cwd: Optional[Path] = None) -> bool:
     """DESIGN-adjacent opt-in gate (see module docstring, requirement 1).
 
     `SWARMSYNC_ACTIVE=1` wins outright (e.g. CI/demo runs that always want
     enforcement without touching the filesystem); otherwise a
-    `.swarmsync-active` marker file at the resolved repo root is the durable,
-    per-repo way to turn this on without exporting an env var in every shell.
+    `.swarmsync-active` marker file activates coordination. The marker is
+    honored at EITHER the resolved repo root (the git toplevel, where parcel
+    ids are keyed) OR the payload `cwd` (the Claude Code project dir, where
+    `swarmsync-hook-guard` looks via $CLAUDE_PROJECT_DIR). Checking both closes
+    an activation split: with a project dir that is a SUBDIR of a larger git
+    repo, a marker at the project dir launched the guard but the adapter
+    (checking only the toplevel) no-opped -- no single marker location could
+    activate both halves.
     """
     if env.get("SWARMSYNC_ACTIVE") == "1":
         return True
-    return (repo_root / ACTIVE_MARKER_FILENAME).exists()
+    if (repo_root / ACTIVE_MARKER_FILENAME).exists():
+        return True
+    return cwd is not None and (cwd / ACTIVE_MARKER_FILENAME).exists()
 
 
 # --- file_path -> parcel id ------------------------------------------------------
@@ -323,23 +331,25 @@ def _deny_response(
 
     The reason names the file, the holding agent, and -- when known -- roughly how much
     TTL is left on the hold, plus the crucial caveat that a hook lease RENEWS on every
-    precheck/postupdate while its holder is active, so it does NOT lapse on its own. The
-    old "retry shortly" wording was removed precisely because it was misleading: telling
-    an agent to wait for a lease that keeps renewing sends it into a busy-wait that never
-    clears. The actionable pointer (`GET <url>/leases`) lets the agent inspect the live
-    holder set instead. All fields come from the acquire/leases response already in hand
-    -- no second round-trip (WP2.4 consumes `LeaseResult.holder{,_ttl_expires_at}`)."""
+    precheck/postupdate while its holder stays active. The old "retry shortly" wording
+    was removed because it sent agents into a busy-wait against a renewing lease; but
+    the caveat deliberately stops short of "it will never lapse" -- a CRASHED holder
+    stops renewing and its TTL does expire, so retrying after the remaining TTL is a
+    legitimate strategy. Wording also avoids claiming the blocking lease's mode (the
+    tie-broken blocker can be a reader; the acquire response does not carry its mode).
+    The actionable pointer (`GET <url>/leases`) lets the agent inspect the live holder
+    set instead. All fields come from the acquire response already in hand -- no second
+    round-trip (WP2.4 consumes `LeaseResult.holder{,_ttl_expires_at}`)."""
     url = os.environ.get("SWARMSYNC_URL", DEFAULT_SWARMSYNC_URL)
     if holder_ttl_expires_at is not None:
         remaining = max(0.0, holder_ttl_expires_at - time.time())
-        ttl_note = f"~{remaining:.0f}s left on the current hold, "
+        ttl_note = f"~{remaining:.0f}s left on the current hold; "
     else:
         ttl_note = ""
     reason = (
-        f"swarm-sync: {relpath} holds a write lease owned by {owner} "
-        f"({ttl_note}but the hold renews while its holder is active, so it will not "
-        f"lapse on its own). Pick different work; inspect current holders with "
-        f"GET {url}/leases."
+        f"swarm-sync: {relpath} is leased by {owner} "
+        f"({ttl_note}the hold renews while its holder stays active). Pick different "
+        f"work; inspect current holders with GET {url}/leases."
     )
     return {
         "hookSpecificOutput": {
@@ -608,13 +618,44 @@ def _repo_root(payload: Mapping[str, Any]) -> Path:
 # --- C10 two-tier fail policy: last-successful-contact marker ---------------------
 
 
+class _ContactRecordingHttp:
+    """Wraps the http object so `_dispatch` gets POSITIVE evidence of blackboard
+    contact: `contacted` flips True only when a get/post RETURNED (any status --
+    even a 500 proves the server is alive, which is the question the two-tier
+    fail policy asks). A call that raises propagates unchanged and never counts.
+
+    This exists because "the subcommand finished without raising" is NOT contact:
+    precheck/postupdate with an out-of-repo target, a non-edit tool_name, or an
+    unrecognized subcommand all complete without a single network call, and an
+    unconditional post-dispatch stamp on those paths flipped a NEVER-STARTED
+    server into fail-closed denials (a scratchpad Write would stamp, then the
+    next in-repo Edit found a "recent contact" and denied) -- the exact broken
+    setup the policy promises stays fail-open, and the perpetual re-stamping
+    also defeated the 60s self-heal after a deliberate server stop."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self.contacted = False
+
+    def get(self, url: str, **kwargs: Any) -> Any:
+        response = self._inner.get(url, **kwargs)
+        self.contacted = True
+        return response
+
+    def post(self, url: str, **kwargs: Any) -> Any:
+        response = self._inner.post(url, **kwargs)
+        self.contacted = True
+        return response
+
+
 def _record_contact(repo_root: Path) -> None:
     """Stamp `repo_root/.swarmsync-last-contact` with the current wall-clock time.
 
-    Called after a subcommand talked to the blackboard WITHOUT error, so a later
-    unreachable-blackboard failure can tell contention (recent stamp) from absence
-    (no/stale stamp). Best-effort: a read-only tree or any write error is swallowed --
-    a missing stamp only costs us the fail-CLOSED tier (we fall back to fail-open),
+    Called ONLY after the blackboard positively answered an HTTP call this
+    invocation (see `_ContactRecordingHttp`), so a later unreachable-blackboard
+    failure can tell contention (recent stamp) from absence (no/stale stamp).
+    Best-effort: a read-only tree or any write error is swallowed -- a missing
+    stamp only costs us the fail-CLOSED tier (we fall back to fail-open),
     which is the safe direction."""
     try:
         (repo_root / LAST_CONTACT_FILENAME).write_text(str(time.time()), encoding="utf-8")
@@ -646,12 +687,20 @@ def _maybe_fail_closed(
       - a successful blackboard contact was recorded recently (server is real and was
         up moments ago -> this silence is contention, not a broken setup), AND
       - the payload actually names an in-repo edit target to gate.
+
+    Scope note: this tier engages on ANY exception the umbrella caught during an
+    actively-coordinating precheck -- unreachability, a timeout, a 5xx, or a bug in
+    the precheck path itself. That widening is deliberate: once a recent POSITIVE
+    contact is on record (see `_ContactRecordingHttp` -- the stamp is written only
+    when the server actually answered), an error mid-coordination means the gate
+    could not be consulted, and un-gating the shared tree is the worse failure.
     """
     if subcommand != "precheck":
         return None
     try:
         repo_root = _repo_root(payload)
-        if not _is_active(os.environ, repo_root):
+        payload_cwd = Path(payload.get("cwd") or os.getcwd()).resolve()
+        if not _is_active(os.environ, repo_root, payload_cwd):
             return None
         if not _recent_contact(repo_root):
             return None
@@ -690,10 +739,11 @@ def _dispatch(
     err: TextIO,
 ) -> int:
     repo_root = _repo_root(payload)
+    payload_cwd = Path(payload.get("cwd") or os.getcwd()).resolve()
 
     # Requirement 1 (OPT-IN): checked before ANY blackboard I/O, for every
     # subcommand alike. Inactive means silent, zero-network-call ALLOW.
-    if not _is_active(os.environ, repo_root):
+    if not _is_active(os.environ, repo_root, payload_cwd):
         return 0
 
     base_url = os.environ.get("SWARMSYNC_URL", DEFAULT_SWARMSYNC_URL)
@@ -701,7 +751,8 @@ def _dispatch(
     factory: HttpFactory = http_factory or _default_http_factory
     http = factory(base_url)
     try:
-        client = BlackboardClient(http)
+        recorder = _ContactRecordingHttp(http)
+        client = BlackboardClient(recorder)
         agent_id = _agent_id(payload, err)
         tool_name = payload.get("tool_name")
         tool_input = payload.get("tool_input") or {}
@@ -716,11 +767,14 @@ def _dispatch(
         elif subcommand == "release":
             cmd_release(client, agent_id)
         elif subcommand == "session-start":
-            cmd_session_start(http, repo_root)
+            cmd_session_start(recorder, repo_root)
         # else: unrecognized subcommand -> no-op ALLOW, same as an inactive repo.
-        # C10: reaching here means the blackboard answered without error, so record a
-        # successful-contact stamp the two-tier fail policy can consult later.
-        _record_contact(repo_root)
+        # C10: stamp ONLY on positive contact. Merely "reaching here" is not evidence
+        # the blackboard answered -- several paths above complete with zero network
+        # calls (out-of-repo target, non-edit tool, unrecognized subcommand), and
+        # stamping on those flipped never-started setups into fail-closed denials.
+        if recorder.contacted:
+            _record_contact(repo_root)
         return 0
     finally:
         if owns_http:
