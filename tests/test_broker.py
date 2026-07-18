@@ -538,3 +538,185 @@ def test_frozen_contract_target_is_upgraded_to_an_exclusive_lease_parked_mechani
         and json.loads(e["payload"]).get("parcel_id") == module_id
     ]
     assert granted and all(g["mode"] == "exclusive" for g in granted)
+
+
+# --- C11 (WP3.6): broker failure containment -----------------------------------------
+
+
+def _exploding_mutator(worktree, **kwargs):
+    raise RuntimeError("boom mid-edit")
+
+
+def test_broker_contains_a_crashing_task_and_keeps_sibling_results(conn_and_client, repo):
+    """C11: one task crashing must not abort the whole run. Before the fix the
+    mutator's RuntimeError propagated through run_agent and out of
+    `future.result()`, so `broker.run` raised and EVERY other task's result was
+    discarded (the sibling's edit had even landed on trunk already -- the caller
+    just never got told)."""
+    conn, client = conn_and_client
+    r, base = repo
+    task_bad = broker.Task(
+        task_id="crashing-task",
+        targets=[("mod_a.py", "helper")],
+        mutator=_exploding_mutator,
+        base_commit=base,
+    )
+    task_good = broker.Task(
+        task_id="edit-compute",
+        targets=[("mod_b.py", "compute")],
+        mutator=mutators.edit_function_body,
+        mutator_kwargs={"path": "mod_b.py", "symbol": "compute", "new_body": "return n * 10"},
+        base_commit=base,
+    )
+
+    # disjoint targets -> same wave, genuinely concurrent dispatch.
+    results = broker.run(conn, r, [task_bad, task_good], client, n_agents=2)
+
+    # the sibling's result survived AND its edit landed.
+    assert results["edit-compute"].status == "done"
+    assert "return n * 10" in (r / "mod_b.py").read_text()
+
+    # the crashing task is recorded as an error result for THAT task only.
+    bad = results["crashing-task"]
+    assert bad.status == "error"
+    assert bad.error_type == "RuntimeError"
+    assert bad.error is not None and "boom mid-edit" in bad.error
+
+    # and the crashed attempt's lease was released, not leaked until TTL.
+    active = client.leases()
+    assert active == [], f"a crashed task leaked active leases: {active!r}"
+
+
+def test_broker_records_an_error_result_when_the_runner_itself_raises(
+    conn_and_client, repo, monkeypatch
+):
+    """Even if run_agent somehow raises PAST its own containment, the broker must
+    catch it per-task, record an error result, and keep the run going."""
+    conn, client = conn_and_client
+    r, base = repo
+    real_run_agent = broker.run_agent
+
+    def raising_run_agent(*args, **kwargs):
+        if kwargs["task"] == "raises-out-of-the-runner":
+            raise RuntimeError("runner escaped containment")
+        return real_run_agent(*args, **kwargs)
+
+    monkeypatch.setattr(broker, "run_agent", raising_run_agent)
+
+    task_bad = broker.Task(
+        task_id="raises-out-of-the-runner",
+        targets=[("mod_a.py", "helper")],
+        mutator=mutators.edit_function_body,
+        mutator_kwargs={"path": "mod_a.py", "symbol": "helper", "new_body": "return 0"},
+        base_commit=base,
+    )
+    task_good = broker.Task(
+        task_id="edit-compute",
+        targets=[("mod_b.py", "compute")],
+        mutator=mutators.edit_function_body,
+        mutator_kwargs={"path": "mod_b.py", "symbol": "compute", "new_body": "return n * 10"},
+        base_commit=base,
+    )
+
+    results = broker.run(conn, r, [task_bad, task_good], client, n_agents=2)
+
+    assert results["edit-compute"].status == "done"
+    bad = results["raises-out-of-the-runner"]
+    assert bad.status == "error"
+    assert bad.error_type == "RuntimeError"
+    assert bad.error is not None and "escaped containment" in bad.error
+
+
+def test_broker_retries_once_on_transient_gitops_error_and_succeeds(
+    conn_and_client, repo, caplog
+):
+    """A GitOpsError is git's own transient ref/index lock contention -- exactly
+    what concurrent `git worktree add`/checkout in one repo can hit -- so the
+    broker grants ONE bounded retry, and logs it so an operator can see it."""
+    import logging
+
+    conn, client = conn_and_client
+    r, base = repo
+    calls = {"n": 0}
+
+    def transient_git_failure_mutator(worktree, path, symbol, new_body):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise git_ops.GitOpsError("fatal: Unable to create '.git/index.lock': File exists")
+        mutators.edit_function_body(worktree, path, symbol, new_body)
+
+    task = broker.Task(
+        task_id="edit-helper",
+        targets=[("mod_a.py", "helper")],
+        mutator=transient_git_failure_mutator,
+        mutator_kwargs={"path": "mod_a.py", "symbol": "helper", "new_body": "return x - y"},
+        base_commit=base,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="swarmsync.coordinator.broker"):
+        results = broker.run(conn, r, [task], client, n_agents=1)
+
+    assert calls["n"] == 2  # first attempt failed, the ONE retry ran
+    assert results["edit-helper"].status == "done"
+    assert "return x - y" in (r / "mod_a.py").read_text()
+    # the retry is visible: a logged, inspectable note naming the task.
+    retry_notes = [
+        rec for rec in caplog.records if "retry" in rec.message.lower() and "edit-helper" in rec.message
+    ]
+    assert retry_notes, "the GitOpsError retry left no inspectable trace"
+
+
+def test_broker_gitops_retry_is_bounded_second_failure_records_the_error(
+    conn_and_client, repo
+):
+    """The GitOpsError retry is ONE retry, not a loop: a second failure records
+    the error result for the task and moves on."""
+    conn, client = conn_and_client
+    r, base = repo
+    calls = {"n": 0}
+
+    def always_git_failure(worktree, **kwargs):
+        calls["n"] += 1
+        raise git_ops.GitOpsError("lock contention that never clears")
+
+    task = broker.Task(
+        task_id="edit-helper",
+        targets=[("mod_a.py", "helper")],
+        mutator=always_git_failure,
+        base_commit=base,
+    )
+
+    results = broker.run(conn, r, [task], client, n_agents=1)
+
+    assert calls["n"] == 2, "expected exactly one original attempt + one retry"
+    result = results["edit-helper"]
+    assert result.status == "error"
+    assert result.error_type == "GitOpsError"
+    # nothing leaked despite two crashed attempts.
+    assert client.leases() == []
+
+
+def test_broker_non_gitops_error_is_not_retried(conn_and_client, repo):
+    """The bounded retry exists for git's transient lock contention ONLY -- an
+    arbitrary crash is not presumed transient and gets no second run (a mutator
+    with side effects must not be silently re-run on an unknown failure)."""
+    conn, client = conn_and_client
+    r, base = repo
+    calls = {"n": 0}
+
+    def counting_explosion(worktree, **kwargs):
+        calls["n"] += 1
+        raise RuntimeError("not a git lock problem")
+
+    task = broker.Task(
+        task_id="crashing-task",
+        targets=[("mod_a.py", "helper")],
+        mutator=counting_explosion,
+        base_commit=base,
+    )
+
+    results = broker.run(conn, r, [task], client, n_agents=1)
+
+    assert calls["n"] == 1
+    assert results["crashing-task"].status == "error"
+    assert results["crashing-task"].error_type == "RuntimeError"

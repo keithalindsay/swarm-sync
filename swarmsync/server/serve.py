@@ -14,6 +14,9 @@ import argparse
 import os
 import sqlite3
 import time
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
 
 import uvicorn
 
@@ -60,6 +63,33 @@ def assert_clock_agreement() -> None:
         )
 
 
+def rotate_stale_db(db_path: Path) -> Optional[Path]:
+    """Move an existing blackboard DB aside to a timestamped backup (WP3.6 --fresh).
+
+    The old file is RENAMED to `<db>.stale-<YYYYmmdd-HHMMSS>` -- data is never
+    deleted; an operator who `--fresh`ed the wrong DB can always move it back. Any
+    WAL sidecars (`<db>-wal`/`<db>-shm`) ride along under the same stale suffix:
+    they can carry un-checkpointed writes, and a stale `-wal` sitting next to a
+    brand-new empty DB of the same name is a corruption hazard, not a keepsake.
+    Returns the backup path, or None when there was no DB to move.
+    """
+    if not db_path.exists():
+        return None
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup = db_path.with_name(f"{db_path.name}.stale-{stamp}")
+    n = 1
+    while backup.exists():
+        # Two --fresh boots inside one second: never overwrite the earlier backup.
+        n += 1
+        backup = db_path.with_name(f"{db_path.name}.stale-{stamp}-{n}")
+    db_path.rename(backup)
+    for suffix in ("-wal", "-shm"):
+        sidecar = db_path.with_name(db_path.name + suffix)
+        if sidecar.exists():
+            sidecar.rename(backup.with_name(backup.name + suffix))
+    return backup
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="swarmsync-serve", description=__doc__)
     parser.add_argument("--db", default="swarmsync.db", help="blackboard SQLite path")
@@ -72,6 +102,13 @@ def main() -> None:
         "SWARMSYNC_ROOTS, which itself defaults to the launch cwd. Not repeatable: "
         "one server coordinates one repo (parcel ids carry no repo qualifier, so two "
         "roots would collide on the same ids). Run a second server for a second repo.",
+    )
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="start on a fresh, empty blackboard: an existing --db file is moved "
+        "aside to <db>.stale-<YYYYmmdd-HHMMSS> (a backup -- never deleted) before "
+        "the schema is created. Without this flag an existing DB is reused as-is.",
     )
     args = parser.parse_args()
 
@@ -100,6 +137,14 @@ def main() -> None:
         "(set SWARMSYNC_ROOTS or pass --root).",
         flush=True,
     )
+
+    if args.fresh:
+        backup = rotate_stale_db(Path(args.db))
+        if backup is not None:
+            print(
+                f"swarm-sync: --fresh: moved existing blackboard DB aside to {backup}",
+                flush=True,
+            )
 
     app = create_app(args.db)
     uvicorn.run(app, host=args.host, port=args.port)
