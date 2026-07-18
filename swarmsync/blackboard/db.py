@@ -43,6 +43,14 @@ EXPECTED_TABLES = (
     "events",
 )
 
+# SQLite busy_timeout (see `_configure`): how long a write that loses a brief lock
+# race waits for the winner instead of failing with "database is locked". Exposed as
+# a named constant (rather than a bare literal buried in `_configure`) so callers that
+# must sit ABOVE it can reference it directly -- notably the hook adapter's HTTP client
+# timeout, which has to outlast a busy server's lock wait or a merely-contended (not
+# dead) blackboard trips the hook's fail path. See hooks/adapter.py `_DEFAULT_TIMEOUT_SECONDS`.
+BUSY_TIMEOUT_SECONDS = 5.0
+
 
 def _configure(conn: sqlite3.Connection) -> None:
     """Apply the pragmas + row factory every connection to the blackboard must use."""
@@ -61,7 +69,7 @@ def _configure(conn: sqlite3.Connection) -> None:
     # finish its single short statement instead of erroring out. Harmless for
     # every earlier, single-threaded unit's tests (only engages under real
     # contention, which none of them exercised).
-    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.execute(f"PRAGMA busy_timeout = {int(BUSY_TIMEOUT_SECONDS * 1000)}")
 
 
 def connect(path: StrPath) -> sqlite3.Connection:

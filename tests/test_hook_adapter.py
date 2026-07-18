@@ -237,16 +237,16 @@ def test_parcel_held_by_another_agent_denies_with_reason(monkeypatch, repo, inde
     assert code == 0
     assert out != ""
     decision = json.loads(out)
-    assert decision == {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",
-            "permissionDecisionReason": (
-                "swarm-sync: mod_a.py is leased by agent-0; "
-                "pick different work or retry shortly."
-            ),
-        }
-    }
+    assert decision["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
+    assert decision["hookSpecificOutput"]["permissionDecision"] == "deny"
+    reason = decision["hookSpecificOutput"]["permissionDecisionReason"]
+    # WP2.4 U3: an informative deny -- file, holder, the renewal caveat, and an
+    # actionable pointer; and NOT the old misleading "retry shortly".
+    assert "mod_a.py" in reason
+    assert "agent-0" in reason
+    assert "renews while its holder is active" in reason
+    assert "/leases" in reason
+    assert "retry shortly" not in reason
 
     # agent-1 never actually acquired anything -- only agent-0's lease exists.
     leases = indexed_client.get("/leases").json()
@@ -345,7 +345,12 @@ def test_agent_id_falls_back_to_session_id_when_absent(monkeypatch, repo, indexe
     assert leases[0]["agent_id"] == "sess-42"
 
 
-def test_agent_id_falls_back_to_main_when_neither_present(monkeypatch, repo, indexed_client):
+def test_agent_id_neither_present_is_degraded_unique_not_shared_main(monkeypatch, repo, indexed_client):
+    """WP2.1 C2: a payload with NEITHER agent_id nor session_id must NOT collapse to a
+    shared `"main"` constant -- for a lock, a shared identity is UNDER-protection (two
+    distinct agents fused into one holder, both allowed). It must instead get a
+    per-invocation-unique identity and a stderr warning that coordination is degraded.
+    Pre-fix this returned the constant `"main"`."""
     monkeypatch.setenv("SWARMSYNC_ACTIVE", "1")
     payload = _payload("Edit", file_path=str(repo / "mod_a.py"), cwd=str(repo))
     assert "agent_id" not in payload and "session_id" not in payload
@@ -353,7 +358,27 @@ def test_agent_id_falls_back_to_main_when_neither_present(monkeypatch, repo, ind
 
     assert code == 0
     leases = indexed_client.get("/leases").json()
-    assert leases[0]["agent_id"] == "main"
+    holder = leases[0]["agent_id"]
+    assert holder != "main"  # never the shared constant
+    assert holder.startswith("swarmsync-unidentified-")  # a per-invocation-unique id
+    assert "DEGRADED" in err  # operator is told coordination is degraded
+
+
+def test_agent_id_neither_present_two_invocations_do_not_share_identity(monkeypatch, repo, indexed_client):
+    """The false-sharing footgun made concrete: two separate no-id invocations must get
+    DIFFERENT identities, so the second is not silently treated as the first holder (and
+    thus waved through onto a file the first 'holds'). Pre-fix both were `"main"` and the
+    second sailed through as the same holder."""
+    monkeypatch.setenv("SWARMSYNC_ACTIVE", "1")
+    p1 = _payload("Edit", file_path=str(repo / "mod_a.py"), cwd=str(repo))
+    p2 = _payload("Edit", file_path=str(repo / "mod_b.py"), cwd=str(repo))
+    _run("precheck", p1, http_factory=_http_factory(indexed_client))
+    _run("precheck", p2, http_factory=_http_factory(indexed_client))
+
+    holders = {ls["parcel_id"]: ls["agent_id"] for ls in indexed_client.get("/leases").json()}
+    id_a = holders[f"mod_a.py::{MODULE_SYMBOL}"]
+    id_b = holders[f"mod_b.py::{MODULE_SYMBOL}"]
+    assert id_a != id_b, "two unidentified invocations collapsed to one shared holder"
 
 
 # --- blackboard unreachable/raises -> fail-open ALLOW -----------------------------
@@ -952,3 +977,274 @@ def test_hook_lease_ttl_in_bounds_value_is_used_without_warning(monkeypatch):
     err = io.StringIO()
     assert adapter._hook_lease_ttl(err=err) == 120.0
     assert err.getvalue() == ""
+
+
+# =====================================================================================
+# WP2.1 -- agent identity: trust agent_id, kill silent false-sharing (C2)
+#   Uses the VERIFIED current Claude Code payload shapes:
+#     - main-thread PreToolUse: has session_id, NO agent_id
+#     - subagent PreToolUse:     has agent_id (unique per subagent) + shared session_id
+#     - SubagentStop:            has agent_id identifying WHICH subagent stopped
+# =====================================================================================
+
+
+def test_subagent_payload_leases_under_its_unique_agent_id(monkeypatch, repo, indexed_client):
+    """A subagent's payload carries a unique agent_id AND the shared session_id; the
+    lease identity must be the agent_id (what distinguishes sibling subagents), not the
+    session_id they all share."""
+    monkeypatch.setenv("SWARMSYNC_ACTIVE", "1")
+    payload = _payload(
+        "Edit", file_path=str(repo / "mod_a.py"), cwd=str(repo),
+        agent_id="subagent-7", session_id="sess-shared", agent_type="Explore",
+    )
+    code, out, err = _run("precheck", payload, http_factory=_http_factory(indexed_client))
+    assert code == 0
+    leases = indexed_client.get("/leases").json()
+    assert leases[0]["agent_id"] == "subagent-7"  # the agent_id, never the shared session
+
+
+def test_main_thread_payload_leases_under_session_id(monkeypatch, repo, indexed_client):
+    """A main-thread payload has NO agent_id; the whole session is one editor, so its
+    session_id is the right lease identity there."""
+    monkeypatch.setenv("SWARMSYNC_ACTIVE", "1")
+    payload = _payload(
+        "Edit", file_path=str(repo / "mod_a.py"), cwd=str(repo), session_id="sess-main"
+    )
+    assert "agent_id" not in payload
+    code, out, err = _run("precheck", payload, http_factory=_http_factory(indexed_client))
+    assert code == 0
+    leases = indexed_client.get("/leases").json()
+    assert leases[0]["agent_id"] == "sess-main"
+
+
+def test_subagent_stop_releases_only_the_stopping_subagents_leases(monkeypatch, repo, indexed_client):
+    """WP2.1 sibling isolation: two subagents of ONE session (shared session_id, distinct
+    agent_ids) each hold a lease. A SubagentStop for one subagent (payload agent_id names
+    it) must release ONLY that subagent's lease, never its sibling's. A release scoped to
+    the shared session_id would wrongly free the sibling."""
+    monkeypatch.setenv("SWARMSYNC_ACTIVE", "1")
+    # Two siblings under one session, each holding a different file.
+    assert indexed_client.post(
+        "/lease",
+        json={"agent_id": "sub-A", "parcel_id": f"mod_a.py::{MODULE_SYMBOL}", "mode": "write"},
+    ).json()["granted"]
+    assert indexed_client.post(
+        "/lease",
+        json={"agent_id": "sub-B", "parcel_id": f"mod_b.py::{MODULE_SYMBOL}", "mode": "write"},
+    ).json()["granted"]
+
+    # SubagentStop fires for sub-A (payload identifies the stopping subagent by agent_id).
+    stop_a = _payload("SubagentStop", cwd=str(repo), agent_id="sub-A", session_id="sess-shared")
+    code, out, err = _run("release", stop_a, http_factory=_http_factory(indexed_client))
+    assert code == 0
+
+    remaining = {ls["agent_id"] for ls in indexed_client.get("/leases").json()}
+    assert remaining == {"sub-B"}, "SubagentStop freed a sibling's lease, not just its own"
+
+
+# =====================================================================================
+# WP2.2 -- parcel ids from the git root, not cwd (C12)
+# =====================================================================================
+
+
+def test_parcel_id_is_git_root_relative_not_cwd_relative(monkeypatch, tmp_path):
+    """A session running in a SUBDIR of the repo must key the file's parcel on its
+    git-root-relative id (`pkg/a.py::<module>`), matching the server's root-relative id --
+    not `a.py::<module>` relative to the subdir cwd. Pre-fix (`_repo_root` = cwd) the two
+    diverged."""
+    monkeypatch.setenv("SWARMSYNC_ACTIVE", "1")
+    repo = tmp_path / "myrepo"
+    (repo / "pkg").mkdir(parents=True)
+    (repo / ".git").mkdir()  # marks the git toplevel
+    (repo / "pkg" / "a.py").write_text("x = 1\n", encoding="utf-8")
+
+    app = create_app(tmp_path / "bb.db")
+    with TestClient(app) as c:
+        # cwd is the SUBDIR, but the file's absolute path is under the repo.
+        payload = _payload(
+            "Edit", file_path=str(repo / "pkg" / "a.py"), cwd=str(repo / "pkg"), agent_id="a1"
+        )
+        code, out, err = _run("precheck", payload, http_factory=_http_factory(c))
+        assert code == 0
+        leases = c.get("/leases").json()
+        assert len(leases) == 1
+        assert leases[0]["parcel_id"] == f"pkg/a.py::{MODULE_SYMBOL}"  # ROOT-relative
+
+
+def test_two_agents_in_different_cwds_collide_on_one_lease(monkeypatch, tmp_path):
+    """The bug C12 prevents: two agents editing ONE physical file from DIFFERENT cwds must
+    contend for ONE lease. Pre-fix the subdir agent minted a divergent parcel id (a ghost
+    row) and got a SECOND write lease on the same file -- the exact collision the lease
+    exists to prevent. Here the second agent must be DENIED and only one lease can exist."""
+    monkeypatch.setenv("SWARMSYNC_ACTIVE", "1")
+    repo = tmp_path / "myrepo"
+    (repo / "pkg").mkdir(parents=True)
+    (repo / ".git").mkdir()
+    (repo / "pkg" / "a.py").write_text("x = 1\n", encoding="utf-8")
+
+    app = create_app(tmp_path / "bb.db")
+    with TestClient(app) as c:
+        factory = _http_factory(c)
+        # Agent 1 runs from the repo root.
+        code_a, out_a, _ = _run(
+            "precheck",
+            _payload("Edit", file_path=str(repo / "pkg" / "a.py"), cwd=str(repo), agent_id="A"),
+            http_factory=factory,
+        )
+        assert (code_a, out_a) == (0, "")
+
+        # Agent 2 runs from the SUBDIR -- same file, must be DENIED (same lease).
+        code_b, out_b, _ = _run(
+            "precheck",
+            _payload("Edit", file_path=str(repo / "pkg" / "a.py"), cwd=str(repo / "pkg"), agent_id="B"),
+            http_factory=factory,
+        )
+        assert code_b == 0
+        assert out_b != "", "subdir agent got a SECOND lease on one file (ghost parcel id)"
+        assert json.loads(out_b)["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+        held = c.get("/leases").json()
+        assert len(held) == 1, f"one physical file took {len(held)} leases: {held}"
+
+
+def test_repo_root_without_git_keeps_cwd_behavior(tmp_path):
+    """No `.git` anywhere up the tree -> nothing to discover -> unchanged cwd behavior."""
+    sub = tmp_path / "no_git_repo" / "inner"
+    sub.mkdir(parents=True)
+    assert adapter._repo_root({"cwd": str(sub)}) == sub.resolve()
+
+
+# =====================================================================================
+# WP2.3 -- timeout inversion + fail-closed under active coordination (C10)
+# =====================================================================================
+
+
+def test_hook_timeout_is_above_server_busy_timeout():
+    """Part (a): the hook HTTP client timeout must sit ABOVE the server's SQLite
+    busy_timeout, or a merely-busy (contended) blackboard times the hook out and the
+    fail path un-gates the tree. Pre-fix the client used 2s vs the server's 5s."""
+    from swarmsync.blackboard import db
+
+    assert adapter._DEFAULT_TIMEOUT_SECONDS > db.BUSY_TIMEOUT_SECONDS
+    # and the real client actually carries that read timeout
+    c = adapter._default_http_factory("http://127.0.0.1:8787")
+    try:
+        assert c.timeout.read == adapter._DEFAULT_TIMEOUT_SECONDS
+    finally:
+        c.close()
+
+
+def test_successful_precheck_records_a_last_contact_stamp(monkeypatch, repo, indexed_client):
+    """A successful blackboard contact stamps `.swarmsync-last-contact` at the repo root,
+    so the two-tier fail policy can later tell contention from absence."""
+    monkeypatch.setenv("SWARMSYNC_ACTIVE", "1")
+    assert not (repo / adapter.LAST_CONTACT_FILENAME).exists()
+    payload = _payload("Edit", file_path=str(repo / "mod_a.py"), cwd=str(repo), agent_id="a1")
+    code, out, err = _run("precheck", payload, http_factory=_http_factory(indexed_client))
+    assert code == 0
+    assert (repo / adapter.LAST_CONTACT_FILENAME).exists()
+
+
+def test_fail_open_when_unreachable_and_no_recent_contact(monkeypatch, repo):
+    """Tier 1 (unchanged default): active but the blackboard is unreachable AND there is
+    NO evidence of recent successful coordination -> fail OPEN, so a broken/never-started
+    setup never bricks a real editing session."""
+    monkeypatch.setenv("SWARMSYNC_ACTIVE", "1")
+    assert not (repo / adapter.LAST_CONTACT_FILENAME).exists()
+    payload = _payload("Edit", file_path=str(repo / "mod_a.py"), cwd=str(repo), agent_id="a1")
+    code, out, err = _run("precheck", payload, http_factory=lambda base_url: _ExplodingHttp())
+    assert code == 0
+    assert out == ""  # ALLOW
+    assert "failing open" in err
+
+
+def test_fail_closed_when_unreachable_during_active_coordination_with_recent_contact(
+    monkeypatch, repo
+):
+    """Tier 2 (the new fail-CLOSED tier): active coordination WITH a recent successful
+    contact on record, and the blackboard is now unreachable -> the silence is contention,
+    not absence, so precheck fails CLOSED with a retry-deny instead of silently un-gating
+    the shared tree. Reverting part (b) makes this ALLOW (out == '') and fail."""
+    monkeypatch.setenv("SWARMSYNC_ACTIVE", "1")
+    # Recent successful contact on record (as if a prior call had reached the server).
+    (repo / adapter.LAST_CONTACT_FILENAME).write_text(str(time.time()), encoding="utf-8")
+
+    payload = _payload("Edit", file_path=str(repo / "mod_a.py"), cwd=str(repo), agent_id="a1")
+    code, out, err = _run("precheck", payload, http_factory=lambda base_url: _ExplodingHttp())
+    assert code == 0
+    assert out != "", "fail-CLOSED tier did not deny under active contention"
+    decision = json.loads(out)
+    assert decision["hookSpecificOutput"]["permissionDecision"] == "deny"
+    reason = decision["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "retry" in reason.lower()
+    assert "mod_a.py" in reason
+
+
+def test_fail_closed_tier_ignores_stale_contact(monkeypatch, repo):
+    """A STALE contact stamp (older than the recency window) reads as absence, not
+    contention -> back to fail OPEN. Guards the tier boundary from over-applying."""
+    monkeypatch.setenv("SWARMSYNC_ACTIVE", "1")
+    old = time.time() - adapter.RECENT_CONTACT_WINDOW_SECONDS - 10
+    (repo / adapter.LAST_CONTACT_FILENAME).write_text(str(old), encoding="utf-8")
+
+    payload = _payload("Edit", file_path=str(repo / "mod_a.py"), cwd=str(repo), agent_id="a1")
+    code, out, err = _run("precheck", payload, http_factory=lambda base_url: _ExplodingHttp())
+    assert code == 0
+    assert out == ""  # fail OPEN -- stale contact is not evidence of active coordination
+
+
+# =====================================================================================
+# WP2.4 -- deny messages that inform (U3): consume LeaseResult.holder{,_ttl_expires_at}
+# =====================================================================================
+
+
+def test_deny_reason_reports_holder_ttl_remaining(monkeypatch, repo, indexed_client):
+    """The deny names roughly how much TTL is left on the current hold, derived from the
+    holder's ttl_expires_at already in the leases/acquire response."""
+    monkeypatch.setenv("SWARMSYNC_ACTIVE", "1")
+    assert indexed_client.post(
+        "/lease",
+        json={"agent_id": "agent-0", "parcel_id": f"mod_a.py::{MODULE_SYMBOL}",
+              "mode": "write", "ttl": 300},
+    ).json()["granted"]
+
+    payload = _payload("Edit", file_path=str(repo / "mod_a.py"), cwd=str(repo), agent_id="agent-1")
+    code, out, err = _run("precheck", payload, http_factory=_http_factory(indexed_client))
+    reason = json.loads(out)["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "left on the current hold" in reason
+
+
+class _DenyingAcquireClient:
+    """Free on read, but the acquire DENIES with holder info -- the lost-race deny path.
+    Counts leases() calls to prove the deny message is built from the acquire response,
+    NOT a second GET /leases round-trip (WP2.4)."""
+
+    def __init__(self):
+        self.leases_calls = 0
+
+    def leases(self):
+        self.leases_calls += 1
+        return []  # free on the initial read -> precheck takes the acquire path
+
+    def lease(self, *a, **kw):
+        return {
+            "granted": False,
+            "holder": "agent-Z",
+            "holder_ttl_expires_at": time.time() + 123,
+        }
+
+
+def test_race_deny_consumes_acquire_result_without_second_leases_roundtrip(repo):
+    """WP2.4: on a lost acquire race the deny names the holder + TTL straight from the
+    acquire `LeaseResult` -- no second `/leases` read. Pre-fix this path re-read leases()
+    to name the winner (leases_calls == 2)."""
+    client = _DenyingAcquireClient()
+    result = adapter.cmd_precheck(
+        "Edit", {"file_path": str(repo / "mod_a.py")}, client, repo, "agent-1"
+    )
+    assert result is not None
+    reason = result["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "agent-Z" in reason
+    assert "left on the current hold" in reason
+    assert "renews while its holder is active" in reason
+    assert client.leases_calls == 1, "deny path did a second /leases round-trip"
