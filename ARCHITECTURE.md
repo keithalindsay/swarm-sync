@@ -161,6 +161,23 @@ swarm-sync coordinates agents two ways, and a contributor must not confuse them:
   for `Edit`/`Write`-family tools, so a `Bash` write (`sed -i`, `cat >`) bypasses it entirely. The
   hook path is a cooperative protocol among well-behaved agents, not a sandbox.
 
+### Hook coordination identity has a Claude Code version floor
+
+The hook derives each edit's lease identity from the payload (`hooks/adapter.py::_agent_id`): a
+subagent's PreToolUse/PostToolUse/SubagentStop payload carries a **unique `agent_id`**, and that is
+what lets swarm-sync tell the parallel subagents of one session apart and give each its own leases.
+All subagents of a session **share the parent `session_id`** — so `agent_id` is the *only* field that
+distinguishes them, which is why it takes precedence over `session_id`. A main-thread payload has no
+`agent_id` and correctly leases under its `session_id` (the whole session is one editor there).
+
+This is an **honest version dependency, not a bug**: per-subagent coordination requires a Claude Code
+version whose hook payloads include `agent_id`. On an older version whose payloads omit it, every
+subagent of a session falls back to the shared `session_id` and the fabric cannot distinguish them —
+they collapse to one holder and effectively coordinate at session granularity. A payload lacking
+*both* fields (malformed/unrecognized) does **not** collapse to a shared constant: the adapter mints a
+per-invocation-unique id and warns on stderr, so two different agents are never *silently* fused into
+one lease holder (fail-open in effect, never false-sharing).
+
 ---
 
 ## Good places to contribute (where the real problems are)

@@ -59,10 +59,20 @@ gets stuck.
    editing session, so every blackboard call below is one that a raised
    exception simply falls through to that outer handler.
 
-3. SHORT TIMEOUTS. The default `httpx.Client` this module builds for the real
-   console-script path uses a 2s timeout (`_DEFAULT_TIMEOUT_SECONDS`), so an
-   unreachable/hung blackboard server fails fast into the fail-open path
-   instead of stalling the tool call.
+   C10 TWO-TIER refinement: fail-open stays the DEFAULT, but it is no longer
+   unconditional for `precheck`. If a coordinated session is active AND a
+   successful blackboard contact was recorded recently (`.swarmsync-last-contact`),
+   an unreachable blackboard is read as CONTENTION, not absence -- so instead of
+   silently un-gating the shared tree the umbrella emits a retry-deny (see
+   `_maybe_fail_closed`). Absent any recent contact (a broken/never-started
+   setup), it still fails OPEN and never bricks the session.
+
+3. BALANCED TIMEOUTS (C10). The default `httpx.Client` this module builds for
+   the real console-script path uses `_DEFAULT_TIMEOUT_SECONDS`, deliberately set
+   ABOVE the server's SQLite `busy_timeout` so a merely-BUSY (contended) blackboard
+   is waited out rather than mistaken for a dead one -- a truly unreachable/hung
+   server still fails within a few seconds. Which way that failure resolves is no
+   longer unconditionally "open": see FAIL-OPEN's two-tier note above.
 """
 from __future__ import annotations
 
@@ -70,6 +80,8 @@ import hashlib
 import json
 import os
 import sys
+import time
+import uuid
 from collections import Counter
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, TextIO
@@ -77,6 +89,7 @@ from typing import Any, Callable, Mapping, Optional, TextIO
 import httpx
 
 from swarmsync.agent.client import BlackboardClient
+from swarmsync.blackboard.db import BUSY_TIMEOUT_SECONDS
 from swarmsync.blackboard.models import (
     LEASE_TTL_FLOOR_SECONDS,
     LEASE_TTL_MAX_SECONDS,
@@ -86,8 +99,31 @@ from swarmsync.classifier.indexer import MODULE_SYMBOL, parse_file
 # --- config ------------------------------------------------------------------
 
 DEFAULT_SWARMSYNC_URL = "http://127.0.0.1:8787"
-_DEFAULT_TIMEOUT_SECONDS = 2.0
+
+# HTTP client timeout for the real console-script path. C10: this MUST sit comfortably
+# above the server's SQLite `busy_timeout` (blackboard/db.BUSY_TIMEOUT_SECONDS, 5s).
+# The old 2s value INVERTED that: under write contention the server can legitimately
+# spend up to its whole busy_timeout waiting on a lock before answering, so a 2s client
+# timeout fired FIRST and the fail-open umbrella turned it into a silent ALLOW -- exactly
+# when the tree was busiest. Deriving it from the busy_timeout (rather than a bare number)
+# keeps the two in lockstep if the server's is ever retuned.
+_DEFAULT_TIMEOUT_SECONDS = BUSY_TIMEOUT_SECONDS + 3.0  # 8s: > the 5s server busy_timeout
+
 ACTIVE_MARKER_FILENAME = ".swarmsync-active"
+
+# C10 two-tier fail policy. A successful blackboard contact stamps this file at the repo
+# root with the wall-clock time. When the blackboard is later unreachable DURING an active
+# coordinated session AND that stamp is recent, the silence is contention (a busy server),
+# not absence (a broken/never-started setup): fail CLOSED with a retry-deny instead of
+# silently un-gating the shared tree. With no recent stamp we still fail OPEN, so a
+# genuinely-broken setup never bricks a real editing session.
+LAST_CONTACT_FILENAME = ".swarmsync-last-contact"
+
+# How recent a successful contact must be for an unreachable-blackboard failure to be
+# read as contention (fail closed) rather than absence (fail open). A few multiples of
+# the client timeout: long enough to bridge a burst of lock contention, short enough that
+# a server that truly went away stops gating edits soon after.
+RECENT_CONTACT_WINDOW_SECONDS = 60.0
 
 # S5 keepalive: the TTL the hook acquires/renews a lease with. The server's own
 # default lease TTL is 30s (`server.leases.DEFAULT_TTL_SECONDS`) -- far too short
@@ -279,25 +315,39 @@ def _tool_file_path(tool_input: Mapping[str, Any]) -> Optional[str]:
 # --- precheck (PreToolUse) -------------------------------------------------------
 
 
-def _deny_response(relpath: str, owner: str) -> dict:
-    """Claude Code's PreToolUse structured-deny JSON shape."""
+def _deny_response(
+    relpath: str, owner: str, holder_ttl_expires_at: Optional[float] = None
+) -> dict:
+    """Claude Code's PreToolUse structured-deny JSON shape (U3: a deny that actually
+    informs).
+
+    The reason names the file, the holding agent, and -- when known -- roughly how much
+    TTL is left on the hold, plus the crucial caveat that a hook lease RENEWS on every
+    precheck/postupdate while its holder is active, so it does NOT lapse on its own. The
+    old "retry shortly" wording was removed precisely because it was misleading: telling
+    an agent to wait for a lease that keeps renewing sends it into a busy-wait that never
+    clears. The actionable pointer (`GET <url>/leases`) lets the agent inspect the live
+    holder set instead. All fields come from the acquire/leases response already in hand
+    -- no second round-trip (WP2.4 consumes `LeaseResult.holder{,_ttl_expires_at}`)."""
+    url = os.environ.get("SWARMSYNC_URL", DEFAULT_SWARMSYNC_URL)
+    if holder_ttl_expires_at is not None:
+        remaining = max(0.0, holder_ttl_expires_at - time.time())
+        ttl_note = f"~{remaining:.0f}s left on the current hold, "
+    else:
+        ttl_note = ""
+    reason = (
+        f"swarm-sync: {relpath} holds a write lease owned by {owner} "
+        f"({ttl_note}but the hold renews while its holder is active, so it will not "
+        f"lapse on its own). Pick different work; inspect current holders with "
+        f"GET {url}/leases."
+    )
     return {
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": "deny",
-            "permissionDecisionReason": (
-                f"swarm-sync: {relpath} is leased by {owner}; "
-                "pick different work or retry shortly."
-            ),
+            "permissionDecisionReason": reason,
         }
     }
-
-
-def _find_holder(leases: list[dict], parcel_id: str) -> Optional[str]:
-    for lease in leases:
-        if lease.get("parcel_id") == parcel_id:
-            return lease.get("agent_id")
-    return None
 
 
 def _find_lease(leases: list[dict], parcel_id: str) -> Optional[dict]:
@@ -353,7 +403,7 @@ def cmd_precheck(
             # expire it out from under a still-active agent.
             _keepalive(client, agent_id, lease)
             return None
-        return _deny_response(relpath, owner)
+        return _deny_response(relpath, owner, lease.get("ttl_expires_at"))
 
     # `ensure_parcel=True`: this hook is handed whatever real file the agent is
     # editing -- `.ts`, `.yaml`, `package.json`, or a `.py` created since the last
@@ -367,11 +417,14 @@ def cmd_precheck(
     if result.get("granted"):
         return None
 
-    # Lost the acquire race against another agent between our read above and
-    # this acquire -- re-read to name the winner in the deny message, falling
-    # back to a generic phrase if the race is somehow already resolved.
-    owner = _find_holder(client.leases(), parcel_id) or "another agent"
-    return _deny_response(relpath, owner)
+    # Lost the acquire race against another agent between our read above and this
+    # acquire. WP2.4: the server's deny `LeaseResult` already carries `holder` and
+    # `holder_ttl_expires_at`, so name the winner (and its TTL) straight from the
+    # acquire response -- no second `GET /leases` round-trip. Fall back to a generic
+    # phrase only if the server somehow reported no single holder (e.g. a race that
+    # already resolved).
+    owner = result.get("holder") or "another agent"
+    return _deny_response(relpath, owner, result.get("holder_ttl_expires_at"))
 
 
 # --- postupdate (PostToolUse) -----------------------------------------------------
@@ -497,17 +550,136 @@ def cmd_session_start(http: Any, repo_root: Path) -> None:
 # --- payload parsing + dispatch ---------------------------------------------------
 
 
-def _agent_id(payload: Mapping[str, Any]) -> str:
-    """agent_id if present (inside a subagent), else session_id, else "main"
-    (a top-level/"main" agent session has neither in Claude Code's payload
-    shape) -- per this unit's brief.
+def _agent_id(payload: Mapping[str, Any], err: TextIO = sys.stderr) -> str:
+    """The coordination identity for this hook invocation (C2).
+
+    Precedence, matching the VERIFIED Claude Code payload shapes:
+      1. `agent_id` -- present and UNIQUE per subagent (Task-tool call). This is the
+         identity that distinguishes the parallel subagents of one session, and it is
+         what makes per-subagent leasing work on current Claude Code.
+      2. `session_id` -- a main-thread payload has no `agent_id`; the whole session is
+         one editor, so its session id is the right lease identity there. (All subagents
+         of a session SHARE this id, which is exactly why `agent_id` must win above it --
+         see the version-dependency note in ARCHITECTURE.md.)
+      3. Neither present (a malformed/unrecognized payload): DO NOT collapse to a shared
+         constant. The old `"main"` fallback silently gave any two such invocations the
+         SAME lease identity, and for a lock shared identity means UNDER-protection -- two
+         distinct agents treated as one holder, both allowed onto one file. Instead we
+         mint a per-invocation-unique id and warn on stderr that coordination is degraded.
+         The edit still isn't wrongly blocked (fail-open spirit), but two different agents
+         can never be SILENTLY fused into one holder.
     """
-    return payload.get("agent_id") or payload.get("session_id") or "main"
+    identity = payload.get("agent_id") or payload.get("session_id")
+    if identity:
+        return identity
+    degraded = f"swarmsync-unidentified-{uuid.uuid4().hex}"
+    err.write(
+        "swarmsync-hook: payload has neither agent_id nor session_id; coordination "
+        f"identity is DEGRADED -- using a per-invocation id ({degraded}) so two agents "
+        "are never silently treated as one holder (this invocation is effectively "
+        "uncoordinated: it will not keepalive or release a prior lease)\n"
+    )
+    return degraded
 
 
 def _repo_root(payload: Mapping[str, Any]) -> Path:
+    """The repo root to resolve parcel ids against (C12).
+
+    Parcel ids are ROOT-relative on the server (indexer walks from the git toplevel), so
+    the hook must key on that SAME root or it mints a divergent id for the same physical
+    file. `payload["cwd"]` is wherever the session happens to be running -- if that is a
+    SUBDIR of the repo, keying on it yields `subdir/a.py::<module>` where the server holds
+    `a.py::<module>`, so `ensure_parcel=True` auto-creates a GHOST row and the one file
+    ends up with TWO independent write leases -- the exact collision the lease prevents.
+
+    So we walk UP from cwd to the git toplevel (the dir containing `.git`, a directory for
+    a normal checkout or a file for a worktree/submodule) and resolve against THAT. With no
+    `.git` anywhere up the tree we keep the old cwd-based behavior -- there is no root to
+    discover, so cwd is the best (and unchanged) answer.
+    """
     cwd = payload.get("cwd") or os.getcwd()
-    return Path(cwd).resolve()
+    start = Path(cwd).resolve()
+    for candidate in (start, *start.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return start
+
+
+# --- C10 two-tier fail policy: last-successful-contact marker ---------------------
+
+
+def _record_contact(repo_root: Path) -> None:
+    """Stamp `repo_root/.swarmsync-last-contact` with the current wall-clock time.
+
+    Called after a subcommand talked to the blackboard WITHOUT error, so a later
+    unreachable-blackboard failure can tell contention (recent stamp) from absence
+    (no/stale stamp). Best-effort: a read-only tree or any write error is swallowed --
+    a missing stamp only costs us the fail-CLOSED tier (we fall back to fail-open),
+    which is the safe direction."""
+    try:
+        (repo_root / LAST_CONTACT_FILENAME).write_text(str(time.time()), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _recent_contact(repo_root: Path) -> bool:
+    """True iff a successful blackboard contact was recorded within the recency window.
+
+    A parse failure / missing file / stale timestamp all read as 'no recent contact'
+    (fail-open direction)."""
+    try:
+        raw = (repo_root / LAST_CONTACT_FILENAME).read_text(encoding="utf-8")
+        stamped = float(raw.strip())
+    except (OSError, ValueError):
+        return False
+    return (time.time() - stamped) <= RECENT_CONTACT_WINDOW_SECONDS
+
+
+def _maybe_fail_closed(
+    subcommand: str, payload: Mapping[str, Any], err: TextIO
+) -> Optional[dict]:
+    """Decide whether an umbrella-caught failure should fail CLOSED instead of open (C10).
+
+    Only `precheck` can gate an edit, so only it is ever a candidate. We fail closed
+    (return a retry-deny) ONLY when ALL of these hold, else return None (fail open):
+      - coordination is active (env/marker) for this payload's repo root, AND
+      - a successful blackboard contact was recorded recently (server is real and was
+        up moments ago -> this silence is contention, not a broken setup), AND
+      - the payload actually names an in-repo edit target to gate.
+    """
+    if subcommand != "precheck":
+        return None
+    try:
+        repo_root = _repo_root(payload)
+        if not _is_active(os.environ, repo_root):
+            return None
+        if not _recent_contact(repo_root):
+            return None
+        tool_name = payload.get("tool_name")
+        if tool_name not in EDIT_TOOLS:
+            return None
+        relpath = _relpath(_tool_file_path(payload.get("tool_input") or {}), repo_root)
+        if relpath is None:
+            return None
+    except Exception:  # noqa: BLE001 -- the decision path itself must never brick a session
+        return None
+    err.write(
+        f"swarmsync-hook: precheck: blackboard unreachable DURING active coordination "
+        f"(recent contact on record) -- failing CLOSED for {relpath} rather than "
+        "un-gating the shared tree under contention\n"
+    )
+    url = os.environ.get("SWARMSYNC_URL", DEFAULT_SWARMSYNC_URL)
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": (
+                f"swarm-sync: coordination is active but the blackboard is momentarily "
+                f"unreachable (contention, not absence) -- retry {relpath} in a moment. "
+                f"If this persists, check the blackboard at {url}."
+            ),
+        }
+    }
 
 
 def _dispatch(
@@ -515,6 +687,7 @@ def _dispatch(
     payload: Mapping[str, Any],
     http_factory: Optional[HttpFactory],
     out: TextIO,
+    err: TextIO,
 ) -> int:
     repo_root = _repo_root(payload)
 
@@ -529,7 +702,7 @@ def _dispatch(
     http = factory(base_url)
     try:
         client = BlackboardClient(http)
-        agent_id = _agent_id(payload)
+        agent_id = _agent_id(payload, err)
         tool_name = payload.get("tool_name")
         tool_input = payload.get("tool_input") or {}
 
@@ -545,6 +718,9 @@ def _dispatch(
         elif subcommand == "session-start":
             cmd_session_start(http, repo_root)
         # else: unrecognized subcommand -> no-op ALLOW, same as an inactive repo.
+        # C10: reaching here means the blackboard answered without error, so record a
+        # successful-contact stamp the two-tier fail policy can consult later.
+        _record_contact(repo_root)
         return 0
     finally:
         if owns_http:
@@ -591,14 +767,23 @@ def main(
         out.write(_USAGE)
         return 0
 
+    payload: dict = {}
     try:
         raw = stdin.read()
-        payload = json.loads(raw) if raw.strip() else {}
-        if not isinstance(payload, dict):
-            payload = {}
-        return _dispatch(subcommand, payload, http_factory, out)
+        parsed = json.loads(raw) if raw.strip() else {}
+        if isinstance(parsed, dict):
+            payload = parsed
+        return _dispatch(subcommand, payload, http_factory, out, err)
     except Exception as exc:  # noqa: BLE001 -- deliberate: see FAIL-OPEN above
         err.write(f"swarmsync-hook: {subcommand}: failing open ({exc!r})\n")
+        # C10 two-tier: default is still open, but a precheck failure DURING active
+        # coordination with recent successful contact fails CLOSED (contention, not a
+        # dead setup) -- emit a retry-deny instead of silently un-gating. `payload` is
+        # whatever we managed to parse ({} if parsing itself failed -> stays fail-open).
+        deny = _maybe_fail_closed(subcommand, payload, err)
+        if deny is not None:
+            out.write(json.dumps(deny))
+            out.write("\n")
         return 0
 
 
