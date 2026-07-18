@@ -706,7 +706,16 @@ def integrate(
 
 # A terminal event for an `integrate_started` -- i.e. the integrate reached a verdict
 # and trunk is in a state it chose. Anything else means we died mid-flight.
-_INTEGRATE_TERMINAL_TYPES = frozenset({"merged", "merge_rejected", "needs_rebase"})
+#
+# `integrate_orphaned` is terminal too, and this is finding C1: it is the event
+# reconciliation itself emits once it has rolled an orphan back. If it is NOT counted
+# as terminal, the orphaned `integrate_started` stays "open" forever, so every later
+# restart re-reconciles the SAME orphan -- sees trunk has moved on under legitimately
+# gated merges, and `git reset --hard`s them off trunk. Being terminal makes the
+# rollback idempotent: an orphan is reconciled exactly once.
+_INTEGRATE_TERMINAL_TYPES = frozenset(
+    {"merged", "merge_rejected", "needs_rebase", "integrate_orphaned"}
+)
 
 
 def reconcile_orphaned_integrations(conn: sqlite3.Connection) -> list[dict]:
@@ -732,7 +741,14 @@ def reconcile_orphaned_integrations(conn: sqlite3.Connection) -> list[dict]:
         this process must not stop the server from booting. Each failure is reported in
         the returned record instead.
     """
-    started: dict[tuple[str, str, str], dict] = {}
+    # Open starts are keyed by the start event's OWN `seq`, not (repo, branch, into):
+    # a reused branch name must not let one integrate's verdict close an unrelated
+    # older orphan. A terminal event that carries `started_seq` closes exactly that
+    # start; older events without it fall back to the most recent start sharing their
+    # (repo, branch, into). `integrate_orphaned` (which reconciliation emits below)
+    # always carries `started_seq`, so it closes precisely the orphan it rolled back.
+    started: dict[int, dict] = {}
+    latest_seq_by_key: dict[tuple[str, str, str], int] = {}
     for event in events_mod.tail(conn, since_seq=0, limit=1_000_000):
         if event.type not in _INTEGRATE_TERMINAL_TYPES and event.type != "integrate_started":
             continue
@@ -746,13 +762,25 @@ def reconcile_orphaned_integrations(conn: sqlite3.Connection) -> list[dict]:
             str(payload.get("into") or ""),
         )
         if event.type == "integrate_started":
-            started[key] = payload
+            if event.seq is not None:
+                started[event.seq] = payload
+                latest_seq_by_key[key] = event.seq
         else:
-            # A verdict for this (repo, branch, into) closes the most recent start.
-            started.pop(key, None)
+            # A verdict (including the `integrate_orphaned` reconciliation emits for an
+            # orphan it already rolled back) closes its start. Match on the start's
+            # `seq` when the event carries it; otherwise close the most recent start
+            # with the same (repo, branch, into).
+            start_seq = payload.get("started_seq")
+            if not isinstance(start_seq, int):
+                start_seq = latest_seq_by_key.get(key)
+            if start_seq is not None:
+                started.pop(start_seq, None)
 
     reconciled: list[dict] = []
-    for (repo, branch, into), payload in started.items():
+    for start_seq, payload in started.items():
+        repo = str(payload.get("repo") or "")
+        branch = str(payload.get("branch") or "")
+        into = str(payload.get("into") or "")
         record = {"repo": repo, "branch": branch, "into": into, "action": None, "error": None}
         sha_before = payload.get("trunk_sha_before")
         if not repo or not into or not sha_before:
@@ -774,7 +802,12 @@ def reconcile_orphaned_integrations(conn: sqlite3.Connection) -> list[dict]:
             conn,
             "integrate_orphaned",
             None,
-            {**payload, "reconciliation": record["action"], "error": record["error"]},
+            {
+                **payload,
+                "started_seq": start_seq,
+                "reconciliation": record["action"],
+                "error": record["error"],
+            },
         )
         reconciled.append(record)
     return reconciled
