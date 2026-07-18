@@ -435,7 +435,7 @@ def test_impact_selection_runs_a_transitively_affected_test(tmp_path):
 
 
 def test_contract_change_event_emitted_when_a_frozen_signature_lands(tmp_path):
-    """DESIGN §5.3 (money-shot #3): a merge that genuinely changes a frozen
+    """DESIGN §5.3 (test case #3): a merge that genuinely changes a frozen
     contract's signature must emit a real `contract_change` event carrying
     the old/new signature + version, and report the symbol on
     `IntegrateResult.contract_changes` -- driven straight off a real

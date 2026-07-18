@@ -197,7 +197,7 @@ Only if Stage 3's shadow data says the rejection rate is tolerable. Hook adapter
   the *preventive* half: the exclusive-lease upgrade and `co_schedulable`'s frozen clause.
   Detection survives; prevention doesn't.
 - **The demo runs `mode="symbol"`** (`demo/run_demo.py:300,432`), not the default file mode. So all
-  five money shots currently demonstrate the ambitious mode, including money-shot #1's
+  five test cases currently demonstrate the ambitious mode, including test case #1's
   "two agents, one file, zero collisions".
 
 ## Consequence for an MVP

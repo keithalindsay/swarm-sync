@@ -234,7 +234,7 @@ def test_heartbeater_survives_a_raising_heartbeat_and_keeps_beating():
 
 
 def test_two_agents_disjoint_functions_same_file_both_land(client, repo):
-    """Building block of money-shot #1: two agents editing DIFFERENT functions
+    """Building block of test case #1: two agents editing DIFFERENT functions
     in the SAME file both complete run_agent independently (no lease
     contention) and merge with zero conflicts."""
     r, base = repo

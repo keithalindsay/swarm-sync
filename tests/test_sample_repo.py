@@ -57,7 +57,7 @@ def test_real_cross_file_import_or_call_edge_exists(classified):
 def test_calc_has_two_symbol_parcels_with_disjoint_spans(classified):
     """The indexer emits >=2 function parcels in ONE file with disjoint byte spans.
 
-    This used to be phrased as money-shot #1's precondition ("so symbol-mode leasing can
+    This used to be phrased as test case #1's precondition ("so symbol-mode leasing can
     let two agents edit them at once") and asserted via `co_schedulable(..., mode="symbol")`.
     Symbol granularity is parked (SYMBOL_MODE_DESIGN.md) so that call now refuses -- but the
     structural fact is orthogonal to leasing and must KEEP holding: symbol-level parcels are
@@ -78,7 +78,7 @@ def test_calc_has_two_symbol_parcels_with_disjoint_spans(classified):
 
 
 def test_at_least_one_high_fan_in_frozen_contract(classified):
-    """Money-shot #3's precondition: a frozen contract (blast_radius >= FREEZE_THRESHOLD,
+    """Test case #3's precondition: a frozen contract (blast_radius >= FREEZE_THRESHOLD,
     imported/called across a module boundary) exists to change under an exclusive lease."""
     parcels, graph, blast, contracts = classified
     assert contracts, "expected >=1 frozen contract"
@@ -91,7 +91,7 @@ def test_at_least_one_high_fan_in_frozen_contract(classified):
 
 
 def test_sample_repo_pytest_suite_is_green():
-    """The merge gate money-shots #1 and #5 depend on: sample_repo's own suite passes."""
+    """The merge gate test cases #1 and #5 depend on: sample_repo's own suite passes."""
     result = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", "tests"],
         cwd=str(SAMPLE_REPO),

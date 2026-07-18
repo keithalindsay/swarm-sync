@@ -45,7 +45,7 @@ run(conn, repo, tasks, client, n_agents=4, mode="file") -> dict[task_id, AgentRe
   tasks concurrently (bounded by `n_agents`), retry a task that comes back
   `lease_denied` (contention with a still-active holder, OR the task's
   original agent crashed and hasn't aged out yet) under a fresh agent id with
-  backoff -- this is both DESIGN §7 money-shot #2 ("contended parcel
+  backoff -- this is both DESIGN §7 test case #2 ("contended parcel
   serializes... waits, then acquires") and the "task whose agent is reaped
   is reassigned and completes" behavior this unit's done-when asks for, via
   the SAME retry loop: `leases.acquire`'s lazy expiry (U5) means a
@@ -58,7 +58,7 @@ run(conn, repo, tasks, client, n_agents=4, mode="file") -> dict[task_id, AgentRe
 Design notes (this unit's own decisions):
 
 - **Frozen-contract targets are auto-upgraded to an EXCLUSIVE lease** (U15,
-  DESIGN §5.3, money-shot #3): `run` already computes `frozen_ids` for
+  DESIGN §5.3, test case #3): `run` already computes `frozen_ids` for
   `group_schedulable`'s co-schedulability check when `contract_aware=True`
   (the default); `_run_task_once` reuses that SAME set so any task whose
   resolved target parcel is a frozen contract gets `lease_modes=
@@ -106,7 +106,7 @@ Design notes (this unit's own decisions):
   read-lease would add ceremony with no safety payoff yet. `task.read_deps`
   is threaded straight through to `run_agent`'s `read_contracts` param
   unchanged; a literal read-lease is left for whichever later unit
-  (money-shot #3, U15) actually needs to gate on one.
+  (test case #3, U15) actually needs to gate on one.
 - **Greedy wave partitioning**, not an optimal graph coloring: `tasks` is
   walked in order, each task joining the first existing wave it is
   co-schedulable with everything already in, else starting a new wave. This
@@ -321,7 +321,7 @@ def _run_task_once(
     frozen_ids: Optional[set[str]] = None,
 ) -> AgentResult:
     target_parcels = resolve_task(conn, task, mode=mode)
-    # DESIGN §5.3 (money-shot #3, U15): any target parcel that is ALREADY a
+    # DESIGN §5.3 (test case #3, U15): any target parcel that is ALREADY a
     # frozen contract (per the SAME `frozen_ids` this call's wave was
     # scheduled against, `load_scheduling_graph`) must be taken under an
     # EXCLUSIVE lease, not whatever `lease_mode` the task/caller happened to
@@ -357,7 +357,7 @@ def _run_task_with_retries(
     frozen_ids: Optional[set[str]] = None,
 ) -> AgentResult:
     """Drive one task to completion, retrying under a fresh agent id on
-    `lease_denied` -- contention with a still-live holder (money-shot #2) or
+    `lease_denied` -- contention with a still-live holder (test case #2) or
     a crashed original holder that hasn't aged out/been reaped yet (this
     unit's "reassigned and completes" case) look identical from here, and
     both resolve the same way: back off, let `reap_once` run (bookkeeping;
