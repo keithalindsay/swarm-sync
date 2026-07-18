@@ -90,6 +90,7 @@ from typing import Any, Callable, Mapping, Optional, TextIO
 
 import httpx
 
+from swarmsync import config
 from swarmsync.agent.client import BlackboardClient
 from swarmsync.blackboard.db import BUSY_TIMEOUT_SECONDS
 from swarmsync.blackboard.models import (
@@ -101,7 +102,9 @@ from swarmsync.classifier.indexer import parse_file
 
 # --- config ------------------------------------------------------------------
 
-DEFAULT_SWARMSYNC_URL = "http://127.0.0.1:8787"
+# WP4.2: the URL default (and every env read below) lives in `swarmsync.config`;
+# this name survives as an alias for existing importers.
+DEFAULT_SWARMSYNC_URL = config.DEFAULT_URL
 
 # HTTP client timeout for the real console-script path. C10: this MUST sit comfortably
 # above the server's SQLite `busy_timeout` (blackboard/db.BUSY_TIMEOUT_SECONDS, 5s).
@@ -166,7 +169,7 @@ def _hook_lease_ttl(err: TextIO = sys.stderr) -> float:
     sub-second TTLs -- but warned about, since in a real deployment a TTL that small
     shrinks the live window toward request latency and can reopen the heartbeat race.
     """
-    raw = os.environ.get("SWARMSYNC_LEASE_TTL")
+    raw = config.lease_ttl()
     if raw is None:
         return DEFAULT_HOOK_LEASE_TTL_SECONDS
     try:
@@ -202,7 +205,7 @@ def _default_http_factory(base_url: str) -> httpx.Client:
     # behavior. The header is a default on the client, so it rides along on both the
     # BlackboardClient calls and cmd_session_start's direct http.post.
     headers: dict[str, str] = {}
-    token = os.environ.get("SWARMSYNC_TOKEN")
+    token = config.token()
     if token:
         headers["Authorization"] = f"Bearer {token}"
     return httpx.Client(
@@ -233,7 +236,9 @@ _USAGE = (
 # --- activation ----------------------------------------------------------------
 
 
-def _is_active(env: Mapping[str, str], repo_root: Path, cwd: Optional[Path] = None) -> bool:
+def _is_active(
+    env: Optional[Mapping[str, str]], repo_root: Path, cwd: Optional[Path] = None
+) -> bool:
     """DESIGN-adjacent opt-in gate (see module docstring, requirement 1).
 
     `SWARMSYNC_ACTIVE=1` wins outright (e.g. CI/demo runs that always want
@@ -246,8 +251,15 @@ def _is_active(env: Mapping[str, str], repo_root: Path, cwd: Optional[Path] = No
     repo, a marker at the project dir launched the guard but the adapter
     (checking only the toplevel) no-opped -- no single marker location could
     activate both halves.
+
+    `env=None` (every real call site, WP4.2) reads the process environment via
+    `config.active()`; an explicit mapping is the test seam for driving the gate
+    with a synthetic environment.
     """
-    if env.get("SWARMSYNC_ACTIVE") == "1":
+    env_active = (
+        env.get(config.ACTIVE_ENV) == "1" if env is not None else config.active()
+    )
+    if env_active:
         return True
     if (repo_root / ACTIVE_MARKER_FILENAME).exists():
         return True
@@ -343,7 +355,7 @@ def _deny_response(
     The actionable pointer (`GET <url>/leases`) lets the agent inspect the live holder
     set instead. All fields come from the acquire response already in hand -- no second
     round-trip (WP2.4 consumes `LeaseResult.holder{,_ttl_expires_at}`)."""
-    url = os.environ.get("SWARMSYNC_URL", DEFAULT_SWARMSYNC_URL)
+    url = config.url()
     if holder_ttl_expires_at is not None:
         remaining = max(0.0, holder_ttl_expires_at - time.time())
         ttl_note = f"~{remaining:.0f}s left on the current hold; "
@@ -760,7 +772,7 @@ def _maybe_fail_closed(
     try:
         repo_root = _repo_root(payload)
         payload_cwd = Path(payload.get("cwd") or os.getcwd()).resolve()
-        if not _is_active(os.environ, repo_root, payload_cwd):
+        if not _is_active(None, repo_root, payload_cwd):
             return None
         if not _recent_contact(repo_root):
             return None
@@ -777,7 +789,7 @@ def _maybe_fail_closed(
         f"(recent contact on record) -- failing CLOSED for {relpath} rather than "
         "un-gating the shared tree under contention\n"
     )
-    url = os.environ.get("SWARMSYNC_URL", DEFAULT_SWARMSYNC_URL)
+    url = config.url()
     return {
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
@@ -803,10 +815,10 @@ def _dispatch(
 
     # Requirement 1 (OPT-IN): checked before ANY blackboard I/O, for every
     # subcommand alike. Inactive means silent, zero-network-call ALLOW.
-    if not _is_active(os.environ, repo_root, payload_cwd):
+    if not _is_active(None, repo_root, payload_cwd):
         return 0
 
-    base_url = os.environ.get("SWARMSYNC_URL", DEFAULT_SWARMSYNC_URL)
+    base_url = config.url()
     owns_http = http_factory is None
     factory: HttpFactory = http_factory or _default_http_factory
     http = factory(base_url)
