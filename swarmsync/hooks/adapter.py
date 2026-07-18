@@ -96,7 +96,8 @@ from swarmsync.blackboard.models import (
     LEASE_TTL_FLOOR_SECONDS,
     LEASE_TTL_MAX_SECONDS,
 )
-from swarmsync.classifier.indexer import MODULE_SYMBOL, parse_file
+from swarmsync.blackboard.parcel_id import module_id
+from swarmsync.classifier.indexer import parse_file
 
 # --- config ------------------------------------------------------------------
 
@@ -304,12 +305,12 @@ def _parcel_id(relpath: str) -> str:
     defaults to file, not symbol -- so regardless of how finely
     `classifier.indexer` actually parsed a file into symbol-level parcels,
     this hook always leases the one synthetic per-file interstitial parcel
-    id `indexer.parse_file` already emits for every file (`MODULE_SYMBOL`,
-    imported rather than re-hardcoded so the two stay in lockstep). That is
-    the safe default granularity named in this unit's brief: "whole-file
-    parcel is the safe default granularity."
+    id `indexer.parse_file` already emits for every file (built by
+    `blackboard.parcel_id.module_id`, the id scheme's single home, so the
+    two stay in lockstep). That is the safe default granularity named in
+    this unit's brief: "whole-file parcel is the safe default granularity."
     """
-    return f"{relpath}::{MODULE_SYMBOL}"
+    return module_id(relpath)
 
 
 def _tool_file_path(tool_input: Mapping[str, Any]) -> Optional[str]:

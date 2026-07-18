@@ -113,8 +113,10 @@ def test_run_agent_full_lifecycle(client, repo):
     # /integrate now runs the real U10 integrator: clean merge, no test suite
     # in this tiny fixture repo (nothing to gate on) -> lands.
     assert result.integrate_result is not None
-    assert result.integrate_result["_status_code"] == 200
     assert result.integrate_result["status"] == "merged"
+    # WP4.4/A5: the client no longer smuggles the HTTP transport status into
+    # the integrator's domain payload.
+    assert "_status_code" not in result.integrate_result
 
 
 def test_run_agent_backs_off_on_lease_denied(client, repo):
@@ -820,3 +822,52 @@ def test_run_agent_does_not_mask_keyboard_interrupt(client, repo):
         )
     # the existing finally still ran.
     assert not (r / ".worktrees" / "agent-int").exists()
+
+
+# --- WP4.4 (A8): the two formerly-silent swallows now leave a log trace -------
+
+
+def test_heartbeater_logs_a_failed_beat_and_does_not_raise(caplog):
+    """A dying blackboard mid-run must leave a trace: `_Heartbeater._run`
+    still swallows the failure (the daemon thread must never crash) but now
+    logs it at WARNING with the lease + agent context."""
+    import logging as _logging
+
+    from swarmsync.agent.runner import _Heartbeater
+
+    class _DyingClient:
+        def heartbeat(self, agent_id, lease_id):
+            hb._stop.set()  # end the beat loop right after this (failing) beat
+            raise RuntimeError("blackboard went away")
+
+    hb = _Heartbeater(_DyingClient(), "agent-hb", interval=0.01)
+    hb.add(42)
+    with caplog.at_level(_logging.WARNING, logger="swarmsync.agent.runner"):
+        hb._run()  # run the loop synchronously; the failure must not escape
+    beats = [r for r in caplog.records if "heartbeat for lease 42" in r.getMessage()]
+    assert len(beats) == 1, "the swallowed heartbeat failure left no logged note"
+    assert beats[0].levelno == _logging.WARNING
+    assert "agent-hb" in beats[0].getMessage()
+
+
+def test_cleanup_worktree_logs_swallowed_git_failures_and_does_not_raise(
+    tmp_path, monkeypatch, caplog
+):
+    """`_cleanup_worktree` still swallows GitOpsError on both the park and the
+    remove step (cleanup must never become the reason a run fails), but each
+    swallow now logs at DEBUG with the agent context."""
+    import logging as _logging
+
+    from swarmsync.agent import runner
+    from swarmsync.worktree.git_ops import GitOpsError
+
+    def _boom(*args, **kwargs):
+        raise GitOpsError("simulated git failure")
+
+    monkeypatch.setattr(runner.git_ops, "park_branch", _boom)
+    monkeypatch.setattr(runner.git_ops, "remove_worktree", _boom)
+    with caplog.at_level(_logging.DEBUG, logger="swarmsync.agent.runner"):
+        runner._cleanup_worktree(tmp_path, "agent-x", park_branch=True)  # no raise
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("park_branch failed" in m and "agent-x" in m for m in messages), messages
+    assert any("remove_worktree failed" in m and "agent-x" in m for m in messages), messages
