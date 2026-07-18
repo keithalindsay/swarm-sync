@@ -895,6 +895,84 @@ def test_reconcile_rolls_trunk_back_out_of_an_orphaned_integrate(conn, repo):
     assert len(orphaned) == 1, "the rollback left no audit trail"
 
 
+def test_reconcile_does_not_destroy_landed_merges_on_a_second_restart(conn, repo):
+    """Reconciliation must be IDEMPOTENT: once an orphan is rolled back and recorded,
+    a later restart must not re-roll it and wipe the gated merges that landed since.
+
+    This is finding C1. `integrate_orphaned` -- the event reconciliation emits to close
+    an orphan -- was NOT in the terminal-event set, so the orphaned `integrate_started`
+    stayed "open" forever. On any subsequent restart, replay found the same start
+    unclosed, saw trunk had moved on, and `git reset --hard` back to the pre-orphan sha,
+    DESTROYING every legitimate merge landed in between -- and it repeated every restart.
+    """
+    r, base = repo
+    run_index(conn, r)
+    pre = git_ops.current_commit(r, ref="integration")
+
+    # --- step 1: an integrate is SIGKILLed mid-gate: intent recorded, merge landed,
+    # no terminal event.
+    worktree = git_ops.add_worktree(r, "agent-dead", base)
+    (worktree / "mod_a.py").write_text(
+        "def helper(x):\n    return 'never gated'\n", encoding="utf-8"
+    )
+    git_ops.commit_all(worktree, "agent-dead: un-gated edit")
+    events_mod.emit(
+        conn,
+        "integrate_started",
+        "agent-dead",
+        {
+            "branch": "agent-dead",
+            "into": "integration",
+            "base_commit": base,
+            "trunk_sha_before": pre,
+            "repo": str(r),
+        },
+    )
+    ok, _conflicts = git_ops.merge_branch(r, "agent-dead", into="integration")
+    assert ok
+    assert git_ops.current_commit(r, ref="integration") != pre
+
+    # --- step 2: first restart. Reconciliation correctly rolls trunk back to `pre`.
+    first = integrator.reconcile_orphaned_integrations(conn)
+    assert len(first) == 1
+    assert git_ops.current_commit(r, ref="integration") == pre
+
+    # --- step 3: agents land legitimate, gated merges. Trunk moves forward.
+    worktree_b = git_ops.add_worktree(r, "agent-b", base)
+    (worktree_b / "mod_b.py").write_text(
+        "def other(y):\n    z = y * 2\n    return z\n", encoding="utf-8"
+    )
+    git_ops.commit_all(worktree_b, "agent-b: gated edit")
+    assert integrator.integrate(
+        conn, r, "agent-b", base_commit=base, agent_id="agent-b"
+    ).status == "merged"
+
+    worktree_c = git_ops.add_worktree(r, "agent-c", base)
+    (worktree_c / "mod_c.py").write_text(
+        "def broken():\n    result = 1\n    return result\n", encoding="utf-8"
+    )
+    git_ops.commit_all(worktree_c, "agent-c: gated edit (behavior-preserving)")
+    assert integrator.integrate(
+        conn, r, "agent-c", base_commit=base, agent_id="agent-c"
+    ).status == "merged"
+
+    trunk_after_merges = git_ops.current_commit(r, ref="integration")
+    assert trunk_after_merges != pre, "the legitimate merges did not land"
+
+    # --- step 4: second restart, for any reason. Reconciliation must leave trunk alone.
+    second = integrator.reconcile_orphaned_integrations(conn)
+
+    assert git_ops.current_commit(r, ref="integration") == trunk_after_merges, (
+        "second reconciliation reset trunk back out from under the gated merges -- "
+        "the C1 double-restart data-loss bug"
+    )
+    assert second == [], (
+        "the already-reconciled orphan was reconciled AGAIN on the second restart"
+    )
+    assert "z = y * 2" in (r / "mod_b.py").read_text(encoding="utf-8")
+    assert "result = 1" in (r / "mod_c.py").read_text(encoding="utf-8")
+
+
 def test_reconcile_leaves_completed_integrates_alone(conn, repo):
     """Reconciliation must never touch an integrate that reached a verdict -- a
     `merged` merge is trunk's real history, and resetting it would be the very data
