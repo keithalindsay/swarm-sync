@@ -130,7 +130,12 @@ class _Heartbeater:
             self._thread.join(timeout=self._interval + 1.0)
 
 
-def _cleanup_worktree(repo: Path, agent_id: str, delete_branch: bool = False) -> None:
+def _cleanup_worktree(
+    repo: Path,
+    agent_id: str,
+    delete_branch: bool = False,
+    park_branch: bool = False,
+) -> None:
     """Best-effort teardown of this agent's worktree + branch (S5).
 
     Called from a `finally` after integrate/release on the done path, and on the
@@ -147,7 +152,31 @@ def _cleanup_worktree(repo: Path, agent_id: str, delete_branch: bool = False) ->
     `pre_merge_sha`, so this branch is the ONLY reference to the agent's commits.
     Deleting it there makes the work unreachable and destroys the rebase-and-
     resubmit path DESIGN §5.5 promises.
+
+    `park_branch` (WP3.5): keeping the branch was NOT enough. Broker attempt ids
+    are deterministic (`{task_id}-attempt-{n}`), and `git_ops.add_worktree` runs
+    `_prune_stale_worktree` -- which `git branch -D`s the same-named branch --
+    at the top of every call, so a re-run of the same task list destroyed the
+    "kept" branch before doing anything else. When `park_branch=True` (the
+    committed-but-not-landed paths), the branch's tip is additionally parked
+    under `rejected/<agent_id>-<UTC ts>` (`git_ops.park_branch`), a namespace
+    pruning never deletes, making the preserved-commits contract survive reruns.
     """
+    try:
+        if park_branch and not delete_branch:
+            parked = git_ops.park_branch(repo, agent_id)
+            logger.info(
+                "run_agent(%s): merge did not land; branch parked as %r -- the "
+                "rejected commits stay reachable there even after a re-run of the "
+                "same task id prunes branch %r",
+                agent_id,
+                parked,
+                agent_id,
+            )
+    except git_ops.GitOpsError:
+        # e.g. the branch was never created (the failure predates add_worktree);
+        # nothing to park, and cleanup must never become the reason a run fails.
+        pass
     try:
         git_ops.remove_worktree(repo, agent_id, delete_branch=delete_branch)
     except git_ops.GitOpsError:
@@ -283,6 +312,8 @@ def run_agent(
     # design, and the reaper is exactly the backstop for that case.
     contract_snapshot: dict[str, Optional[dict]] = {}
     landed = False
+    commit_sha: Optional[str] = None  # set once commit_all succeeds -- the outer
+    # finally parks the branch only when there IS a commit to preserve (WP3.5).
     try:
         # 4. read-dependency contracts (drift detection vs. a plan-time snapshot
         # is the broker's/U12's job; this unit fetches the current state). Inside
@@ -392,4 +423,14 @@ def run_agent(
         # agent's lease alive across /parcel/update and /integrate's unbounded
         # pytest gate -- see the note in the try block above.
         heartbeater.stop()
-        _cleanup_worktree(repo, agent_id, delete_branch=landed)
+        # WP3.5: a run that COMMITTED work the merge did not land (merge_rejected,
+        # needs_rebase, or an error after commit_all) parks the branch under
+        # `rejected/*` so a rerun's deterministic attempt id can't prune away the
+        # only reference to those commits. A landed run deletes as before; a run
+        # that never committed has nothing worth parking.
+        _cleanup_worktree(
+            repo,
+            agent_id,
+            delete_branch=landed,
+            park_branch=commit_sha is not None and not landed,
+        )

@@ -45,6 +45,14 @@ integrate(conn, repo, branch, base_commit=None, into="integration", ...) -> Inte
      (`regenerate_summary`) for every parcel the branch actually touched --
      never trust the agent's self-reported note (DESIGN §5.4/§6 "lying
      blackboard"). Emits `reindexed` with the touched parcel ids.
+     WP3.5 (C14) **ghost retirement**: `run_index` upserts but never prunes, so
+     this step also RETIRES parcels whose file the landed merge deleted/renamed
+     and contracts whose symbol no longer exists -- FK dependents (leases,
+     pheromone) deleted first via `store.retire_rows`, one `parcel_retired`
+     event per retired parcel (why: file_deleted) and one `contract_retired`
+     per vanished symbol (why: symbol_deleted), scoped to the merge's own
+     changed files (never a full-table sweep). A rename is simply the new
+     path's rows appearing via re-index + the old path's rows retiring.
   5. **Frozen-contract change detection** (DESIGN §5.3, test case #3, U15):
      bracketing step 4's re-index, this snapshots `contracts.type_hash` for
      every symbol whose file this branch touched, BEFORE re-indexing, and
@@ -84,7 +92,7 @@ from swarmsync.blackboard import db
 from swarmsync.blackboard.models import Parcel
 from swarmsync.classifier.graph import DepGraph, build_graph
 from swarmsync.classifier.indexer import index_repo
-from swarmsync.classifier.store import run_index
+from swarmsync.classifier.store import retire_rows, run_index
 from swarmsync.server import events as events_mod
 from swarmsync.worktree import git_ops
 
@@ -137,6 +145,11 @@ class IntegrateResult:
     contract_changes: list[str] = field(default_factory=list)  # symbols whose
     # frozen signature genuinely changed on THIS merge (DESIGN §5.3, U15) --
     # each also has a `contract_change` event emitted, see module docstring.
+    retired_parcels: list[str] = field(default_factory=list)  # WP3.5 (C14): parcel
+    # ids whose file this landed merge deleted/renamed away -- their rows are gone
+    # from the blackboard and each emitted a `parcel_retired` event.
+    retired_contracts: list[str] = field(default_factory=list)  # symbols that no
+    # longer exist after this landed merge -- rows deleted, `contract_retired` emitted.
 
 
 def _check_read_deps(
@@ -676,6 +689,46 @@ def integrate(
                     "new_version": row["version"],
                 }
             )
+
+        # --- WP3.5 (C14): ghost retirement -- COMPUTE the candidates here, act
+        # below. `run_index` upserts but never prunes (see `classifier.store`'s
+        # docstring, which always nominated this re-index as the place to retire),
+        # so a file the landed merge deleted/renamed keeps its `parcels` rows and
+        # a vanished symbol keeps its `contracts` row forever: `GET /contract/
+        # {symbol}` serves a dead signature, and a renamed symbol never emits
+        # `contract_change` (the old row simply never changes), so dependents are
+        # never told.
+        #
+        # Renames need NO rename detection: the new path's parcels/contracts
+        # appeared just above via the normal re-index, and the old path's rows
+        # retire here (why: file_deleted / symbol_deleted). That pairing IS the
+        # honest rename story -- a `parcel_retired` for the old id plus fresh rows
+        # under the new id.
+        #
+        # Scope: ONLY paths this merge touched (`changed_set`) -- never a
+        # full-table sweep per merge. Disk (the just-landed `into` checkout) is
+        # the arbiter for parcels: a changed path with no file behind it anymore
+        # is gone whether it was a `.py` the indexer owned or a hook-created
+        # whole-file parcel the indexer never walks. Contracts retire when their
+        # symbol (== parcel id) is absent from the fresh index; a symbol that
+        # still exists but merely dropped below the freeze threshold is NOT
+        # retired here (unchanged policy -- this is about vanished symbols only).
+        fresh_ids = {p.id for p in index_result.parcels}
+        retired_parcel_rows: list[tuple[str, str]] = []
+        if changed_set:
+            placeholders = ",".join("?" for _ in changed_set)
+            for row in conn.execute(
+                f"SELECT id, path FROM parcels WHERE path IN ({placeholders})",
+                sorted(changed_set),
+            ).fetchall():
+                if not (repo / row["path"]).exists():
+                    retired_parcel_rows.append((row["id"], row["path"]))
+        retired_contract_symbols = [
+            row["symbol"]
+            for row in conn.execute("SELECT symbol FROM contracts").fetchall()
+            if row["symbol"].split("::", 1)[0] in changed_set
+            and row["symbol"] not in fresh_ids
+        ]
     except Exception as exc:  # noqa: BLE001 -- deliberate: any post-merge failure
         # A failure AFTER the merge landed (a later GitOpsError, a parse/re-index
         # crash, a bad symbol, etc.): roll trunk back to byte-identical
@@ -731,6 +784,58 @@ def integrate(
         ts=now,
     )
 
+    # --- WP3.5 (C14): retire the ghosts computed above. Deliberately AFTER the
+    # guarded block and the `merged` emit, not inside them: these deletes are the
+    # one post-merge write `_reject_and_reset`'s compensating re-index could NOT
+    # undo (re-indexing the restored tree re-creates parcel/contract rows, but a
+    # deleted lease row is gone for good), so they must only ever run once the
+    # merge verdict is final. The deletes and their events are ONE transaction --
+    # ghosts never vanish without an audit trail, nor announce without vanishing.
+    # FK ordering lives in `store.retire_rows` (dependents first); it also returns
+    # the active leases the retirement closed so each `parcel_retired` can name
+    # the holders it cut loose.
+    retired_parcel_ids = [pid for pid, _ in retired_parcel_rows]
+    if retired_parcel_ids or retired_contract_symbols:
+        with db.transaction(conn):
+            closed_leases = retire_rows(
+                conn, retired_parcel_ids, retired_contract_symbols
+            )
+            closed_by_parcel: dict[str, list[str]] = {}
+            for lease in closed_leases:
+                closed_by_parcel.setdefault(lease["parcel_id"], []).append(
+                    lease["agent_id"]
+                )
+            for pid, path in retired_parcel_rows:
+                events_mod.emit(
+                    conn,
+                    "parcel_retired",
+                    agent_id,
+                    {
+                        "parcel": pid,
+                        "why": "file_deleted",
+                        "path": path,
+                        "branch": branch,
+                        "into": into,
+                        "started_seq": started_seq,
+                        "released_leases": closed_by_parcel.get(pid, []),
+                    },
+                    ts=now,
+                )
+            for symbol in retired_contract_symbols:
+                events_mod.emit(
+                    conn,
+                    "contract_retired",
+                    agent_id,
+                    {
+                        "symbol": symbol,
+                        "why": "symbol_deleted",
+                        "branch": branch,
+                        "into": into,
+                        "started_seq": started_seq,
+                    },
+                    ts=now,
+                )
+
     return IntegrateResult(
         status="merged",
         branch=branch,
@@ -739,6 +844,8 @@ def integrate(
         changed_files=changed,
         reindexed_parcels=reindexed_ids,
         contract_changes=contract_changes,
+        retired_parcels=retired_parcel_ids,
+        retired_contracts=retired_contract_symbols,
         test_log=test_log,
     )
 
