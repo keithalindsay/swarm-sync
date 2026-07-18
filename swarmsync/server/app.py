@@ -477,6 +477,74 @@ def create_app(
     @app.post("/parcel/update", dependencies=[Depends(require_token)])
     def post_parcel_update(body: ParcelUpdateBody, conn=Depends(get_conn)):
         now = time.time()
+
+        # 404 for a genuinely unknown parcel stays a 404 (distinct from "you don't
+        # hold the lease"); check existence before the ownership gate so the two
+        # failure modes don't collapse into one.
+        if conn.execute(
+            "SELECT 1 FROM parcels WHERE id = ? LIMIT 1", (body.parcel_id,)
+        ).fetchone() is None:
+            raise HTTPException(
+                status_code=404, detail=f"no parcel {body.parcel_id!r}"
+            )
+
+        # C5: previously the UPDATE was keyed on parcel_id ONLY and `body.agent_id`
+        # merely labelled the emitted event/pheromone -- never checked -- so ANY
+        # client could overwrite the content_hash/state_summary of a parcel that
+        # ANOTHER agent held a write lease on. `_check_read_deps` compares plan-time
+        # snapshots against exactly this content_hash column, so a rogue or stale
+        # update spuriously bounces the innocent holder with `needs_rebase`, or
+        # clears a snapshot a later merge then validates against state that never
+        # landed. Require that the caller holds an ACTIVE, UNEXPIRED write/exclusive
+        # lease on this parcel before mutating it.
+        #
+        # Liveness is evaluated on SQLite's OWN clock via `leases._NOW_SQL` -- the
+        # same expression `leases.heartbeat` uses -- rather than a Python-side
+        # `time.time()` bound before the statement serializes. A stale Python `now`
+        # would answer "was the lease alive when I read the clock?", and the row
+        # could lapse in the gap before the statement runs (busy_timeout wait,
+        # threadpool queueing, GIL preemption), letting an already-expired lease pass
+        # the gate -- the C13 clock class of bug. `_NOW_SQL` is a module constant,
+        # never caller input, so the interpolation is not an injection surface.
+        owns = conn.execute(
+            f"""
+            SELECT 1 FROM leases
+            WHERE parcel_id = :parcel_id
+              AND agent_id = :agent_id
+              AND mode IN ('write', 'exclusive')
+              AND status = 'active'
+              AND ttl_expires_at > {leases_mod._NOW_SQL}
+            LIMIT 1
+            """,  # noqa: S608 - _NOW_SQL is a module constant, never caller input
+            {"parcel_id": body.parcel_id, "agent_id": body.agent_id},
+        ).fetchone()
+        if owns is None:
+            # Name the actual current holder (if any) so the caller can act -- e.g.
+            # back off and rebase rather than retry blindly.
+            holder = conn.execute(
+                f"""
+                SELECT agent_id FROM leases
+                WHERE parcel_id = :parcel_id
+                  AND mode IN ('write', 'exclusive')
+                  AND status = 'active'
+                  AND ttl_expires_at > {leases_mod._NOW_SQL}
+                ORDER BY ttl_expires_at DESC
+                LIMIT 1
+                """,  # noqa: S608 - _NOW_SQL is a module constant, never caller input
+                {"parcel_id": body.parcel_id},
+            ).fetchone()
+            if holder is not None:
+                reason = (
+                    f"parcel {body.parcel_id!r} is write-leased by "
+                    f"{holder['agent_id']!r}, not {body.agent_id!r}"
+                )
+            else:
+                reason = (
+                    f"{body.agent_id!r} holds no active write lease on "
+                    f"{body.parcel_id!r}"
+                )
+            return {"ok": False, "parcel_id": body.parcel_id, "reason": reason}
+
         cur = conn.execute(
             """
             UPDATE parcels

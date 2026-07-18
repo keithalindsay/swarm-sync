@@ -333,6 +333,11 @@ def test_release_returns_ok_true_and_frees_the_parcel(client, fixture_repo):
 
 def test_parcel_update_returns_expected_shape_and_updates_row(client, fixture_repo):
     _index(client, fixture_repo)
+    # C5: the caller must hold the write lease it is updating under.
+    client.post(
+        "/lease",
+        json={"agent_id": "agent-1", "parcel_id": "mod_a.py::helper", "mode": "write"},
+    )
     r = client.post(
         "/parcel/update",
         json={
@@ -353,6 +358,117 @@ def test_parcel_update_returns_expected_shape_and_updates_row(client, fixture_re
 
     events = client.get("/events?since=0").json()
     assert any(e["type"] == "done" for e in events)
+
+
+def _lease(client, agent_id, parcel_id, mode="write", ttl=None):
+    body = {"agent_id": agent_id, "parcel_id": parcel_id, "mode": mode}
+    if ttl is not None:
+        body["ttl"] = ttl
+    r = client.post("/lease", json=body)
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+# --- C5: /parcel/update must require the caller to hold the write lease ------------
+
+
+def test_parcel_update_rejects_writer_without_the_lease(client, fixture_repo):
+    """C5 repro. Agent A holds the write lease on a parcel; a DIFFERENT client
+    (agent B, holding no lease) must NOT be able to overwrite its content_hash.
+
+    Pre-fix the UPDATE was keyed on parcel_id ONLY -- body.agent_id was used solely
+    to label the emitted event -- so agent B's post clobbered the hash that
+    integrator._check_read_deps compares plan-time snapshots against, spuriously
+    bouncing agent A with needs_rebase. Post-fix agent B is soft-refused and the
+    stored hash is UNCHANGED.
+    """
+    _index(client, fixture_repo)
+    parcel = "mod_a.py::helper"
+
+    # Agent A takes the write lease and posts a legitimate update.
+    _lease(client, "agent-A", parcel, mode="write")
+    ra = client.post(
+        "/parcel/update",
+        json={"agent_id": "agent-A", "parcel_id": parcel, "content_hash": "aaaa"},
+    )
+    assert ra.status_code == 200
+    assert ra.json()["ok"] is True
+
+    # Agent B holds NO lease and tries to overwrite the same parcel.
+    rb = client.post(
+        "/parcel/update",
+        json={"agent_id": "agent-B", "parcel_id": parcel, "content_hash": "bbbb"},
+    )
+    assert rb.status_code == 200, rb.text
+    body = rb.json()
+    assert body["ok"] is False
+    # The reason must name the ACTUAL current holder so the caller can act.
+    assert "agent-A" in body["reason"]
+
+    # The clobber did NOT land: the hash is still agent-A's value.
+    row = {p["id"]: p for p in client.get("/parcels").json()}[parcel]
+    assert row["content_hash"] == "aaaa"
+
+
+def test_parcel_update_rejects_read_lease_holder(client, fixture_repo):
+    """A READ lease is not enough: only write/exclusive holders may mutate the
+    parcel's content_hash. Agent A holds the write lease; agent B holds only a
+    (shared) read lease and must still be refused."""
+    _index(client, fixture_repo)
+    parcel = "mod_a.py::helper"
+    _lease(client, "agent-A", parcel, mode="read")
+    _lease(client, "agent-B", parcel, mode="read")
+
+    rb = client.post(
+        "/parcel/update",
+        json={"agent_id": "agent-B", "parcel_id": parcel, "content_hash": "bbbb"},
+    )
+    assert rb.status_code == 200, rb.text
+    assert rb.json()["ok"] is False
+
+
+def test_parcel_update_succeeds_for_the_lease_holder(client, fixture_repo):
+    """Positive path: the agent that holds the active write lease can update the
+    parcel it is editing -- the legitimate broker/hook flow must stay open."""
+    _index(client, fixture_repo)
+    parcel = "mod_a.py::helper"
+    _lease(client, "agent-A", parcel, mode="write")
+
+    r = client.post(
+        "/parcel/update",
+        json={
+            "agent_id": "agent-A",
+            "parcel_id": parcel,
+            "content_hash": "deadbeef",
+            "state_summary": "edited by the holder",
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True
+    assert body["parcel_id"] == parcel
+    assert "event_seq" in body
+
+    row = {p["id"]: p for p in client.get("/parcels").json()}[parcel]
+    assert row["content_hash"] == "deadbeef"
+    assert row["state_summary"] == "edited by the holder"
+
+
+def test_parcel_update_refused_once_the_write_lease_expires(client, fixture_repo):
+    """Liveness is on SQLite's own clock: once the holder's lease EXPIRES, its own
+    later update is refused (an expired lease is not ownership). Uses a tiny TTL so
+    the lease lapses without a foreign acquirer, isolating the liveness predicate."""
+    _index(client, fixture_repo)
+    parcel = "mod_a.py::helper"
+    _lease(client, "agent-A", parcel, mode="write", ttl=0.05)
+    time.sleep(0.2)
+
+    r = client.post(
+        "/parcel/update",
+        json={"agent_id": "agent-A", "parcel_id": parcel, "content_hash": "cccc"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["ok"] is False
 
 
 def test_parcel_update_unknown_parcel_is_404(client, fixture_repo):
