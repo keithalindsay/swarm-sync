@@ -58,7 +58,7 @@ import sqlite3
 import time
 from typing import Optional
 
-from swarmsync.server import events as events_mod
+from swarmsync.blackboard import events as events_mod
 
 logger = logging.getLogger(__name__)
 

@@ -18,7 +18,7 @@ from swarmsync.agent import mutators
 from swarmsync.agent.client import BlackboardClient
 from swarmsync.classifier.graph import SymbolModeError
 from swarmsync.coordinator import broker
-from swarmsync.server import leases as leases_mod
+from swarmsync.blackboard import leases as leases_mod
 from swarmsync.server.app import create_app
 from swarmsync.worktree import git_ops
 

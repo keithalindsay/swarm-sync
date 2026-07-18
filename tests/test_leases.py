@@ -13,7 +13,7 @@ import time
 import pytest
 
 from swarmsync.blackboard import db
-from swarmsync.server import leases
+from swarmsync.blackboard import leases
 
 
 @pytest.fixture()
