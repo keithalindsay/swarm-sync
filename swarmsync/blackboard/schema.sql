@@ -1,10 +1,27 @@
 -- swarm-sync blackboard schema (DESIGN.md §4.1)
 -- SQLite in WAL mode: single-writer, concurrent readers, ACID transactions.
--- The `events` table is the append-only pheromone/audit log and is the source of
--- truth for recovery: parcels/leases/pheromone are projections replayable from it.
+-- The SQLite tables ARE the state of record. The `events` table is the
+-- append-only pheromone/audit log -- observability, NOT a recovery source:
+-- state writes and event emits are separate autocommit statements, several
+-- mutations (run_index, _ensure_parcel, pheromone decay) emit no event at all,
+-- and crash recovery reads the `open_integrations` projection (WP3.2), never a
+-- log replay.
 
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
+
+-- Database-level facts, one row per key. Keys in use:
+--   schema_version -- stamped by blackboard/db.py `init_db`; init_db REFUSES to
+--                     open a DB at any other version (see db.SCHEMA_VERSION for
+--                     the version history and the refuse-plus-rotate policy).
+--   managed_root   -- the repo root this DB file was first bound to (see
+--                     db.bind_managed_root); reusing a DB against a different
+--                     root would silently mix root-relative parcel ids.
+-- Additive -- CREATE TABLE IF NOT EXISTS needs no migration.
+CREATE TABLE IF NOT EXISTS meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS parcels (
   id            TEXT PRIMARY KEY,     -- "path::qualified.name" or "path::<module>"

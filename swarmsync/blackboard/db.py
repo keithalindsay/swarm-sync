@@ -2,10 +2,13 @@
 
 Build in Unit U1. Responsibilities:
   - open a sqlite3 connection in WAL mode (PRAGMA journal_mode=WAL, foreign_keys=ON)
-  - `init_db(path)`: execute schema.sql (idempotent CREATE TABLE IF NOT EXISTS)
+  - `init_db(path)`: execute schema.sql (idempotent CREATE TABLE IF NOT EXISTS),
+    gated on `SCHEMA_VERSION` -- refuses legacy/mismatched DBs (WP3.4)
   - `connect(path)`: open one more independent connection to the DB file
   - `transaction(conn)`: run a multi-statement write batch as ONE crisp,
     non-nesting transaction on a single connection
+  - `bind_managed_root` / `stored_managed_root`: pin a DB file to the one repo
+    root it coordinates (WP3.4; server wiring owned by a separate work package)
   - a `reset(path)` helper for tests
 
 **Connection model (S4).** WAL's promise is "one writer, many concurrent readers"
@@ -24,12 +27,37 @@ from __future__ import annotations
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator, Union
+from typing import Iterator, Optional, Union
 
 StrPath = Union[str, "Path"]
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 SCHEMA = SCHEMA_PATH.read_text()
+
+# Version of the schema this code reads and writes, stamped into `meta` under key
+# `schema_version` when `init_db` creates a fresh DB. The migration policy is
+# "refuse + rotate" (NOT a migration framework): `init_db` refuses to touch any DB
+# whose stamp is missing or different, and the operator rotates the old file aside
+# (`swarmsync-serve --fresh`) or deletes it and re-indexes.
+#
+# History:
+#   v1 -- every pre-`meta` DB (implicit; such DBs carry no stamp at all).
+#   v2 -- relative to the last public (v1) state: the `meta` table itself (WP3.4),
+#         the `open_integrations` crash-recovery projection (WP3.2), and the
+#         `idx_leases_reap` index (WP1.2).
+SCHEMA_VERSION = 2
+
+
+class SchemaVersionError(RuntimeError):
+    """The DB file's schema version is missing (legacy) or does not match
+    `SCHEMA_VERSION`. Raised by `init_db` BEFORE any DDL touches the file."""
+
+
+class ManagedRootMismatchError(RuntimeError):
+    """The DB file is already bound (`meta.managed_root`) to a DIFFERENT repo root.
+
+    Parcel ids are root-relative, so proceeding would silently mix two repos'
+    parcel maps. Raised by `bind_managed_root`."""
 
 # All tables the schema is expected to create. Kept explicit (rather than parsed out
 # of schema.sql) so a test can assert against a known-good list independent of the
@@ -97,9 +125,54 @@ def init_db(path: StrPath) -> sqlite3.Connection:
     `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`, so a second call
     on an already-initialized DB is a no-op (no errors, no data loss, no duplicate
     tables/indexes).
+
+    **Schema versioning -- the migration policy IS "refuse + rotate" (WP3.4).**
+    There is deliberately no migration framework. A fresh DB is created at
+    `SCHEMA_VERSION` and stamped in `meta`; any existing DB whose stamp is missing
+    (legacy, pre-`meta`) or different (older OR newer code wrote it) is REFUSED
+    with `SchemaVersionError` before any DDL runs -- `CREATE ... IF NOT EXISTS`
+    would otherwise silently leave such a DB half-shaped. The remedy is to rotate
+    the old file aside (`swarmsync-serve --fresh`) or delete it and re-index.
     """
     conn = connect(path)
+    # Inspect sqlite_master BEFORE running the schema script: once
+    # `CREATE ... IF NOT EXISTS` has run, a legacy DB and a fresh one are
+    # indistinguishable, which is exactly how legacy DBs got stranded silently.
+    names = {
+        row["name"]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    version: Optional[str] = None
+    if "meta" in names:
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key = 'schema_version'"
+        ).fetchone()
+        if row is not None:
+            version = row["value"]
+    if version is None and any(table in names for table in EXPECTED_TABLES):
+        conn.close()
+        raise SchemaVersionError(
+            f"blackboard DB {path} predates schema versioning (schema v1: "
+            "application tables exist but no `meta` schema_version stamp); "
+            f"this code requires schema v{SCHEMA_VERSION} and has no migration "
+            "system. Remedy: run `swarmsync-serve --fresh` to rotate the old "
+            "DB aside, or delete the DB file and re-index."
+        )
+    if version is not None and version != str(SCHEMA_VERSION):
+        conn.close()
+        raise SchemaVersionError(
+            f"blackboard DB {path} is schema v{version}, but this code "
+            f"requires schema v{SCHEMA_VERSION} (the stamp may come from older "
+            "or newer swarm-sync code; there is no migration system). Remedy: "
+            "run `swarmsync-serve --fresh` to rotate the old DB aside, or "
+            "delete the DB file and re-index."
+        )
+    # Fresh DB, or an already-stamped current-version DB (idempotent no-op).
     conn.executescript(SCHEMA)
+    conn.execute(
+        "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)",
+        (str(SCHEMA_VERSION),),
+    )
     return conn
 
 
@@ -145,3 +218,47 @@ def reset(path: StrPath) -> None:
         candidate = Path(str(p) + suffix)
         if candidate.exists():
             candidate.unlink()
+
+
+def bind_managed_root(conn: sqlite3.Connection, root: str) -> None:
+    """Pin the blackboard DB behind `conn` to the ONE repo root it coordinates.
+
+    Parcel ids are `<relpath>::<symbol>` -- relative to the indexed root -- so
+    reusing a DB file against a DIFFERENT repo silently mixes two repos' parcel
+    maps (finding U8). This helper makes the binding explicit and sticky:
+
+      - first call: stores `root` in `meta` under key `managed_root`;
+      - later calls with the SAME root: no-op;
+      - a DIFFERENT root: raises `ManagedRootMismatchError` naming both roots.
+
+    `conn` must be to an `init_db`-initialized DB (the `meta` table must exist).
+    The first-bind write is `INSERT OR IGNORE` + read-back, so two concurrent
+    first binds race safely: exactly one wins, the other either no-ops (same
+    root) or raises (different root).
+
+    NOTE (WP3.4 scope): server wiring -- calling this from `server/app.py`'s
+    startup against the configured managed root -- is owned by a separate work
+    package; this module only provides the primitive.
+    """
+    conn.execute(
+        "INSERT OR IGNORE INTO meta (key, value) VALUES ('managed_root', ?)",
+        (root,),
+    )
+    stored = stored_managed_root(conn)
+    if stored != root:
+        raise ManagedRootMismatchError(
+            f"blackboard DB is bound to managed root {stored!r}, but this server "
+            f"is coordinating {root!r}. Parcel ids are root-relative, so reusing "
+            "the DB across repos would silently mix their parcel maps. Remedy: "
+            "run `swarmsync-serve --fresh` to rotate the old DB aside, or point "
+            f"the server back at the original root ({stored!r})."
+        )
+
+
+def stored_managed_root(conn: sqlite3.Connection) -> Optional[str]:
+    """Return the repo root this DB is bound to (`meta.managed_root`), or None
+    if `bind_managed_root` has never been called on it."""
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key = 'managed_root'"
+    ).fetchone()
+    return None if row is None else str(row["value"])
