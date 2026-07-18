@@ -77,6 +77,10 @@ from typing import Any, Callable, Mapping, Optional, TextIO
 import httpx
 
 from swarmsync.agent.client import BlackboardClient
+from swarmsync.blackboard.models import (
+    LEASE_TTL_FLOOR_SECONDS,
+    LEASE_TTL_MAX_SECONDS,
+)
 from swarmsync.classifier.indexer import MODULE_SYMBOL, parse_file
 
 # --- config ------------------------------------------------------------------
@@ -107,16 +111,49 @@ EDIT_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
 HttpFactory = Callable[[str], Any]
 
 
-def _hook_lease_ttl() -> float:
-    """The lease TTL (seconds) the hook acquires/renews with -- `SWARMSYNC_LEASE_TTL`
-    if it parses as a float, else `DEFAULT_HOOK_LEASE_TTL_SECONDS`."""
+def _hook_lease_ttl(err: TextIO = sys.stderr) -> float:
+    """The lease TTL (seconds) the hook acquires/renews with, from `SWARMSYNC_LEASE_TTL`.
+
+    C9: a nonsensical env value must NOT silently disable protection. The old version
+    accepted ANY float, so a single config typo (`SWARMSYNC_LEASE_TTL=0`) parsed fine
+    and every hook-path lease was born expired -- granted AND dead, so a second agent
+    was also granted while prechecks kept saying "allow". Now a value that is not a
+    finite float, is `<= 0`, or exceeds the ceiling is REFUSED: we log a one-line note
+    to stderr (Claude Code doesn't surface stderr to the model, but a curious operator
+    sees it) and fall back to the safe DEFAULT rather than the caller's poison value.
+
+    C13 (defense-in-depth): a value below `LEASE_TTL_FLOOR_SECONDS` (2x the SQLite
+    busy_timeout) is still USED -- the hook's own keepalive tests legitimately run
+    sub-second TTLs -- but warned about, since in a real deployment a TTL that small
+    shrinks the live window toward request latency and can reopen the heartbeat race.
+    """
     raw = os.environ.get("SWARMSYNC_LEASE_TTL")
     if raw is None:
         return DEFAULT_HOOK_LEASE_TTL_SECONDS
     try:
-        return float(raw)
-    except ValueError:
+        ttl = float(raw)
+    except (ValueError, TypeError):
+        err.write(
+            f"swarmsync-hook: SWARMSYNC_LEASE_TTL={raw!r} is not a number; "
+            f"falling back to default {DEFAULT_HOOK_LEASE_TTL_SECONDS}s\n"
+        )
         return DEFAULT_HOOK_LEASE_TTL_SECONDS
+    # `float('nan')`/`float('inf')` parse but are not usable TTLs; the `not > 0` /
+    # `> max` checks below reject inf, and nan fails every comparison so catch it too.
+    if ttl != ttl or ttl <= 0 or ttl > LEASE_TTL_MAX_SECONDS:
+        err.write(
+            f"swarmsync-hook: SWARMSYNC_LEASE_TTL={raw!r} is out of bounds "
+            f"(0 < ttl <= {LEASE_TTL_MAX_SECONDS}); falling back to default "
+            f"{DEFAULT_HOOK_LEASE_TTL_SECONDS}s rather than disabling lease protection\n"
+        )
+        return DEFAULT_HOOK_LEASE_TTL_SECONDS
+    if ttl < LEASE_TTL_FLOOR_SECONDS:
+        err.write(
+            f"swarmsync-hook: SWARMSYNC_LEASE_TTL={ttl}s is below the recommended "
+            f"floor of {LEASE_TTL_FLOOR_SECONDS}s (2x the SQLite busy_timeout); a TTL "
+            "this small can race the heartbeat liveness check under load\n"
+        )
+    return ttl
 
 
 def _default_http_factory(base_url: str) -> httpx.Client:

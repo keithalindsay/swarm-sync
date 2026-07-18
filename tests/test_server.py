@@ -178,6 +178,77 @@ def test_lease_read_read_both_granted(client, fixture_repo):
     assert r2.json()["granted"] is True
 
 
+# --- C9: TTL must be validated; a ttl<=0 must never double-grant --------------------
+
+
+def test_lease_rejects_zero_ttl_and_never_grants_two_writers(client, fixture_repo):
+    """C9 regression. A `ttl <= 0` makes `ttl_expires_at = now + ttl` land in the
+    past, so the lease is granted AND already expired: the CAS predicate treats it as
+    non-blocking and a SECOND agent is ALSO granted -- two writers on one parcel, both
+    told they hold the lock. Pre-fix this test would see two `granted: True` bodies;
+    post-fix `POST /lease {"ttl": 0}` is a 422 and NOTHING is granted.
+    """
+    _index(client, fixture_repo)
+
+    r1 = client.post(
+        "/lease",
+        json={"agent_id": "agent-1", "parcel_id": "mod_a.py::helper",
+              "mode": "write", "ttl": 0},
+    )
+    assert r1.status_code == 422, r1.text
+
+    r2 = client.post(
+        "/lease",
+        json={"agent_id": "agent-2", "parcel_id": "mod_a.py::helper",
+              "mode": "write", "ttl": 0},
+    )
+    assert r2.status_code == 422, r2.text
+
+    # The load-bearing property: no lease was born at all, so there is nothing to
+    # double-grant. (Pre-fix, two active write leases would exist here.)
+    active = client.get("/leases").json()
+    assert active == [], f"a rejected ttl still created leases: {active}"
+
+
+def test_lease_rejects_negative_and_over_ceiling_ttl(client, fixture_repo):
+    _index(client, fixture_repo)
+    for bad in (-1.0, 86400.0 + 1):
+        r = client.post(
+            "/lease",
+            json={"agent_id": "agent-1", "parcel_id": "mod_a.py::helper",
+                  "mode": "write", "ttl": bad},
+        )
+        assert r.status_code == 422, f"ttl={bad} was accepted: {r.text}"
+    assert client.get("/leases").json() == []
+
+
+def test_lease_accepts_a_valid_positive_ttl(client, fixture_repo):
+    """Guard against over-rejection: a sane in-bounds TTL still grants normally."""
+    _index(client, fixture_repo)
+    r = client.post(
+        "/lease",
+        json={"agent_id": "agent-1", "parcel_id": "mod_a.py::helper",
+              "mode": "write", "ttl": 30.0},
+    )
+    assert r.status_code == 200
+    assert r.json()["granted"] is True
+
+
+def test_heartbeat_rejects_nonpositive_ttl(client, fixture_repo):
+    """C9: the same bound guards renewal -- a ttl<=0 heartbeat would push the lease
+    into the past and revive the double-lease `heartbeat`'s liveness guard prevents."""
+    _index(client, fixture_repo)
+    lease = client.post(
+        "/lease",
+        json={"agent_id": "agent-1", "parcel_id": "mod_a.py::helper", "mode": "write"},
+    ).json()
+    r = client.post(
+        "/heartbeat",
+        json={"agent_id": "agent-1", "lease_id": lease["lease_id"], "ttl": 0},
+    )
+    assert r.status_code == 422, r.text
+
+
 # --- done-when: POST /intent returns expected shape --------------------------------
 
 

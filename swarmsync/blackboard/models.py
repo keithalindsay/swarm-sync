@@ -14,7 +14,26 @@ from __future__ import annotations
 
 from typing import Literal, Optional
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
+
+# --- TTL bounds (C9) ---------------------------------------------------------------
+# A lease TTL must be STRICTLY positive. A `ttl <= 0` makes
+# `ttl_expires_at = now + ttl` land in the past, so the lease is granted AND already
+# expired: `server.leases.acquire`'s CAS predicate (`ttl_expires_at > now`) treats the
+# born-dead row as non-blocking, so a SECOND agent is ALSO immediately granted -- two
+# writers on one parcel, both told they hold the lock. The ceiling guards the
+# symmetric hazard: a huge TTL is an effectively permanent lease the reaper never
+# fires on. Enforced as pydantic field constraints on the wire bodies below, so
+# `POST /lease {"ttl": 0}` is a 422 rather than a silent double-grant.
+LEASE_TTL_MAX_SECONDS = 86400.0  # 24h
+
+# Defense-in-depth floor (C13): a TTL should comfortably exceed the SQLite
+# `busy_timeout` (5s, see blackboard/db.py) -- ideally >= 2x it -- so the heartbeat
+# liveness predicate can never be raced by a lock wait that shrinks the live window
+# toward request latency. NOT enforced on the wire: the hook's own keepalive tests
+# deliberately use sub-second TTLs to exercise renewal quickly, so a hard floor would
+# be a false constraint here. Callers that can (the hook adapter) warn below it.
+LEASE_TTL_FLOOR_SECONDS = 10.0  # 2x the 5s busy_timeout
 
 # --- literals mirroring the CHECK-by-convention columns in schema.sql -------------
 
@@ -140,7 +159,9 @@ class LeaseRequest(BaseModel):
     parcel_id: str
     mode: LeaseMode = "write"
     intent: Optional[str] = None
-    ttl: Optional[float] = None
+    # C9: a TTL, when supplied, must be strictly positive and within the ceiling.
+    # None means "use the server's default window" (server.leases.DEFAULT_TTL_SECONDS).
+    ttl: Optional[float] = Field(default=None, gt=0, le=LEASE_TTL_MAX_SECONDS)
     # Opt-in whole-file parcel auto-creation for callers (the hook adapter) that
     # lease arbitrary real files rather than ids resolved from a real index.
     # See `server.leases._ensure_parcel`.
@@ -165,7 +186,9 @@ class HeartbeatBody(BaseModel):
     # Optional TTL (seconds) to renew with; None -> the server's default window.
     # The hook keepalive (S5) sends its own long TTL so a renewed lease keeps the
     # long window instead of collapsing back to the short server default.
-    ttl: Optional[float] = None
+    # C9: same bounds as LeaseRequest -- a renewal with ttl <= 0 would push the lease
+    # into the past and revive the double-lease `heartbeat`'s liveness guard prevents.
+    ttl: Optional[float] = Field(default=None, gt=0, le=LEASE_TTL_MAX_SECONDS)
 
 
 class ParcelUpdateBody(BaseModel):
