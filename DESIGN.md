@@ -188,13 +188,16 @@ CREATE TABLE events (
 );
 ```
 
-The **`events` table is the pheromone trail and the source of truth for recovery of leases and
-pheromone**: `leases` and `pheromone` are pure projections of the event log (grants, releases, reaps,
-heartbeats, decay) and can be rebuilt by replaying it. **`parcels` and `contracts` are NOT
-event-replayable** — they hold derived facts about the *current source on disk* (byte spans,
-`content_hash`, `blast_radius`, signatures) that the event log never carries; recovering them means
-re-running the classifier (`POST /index` / `classifier.store.run_index`) against the live worktree, not
-replaying history. See §6's failure-handling table for the full recovery story. The load-bearing
+The **`events` table is the pheromone trail — an append-only audit/observability log. The SQLite
+tables themselves are the state of record**; events are NOT a recovery source. Three concrete reasons
+(finding C7): state writes and event emits are separate autocommit statements (a crash can land one
+without the other), several mutations emit no event at all (`run_index`, `_ensure_parcel`, pheromone
+decay), and nothing in the system replays the log — crash recovery reads the `open_integrations`
+projection (WP3.2), which is maintained transactionally alongside its events. `parcels` and
+`contracts` hold derived facts about the *current source on disk* (byte spans, `content_hash`,
+`blast_radius`, signatures); recovering them means re-running the classifier (`POST /index` /
+`classifier.store.run_index`) against the live worktree, not consulting history. See §6's
+failure-handling table for the full recovery story. The load-bearing
 stigmergic signal is `parcels.state_summary` — the live semantic reality every agent reads before
 acting.
 
@@ -333,8 +336,8 @@ read-dependencies. A mismatch means a dependency shifted mid-work → forced reb
 | **Hot-parcel starvation** | A high-blast-radius parcel everyone needs serializes work. Frozen contracts let *readers* proceed without a write-lease; writers queue. Parallelism degrades toward serial but stays **correct**. |
 | **Classifier miss** (dynamic dispatch, reflection, string imports defeat the static graph) | Conservative fallback: when the AST is uncertain about a symbol's boundaries or references, the parcel falls back to **file** granularity, and the test gate is the backstop. |
 | **Lying blackboard** (agent writes a stale/wrong summary) | The integrator **regenerates** `state_summary` deterministically on merge; agent-written summaries are advisory only. |
-| **Blackboard SPOF / corruption** | SQLite WAL durability + the append-only `events` log allow recovery, but the recovery path is **not** a uniform "replay everything": **leases and pheromone are event-replayable** (both are pure projections of `events` — grants/releases/reaps/heartbeats/decay — and rebuild by replaying it); **parcels and contracts are NOT** — they hold derived facts about the current on-disk source (spans, `content_hash`, `blast_radius`, signatures) that the event log doesn't carry, so recovering them means **re-running the classifier** (`POST /index`) against the live worktree, not replaying history. Single-writer server avoids write contention. |
-| **Coordinator/server crash** | On restart: replay `events` to rebuild the active-lease set and pheromone (see above), and re-run the classifier over the repo to repopulate `parcels`/`contracts`; git worktree state on disk is authoritative for the rest, so nothing here trusts staleness in the DB. |
+| **Blackboard SPOF / corruption** | SQLite WAL durability protects the tables, and **the tables are the state of record** — the append-only `events` log is audit/observability only, **not** a rebuild source (state writes and event emits are separate statements, and several mutations emit no event; finding C7). If the DB file itself is lost or corrupt: rotate it aside (`swarmsync-serve --fresh`) and **re-run the classifier** (`POST /index`) against the live worktree to repopulate `parcels`/`contracts`; leases and pheromone are ephemeral coordination state and restart empty. Single-writer server avoids write contention. |
+| **Coordinator/server crash** | On restart: read the `open_integrations` projection (`reconcile_orphaned_integrations`, WP3.2) to roll back any integrate that died without a verdict — **no event-log replay** — and re-run the classifier over the repo to repopulate `parcels`/`contracts`; surviving leases in the tables simply age out via the reaper. Git worktree state on disk is authoritative for the rest, so nothing here trusts staleness in the DB. |
 | **Lease livelock on a hot parcel** | Bounded retries with backoff, then escalate to a FIFO exclusive lease so contenders serialize instead of spinning. |
 | **Multi-host deployment** | Out of scope, not merely undocumented: the blackboard is a **single SQLite file** referenced by filesystem path (`SWARM_SYNC_DB`/`--db`), and every agent's git worktree (`worktree/git_ops.py`) is a plain directory under the repo's `.git`. Both assume one shared filesystem and one host. There is no network-attached DB, no distributed lock, and no cross-host worktree sharing — running agents across multiple machines against the "same" blackboard is unsupported and will not serialize correctly (SQLite's WAL locking guarantees hold only for local-filesystem access, not NFS/network mounts). |
 
