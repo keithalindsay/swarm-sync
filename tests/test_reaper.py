@@ -302,6 +302,60 @@ async def test_run_reaps_and_decays_over_bounded_iterations(conn):
 
 
 @pytest.mark.asyncio
+async def test_run_survives_transient_error_and_reaps_on_next_pass(conn, monkeypatch):
+    """C4 regression: a transient `sqlite3.OperationalError` in ONE pass (exactly
+    what a busy-timeout loss raises) must NOT kill the reaper. The loop logs it and
+    keeps going, so the very next pass still reaps. Before the fix, `run()` had no
+    try/except and the first raise propagated straight out of the loop -- the task
+    died permanently, and this coroutine re-raised instead of reaping.
+    """
+    import sqlite3
+
+    parcel_id = _make_parcel(conn)
+    leases.acquire(conn, parcel_id, "agent-dead", mode="write", ttl=-1.0)
+
+    real_reap = reaper.reap_once
+    calls = {"n": 0}
+
+    def flaky_reap(c, now=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real_reap(c, now)
+
+    monkeypatch.setattr(reaper, "reap_once", flaky_reap)
+
+    # Pass 1 raises (must be swallowed + logged); pass 2 must still run and reap.
+    await reaper.run(conn, interval=0.0, half_life=60.0, iterations=2)
+
+    assert calls["n"] == 2  # loop survived the first raise and ran a second pass
+    row = conn.execute(
+        "SELECT status FROM leases WHERE agent_id = 'agent-dead'"
+    ).fetchone()
+    assert row["status"] == "reaped"
+
+
+@pytest.mark.asyncio
+async def test_run_logs_transient_error_at_warning_with_traceback(conn, monkeypatch, caplog):
+    """The swallowed pass must not vanish silently: it is logged at WARNING with the
+    traceback so an operator can see the reaper hit (and recovered from) an error."""
+    import logging
+    import sqlite3
+
+    def boom_reap(c, now=None):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(reaper, "reap_once", boom_reap)
+
+    with caplog.at_level(logging.WARNING):
+        await reaper.run(conn, interval=0.0, iterations=1)
+
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings, "expected a WARNING log for the swallowed reaper error"
+    assert any(r.exc_info for r in warnings), "expected the traceback (exc_info) to be logged"
+
+
+@pytest.mark.asyncio
 async def test_run_zero_iterations_is_a_noop(conn):
     # iterations=0 -> the loop body never executes, returns immediately.
     await reaper.run(conn, interval=0.0, iterations=0)

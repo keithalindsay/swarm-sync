@@ -33,6 +33,12 @@ CREATE TABLE IF NOT EXISTS leases (
   status         TEXT NOT NULL        -- active|released|reaped
 );
 CREATE INDEX IF NOT EXISTS idx_leases_active ON leases(parcel_id, status);
+-- The reaper's sweep (`UPDATE leases SET status='reaped' WHERE status='active'
+-- AND ttl_expires_at<=?`) matched no index and full-scanned the never-pruned
+-- leases table every interval (finding C4). This index makes it a range scan
+-- over just the active, past-TTL rows instead. Additive -- CREATE INDEX IF NOT
+-- EXISTS needs no migration.
+CREATE INDEX IF NOT EXISTS idx_leases_reap ON leases(status, ttl_expires_at);
 
 CREATE TABLE IF NOT EXISTS contracts (
   symbol    TEXT PRIMARY KEY,
