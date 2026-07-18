@@ -67,7 +67,7 @@ reaps. Test: shutdown after a poisoned reaper still closes connections. Mutation
 try/except → test fails.
 
 ### WP1.3 — TTL validation + clock assertion (C9, C13)
-**Files:** `blackboard/models.py`, `server/leases.py`, `hooks/adapter.py`, `server/serve.py`
+**Files:** `blackboard/models.py`, `blackboard/leases.py`, `hooks/adapter.py`, `server/serve.py`
 - `LeaseRequest.ttl` / `HeartbeatBody.ttl`: `gt=0`, ceiling (e.g. `le=86400`), floor documented as
   ≥ 2× busy_timeout (warn below it).
 - `_hook_lease_ttl`: clamp to the same bounds; a nonsensical env value logs to stderr and uses the
@@ -89,7 +89,7 @@ try/except → test fails.
 holder updates → succeeds. Mutation: drop the ownership predicate → test fails.
 
 ### WP1.5 — Same-agent lease idempotency in the hook (C8)
-**Files:** `hooks/adapter.py`, optionally `server/leases.py`
+**Files:** `hooks/adapter.py`, optionally `blackboard/leases.py`
 - After a lost acquire in `cmd_precheck`: if `_find_holder(...) == agent_id`, treat as ALLOW and
   keepalive instead of denying.
 - Preferred deeper fix (small, do it if clean): make `acquire` idempotent per `(parcel, agent,
@@ -156,7 +156,7 @@ the load-bearing pair. All four parallel except where noted.*
 allow. Mutation: remove the two-tier branch → test fails.
 
 ### WP2.4 — Deny messages that inform (U3, part of A6)
-**Files:** `server/leases.py`, `blackboard/models.py`, `hooks/adapter.py`
+**Files:** `blackboard/leases.py`, `blackboard/models.py`, `hooks/adapter.py`
 - `LeaseResult` gains `holder` and `ttl_expires_at` on the deny path (server already knows both;
   kills the adapter's second round-trip).
 - Hook deny reason becomes: file, holder, TTL-remaining, renewal caveat ("renews while the holder
@@ -172,7 +172,7 @@ this first, it's a superset seed).
 ## Phase 3 — Bound every resource
 
 ### WP3.1 — Events: clamp, retain, compact (S2, C3-adjacent)
-**Files:** `server/app.py`, `server/events.py`, `coordinator/reaper.py`
+**Files:** `server/app.py`, `blackboard/events.py`, `coordinator/reaper.py`
 - Clamp `GET /events?limit=` (e.g. `le=1000` in the query validator).
 - Retention: periodic compaction (piggyback the reaper cadence) deleting heartbeat/keepalive-class
   events older than a window and any event older than a configurable horizon, **except** events the
@@ -193,7 +193,7 @@ WP3.2 fails.
 re-run against the projection. Depends on: WP1.1.
 
 ### WP3.3 — Quota the auto-create paths (S1, S5)
-**Files:** `server/leases.py`, `server/app.py`
+**Files:** `blackboard/leases.py`, `server/app.py`
 - Per-agent cap on active leases and on `ensure_parcel`-minted parcels (config knob, generous
   default); shape/length validation on parcel ids accepted via `ensure_parcel`.
 - Add a request body-size middleware cap (S5) — one middleware, config knob, generous default.
@@ -299,7 +299,7 @@ path across the seam).
 adapter tests against the typed shapes. Depends on: WP2.4 (LeaseResult fields).
 
 ### WP4.6 — Small consistency debts (A7, A8-logging, C15, C16, C17, A1-decision)
-**Files:** `coordinator/broker.py`, `agent/runner.py`, `server/events.py`, `coordinator/integrator.py`,
+**Files:** `coordinator/broker.py`, `agent/runner.py`, `blackboard/events.py`, `coordinator/integrator.py`,
 `blackboard/models.py`
 - Broker: per-thread `db.connect()` in `_run_task_with_retries`; retire the shared-connection
   discipline and its scar-tissue comments.
