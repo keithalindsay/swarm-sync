@@ -26,6 +26,22 @@ acquire(conn, parcel_id, agent_id, mode, ttl) -> LeaseResult
     The exemption is same-statement (inside the atomic CAS itself), so it identifies the
     self-holder atomically and introduces no TOCTOU window.
 
+    Idempotent here is literal (WP3.3): a repeat same-(parcel, agent, mode) request
+    first REFRESHES the caller's existing active lease (a single UPDATE with the same
+    SQLite-clock liveness predicate as `heartbeat`) and returns `granted=True` with the
+    EXISTING lease id, so N re-acquires leave exactly one row and one lease_id the
+    caller can heartbeat/release. Only when no own live same-mode lease exists does the
+    CAS INSERT run. (Pre-WP3.3 the self-exemption alone made each re-acquire INSERT a
+    fresh duplicate row: callers tracking one lease_id could not cleanly free the
+    parcel, and the stray duplicate expired un-renewed later, emitting a spurious
+    `reaped` event.)
+
+    WP3.3 also bounds the acquire surface itself (findings S1/P2): a per-agent cap on
+    active leases (`SWARMSYNC_MAX_LEASES_PER_AGENT`, default 256) and, on the
+    `ensure_parcel` path, parcel-id shape validation -- both deny with a reason rather
+    than minting unbounded parcels/leases/events rows for any client that can reach
+    POST /lease.
+
     `cursor.rowcount == 1` -> granted (row inserted); `== 0` -> denied (NOT EXISTS
     failed, i.e. a conflicting lease is already active). An expired lease
     (`ttl_expires_at <= now`) is treated as not-active by the same WHERE clause, so
@@ -56,6 +72,7 @@ grant; after release, the parcel must be acquirable again.
 """
 from __future__ import annotations
 
+import os
 import sqlite3
 import time
 from typing import Optional
@@ -64,6 +81,52 @@ from swarmsync.blackboard.models import LeaseMode, LeaseResult
 from swarmsync.server.events import emit as _emit
 
 DEFAULT_TTL_SECONDS = 30.0
+
+# WP3.3 (finding S1/P2): cap how many active leases one agent id may hold at once.
+# `POST /lease` with `ensure_parcel=True` otherwise lets any client that clears the
+# token gate mint unlimited parcels rows + acquirable leases + events. The default is
+# deliberately generous -- a legitimate broker wave leases tens of parcels, not
+# hundreds -- and the knob is an env var so an operator with a genuinely huge repo can
+# raise it without a code change.
+DEFAULT_MAX_LEASES_PER_AGENT = 256
+MAX_LEASES_PER_AGENT_ENV = "SWARMSYNC_MAX_LEASES_PER_AGENT"
+
+# WP3.3 (finding S1/P2): bound on parcel-id shape for the `ensure_parcel` auto-create
+# path. Legitimate ids are `<relative-path>::<symbol>` (e.g. `path.py::<module>`,
+# `pkg/sub/file.ts::<module>`) -- always non-empty, short, single-line, NUL-free. The
+# cap only exists to reject abuse (multi-megabyte ids, log-forging newlines, NULs that
+# truncate in C consumers), not to constrain any id the indexer or hook can produce.
+MAX_PARCEL_ID_LENGTH = 512
+
+
+def _max_leases_per_agent() -> int:
+    """Per-agent active-lease cap, read from the env each call (test-friendly);
+    an unset/garbage value falls back to the generous default."""
+    raw = os.environ.get(MAX_LEASES_PER_AGENT_ENV)
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+    return DEFAULT_MAX_LEASES_PER_AGENT
+
+
+def _parcel_id_problem(parcel_id: str) -> Optional[str]:
+    """Return a human-readable reason to reject `parcel_id`, or None if it is sane.
+
+    Only used on the `ensure_parcel` path: a non-ensure acquire on a bogus id already
+    fails on the parcels FK. All ids the classifier/hook legitimately produce
+    (relative paths + `::<symbol>`) pass; this rejects only the abuse shapes."""
+    if not parcel_id:
+        return "parcel_id is empty"
+    if len(parcel_id) > MAX_PARCEL_ID_LENGTH:
+        return (
+            f"parcel_id is {len(parcel_id)} chars long "
+            f"(max {MAX_PARCEL_ID_LENGTH})"
+        )
+    if "\x00" in parcel_id or "\n" in parcel_id or "\r" in parcel_id:
+        return "parcel_id contains a NUL or newline character"
+    return None
 
 # Epoch seconds from SQLite's OWN clock, evaluated when the statement is serialized
 # rather than when Python bound its parameters. Sub-second precision, and it agrees
@@ -142,11 +205,96 @@ def acquire(
     if mode not in ("read", "write", "exclusive"):
         raise ValueError(f"unrecognized lease mode: {mode!r}")
 
-    if ensure_parcel:
-        _ensure_parcel(conn, parcel_id)
-
     now = time.time()
     ttl_expires_at = now + ttl
+
+    # WP3.3 A2: shape-validate the id BEFORE the auto-create can mint a row for it.
+    # Scoped to `ensure_parcel` -- without it, an unknown id fails on the parcels FK
+    # and a KNOWN id was already validated by whoever created it. Policy denials
+    # (this and the quota below) deliberately do NOT emit a `lease_denied` event:
+    # one event row per spam request would hand the flood we are bounding an
+    # unbounded write path into the events table instead.
+    if ensure_parcel:
+        problem = _parcel_id_problem(parcel_id)
+        if problem is not None:
+            return LeaseResult(granted=False, reason=f"invalid parcel_id: {problem}")
+
+    # WP3.3 C1: true idempotency -- FIRST try refreshing the caller's own existing
+    # active same-mode lease, so a repeat same-(parcel, agent, mode) acquire returns
+    # the EXISTING lease id instead of inserting a duplicate row per call. Liveness is
+    # the same SQLite-clock predicate as `heartbeat` (`_NOW_SQL`, not the Python `now`
+    # bound above): a stale Python clock here would refresh -- i.e. revive -- a lease
+    # that lapsed while the statement waited to serialize, exactly the C13 bug class
+    # heartbeat already guards against.
+    #
+    # Two statements (this UPDATE, then the CAS INSERT below) are TOCTOU-safe: if the
+    # UPDATE misses and ANOTHER agent's conflicting lease lands in the gap before our
+    # INSERT, the CAS's own NOT EXISTS sees it and cleanly DENIES us -- never a
+    # double-grant, because the grant decision itself is still single-statement-atomic.
+    # A same-agent thread racing us through the same gap can at worst duplicate-insert
+    # via the CAS's self-exemption (the pre-existing batched-race residue, now confined
+    # to genuinely simultaneous requests); every SEQUENTIAL re-acquire lands here and
+    # converges on one row.
+    refreshed = conn.execute(
+        f"""
+        UPDATE leases
+        SET heartbeat_at = {_NOW_SQL},
+            ttl_expires_at = {_NOW_SQL} + :ttl,
+            intent = COALESCE(:intent, intent)
+        WHERE parcel_id = :parcel_id AND agent_id = :agent_id AND mode = :mode
+          AND status = 'active' AND ttl_expires_at > {_NOW_SQL}
+        RETURNING id
+        """,  # noqa: S608 - _NOW_SQL is a module constant, never caller input
+        {
+            "ttl": ttl,
+            "intent": intent,
+            "parcel_id": parcel_id,
+            "agent_id": agent_id,
+            "mode": mode,
+        },
+    ).fetchall()
+    if refreshed:
+        # Should legacy/batched-race duplicates exist, all were refreshed above (none
+        # left to lapse into a spurious `reaped` event); report the first id.
+        lease_id = refreshed[0]["id"]
+        _emit(
+            conn,
+            "lease_granted",
+            agent_id,
+            {"parcel_id": parcel_id, "lease_id": lease_id, "mode": mode},
+            ts=now,
+        )
+        return LeaseResult(granted=True, lease_id=lease_id)
+
+    # WP3.3 A1: per-agent active-lease cap. Checked AFTER the refresh path (renewing a
+    # lease you already hold adds no rows, so the cap must never block it) and BEFORE
+    # `_ensure_parcel` (a capped agent must not keep minting parcels rows either). The
+    # count and the INSERT below are two statements, not one atomic step: N requests
+    # racing at the cap can each pass the count and over-admit by a few. That is
+    # acceptable -- this is a DoS bound on unbounded resource minting, not an exact
+    # admission quota, and the overshoot is bounded by the number of in-flight racers.
+    max_leases = _max_leases_per_agent()
+    active_count = conn.execute(
+        f"""
+        SELECT COUNT(*) FROM leases
+        WHERE agent_id = :agent_id AND status = 'active'
+          AND ttl_expires_at > {_NOW_SQL}
+        """,  # noqa: S608 - _NOW_SQL is a module constant, never caller input
+        {"agent_id": agent_id},
+    ).fetchone()[0]
+    if active_count >= max_leases:
+        # No single holder explains a quota denial, so the holder fields stay None.
+        return LeaseResult(
+            granted=False,
+            reason=(
+                f"per-agent lease cap reached: {agent_id!r} already holds "
+                f"{active_count} active leases (cap {max_leases}; raise "
+                f"{MAX_LEASES_PER_AGENT_ENV} if this is legitimate)"
+            ),
+        )
+
+    if ensure_parcel:
+        _ensure_parcel(conn, parcel_id)
     # RETURNING id (not `cur.lastrowid`): U12 is the first unit to genuinely
     # dispatch concurrent CAS acquires from multiple threads against this ONE
     # shared connection (the broker's co-schedulable waves). `cur.lastrowid`
@@ -223,7 +371,8 @@ def acquire(
     #      frees the parcel first, i.e. the earliest moment the caller could retry.
     holder_row = conn.execute(
         f"""
-        SELECT l.agent_id AS holder, l.ttl_expires_at AS holder_ttl_expires_at
+        SELECT l.agent_id AS holder, l.mode AS holder_mode,
+               l.ttl_expires_at AS holder_ttl_expires_at
         FROM leases l
         WHERE l.parcel_id = :parcel_id
           AND l.status = 'active'
@@ -242,7 +391,18 @@ def acquire(
     if holder_row is not None:
         holder = holder_row["holder"]
         holder_ttl_expires_at = holder_row["holder_ttl_expires_at"]
-        reason = f"conflicting active lease on {parcel_id!r} held by {holder!r}"
+        if holder == agent_id:
+            # WP3.3 C2: the best-explaining holder IS the requester (a cross-mode
+            # self-conflict, e.g. holding 'write' while requesting 'exclusive'). The
+            # deny is correct -- the modes really conflict -- but "held by 'you'"
+            # phrased as a third party tells the agent to wait for itself, which never
+            # resolves. Say it is their own lease; holder fields stay truthful.
+            reason = (
+                f"your own {holder_row['holder_mode']!r} lease on {parcel_id!r} "
+                f"conflicts with the requested {mode!r} (release it first)"
+            )
+        else:
+            reason = f"conflicting active lease on {parcel_id!r} held by {holder!r}"
 
     return LeaseResult(
         granted=False,
