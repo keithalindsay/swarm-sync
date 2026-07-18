@@ -601,3 +601,104 @@ def test_build_graph_tolerates_a_symbol_on_disk_with_no_parcel_row(tmp_path):
     graph = build_graph(parcels, tmp_path)  # must not raise KeyError
     assert "m.py::known" in graph.signatures
     assert "m.py::added_since_index" not in graph.signatures  # no parcel -> no signature
+
+
+# --- WP2.S: a denied acquire surfaces WHO holds the parcel and WHEN it expires ----
+# U3/A6: pre-fix, LeaseResult.reason was a bare string and the holder's identity/ttl
+# were never returned, forcing the hook adapter into a second /leases round-trip.
+
+
+def test_denied_write_names_the_conflicting_holder_and_ttl(conn):
+    """A DIFFERENT agent's denied write must name the current write holder and carry
+    that lease's ttl_expires_at as STRUCTURED fields (not just prose), so the caller
+    learns who blocks and when it frees without a second round-trip. Mutating out the
+    holder-population line drops these back to None and this fails."""
+    parcel_id = _make_parcel(conn)
+
+    r1 = leases.acquire(conn, parcel_id, "agent-holder", mode="write", ttl=30.0)
+    assert r1.granted
+    held = conn.execute(
+        "SELECT ttl_expires_at FROM leases WHERE id = ?", (r1.lease_id,)
+    ).fetchone()
+
+    r2 = leases.acquire(conn, parcel_id, "agent-other", mode="write")
+    assert r2.granted is False
+    assert r2.holder == "agent-holder"
+    assert r2.holder_ttl_expires_at == pytest.approx(held["ttl_expires_at"])
+    assert "agent-holder" in r2.reason  # human string enriched too
+
+
+def test_denied_read_against_write_holder_names_that_holder(conn):
+    """An incoming READ denied by a write holder still identifies that holder."""
+    parcel_id = _make_parcel(conn)
+    leases.acquire(conn, parcel_id, "agent-w", mode="write")
+    r = leases.acquire(conn, parcel_id, "agent-r", mode="read")
+    assert r.granted is False
+    assert r.holder == "agent-w"
+    assert r.holder_ttl_expires_at is not None
+
+
+def test_granted_acquire_leaves_holder_fields_none(conn):
+    """The granted path must be unchanged: no holder, no holder ttl."""
+    parcel_id = _make_parcel(conn)
+    r = leases.acquire(conn, parcel_id, "agent-1", mode="write")
+    assert r.granted is True
+    assert r.holder is None
+    assert r.holder_ttl_expires_at is None
+
+
+def test_same_agent_idempotent_reacquire_is_granted_with_no_holder(conn):
+    """Phase-1 WP1.5: a same-(parcel, agent, mode) re-acquire is GRANTED, so it is
+    NEVER a deny and must not populate holder fields (it would otherwise name the
+    agent as blocking itself)."""
+    parcel_id = _make_parcel(conn)
+    assert leases.acquire(conn, parcel_id, "agent-A", mode="write").granted is True
+    r2 = leases.acquire(conn, parcel_id, "agent-A", mode="write")
+    assert r2.granted is True
+    assert r2.holder is None
+    assert r2.holder_ttl_expires_at is None
+
+
+def test_denied_write_prefers_write_holder_over_blocking_readers(conn):
+    """Tie-break: multiple readers hold the parcel AND a write/exclusive holder also
+    does; the denied incoming write must name the WRITE/exclusive holder (the exclusive
+    owner whose release frees the parcel), not one of the readers."""
+    parcel_id = _make_parcel(conn)
+    # A live write holder and a live reader cannot BOTH be produced via acquire() on one
+    # parcel (the write would be denied), so seed the mixed set directly to exercise the
+    # ORDER BY tie-break: one active reader + one active write holder on the same parcel.
+    now = time.time()
+    conn.execute(
+        "INSERT INTO leases (parcel_id, agent_id, mode, acquired_at, ttl_expires_at, "
+        "heartbeat_at, status) VALUES (?, ?, 'read', ?, ?, ?, 'active')",
+        (parcel_id, "agent-reader", now, now + 5.0, now),
+    )
+    conn.execute(
+        "INSERT INTO leases (parcel_id, agent_id, mode, acquired_at, ttl_expires_at, "
+        "heartbeat_at, status) VALUES (?, ?, 'write', ?, ?, ?, 'active')",
+        (parcel_id, "agent-writer", now, now + 60.0, now),
+    )
+    r = leases.acquire(conn, parcel_id, "agent-new", mode="write")
+    assert r.granted is False
+    assert r.holder == "agent-writer"  # write holder wins the tie-break over the reader
+
+
+def test_denied_write_among_only_readers_picks_soonest_to_expire(conn):
+    """Tie-break fallback: when only readers block an incoming write, name the reader
+    that frees the parcel SOONEST (smallest ttl_expires_at), i.e. the earliest retry."""
+    parcel_id = _make_parcel(conn)
+    now = time.time()
+    conn.execute(
+        "INSERT INTO leases (parcel_id, agent_id, mode, acquired_at, ttl_expires_at, "
+        "heartbeat_at, status) VALUES (?, ?, 'read', ?, ?, ?, 'active')",
+        (parcel_id, "agent-late", now, now + 100.0, now),
+    )
+    conn.execute(
+        "INSERT INTO leases (parcel_id, agent_id, mode, acquired_at, ttl_expires_at, "
+        "heartbeat_at, status) VALUES (?, ?, 'read', ?, ?, ?, 'active')",
+        (parcel_id, "agent-soon", now, now + 5.0, now),
+    )
+    r = leases.acquire(conn, parcel_id, "agent-new", mode="write")
+    assert r.granted is False
+    assert r.holder == "agent-soon"
+    assert r.holder_ttl_expires_at == pytest.approx(now + 5.0)
