@@ -128,6 +128,7 @@ from typing import Any, Callable, Optional, Union
 
 from swarmsync.agent.runner import AgentResult, run_agent
 from swarmsync.blackboard.models import Parcel
+from swarmsync.blackboard.parcel_id import module_id as _module_id
 from swarmsync.classifier.graph import (
     DepGraph,
     build_graph,
@@ -139,7 +140,6 @@ from swarmsync.worktree.git_ops import GitOpsError
 
 StrPath = Union[str, Path]
 
-MODULE_SYMBOL = "<module>"
 DEFAULT_MAX_ATTEMPTS = 5
 DEFAULT_RETRY_BACKOFF = 0.2
 
@@ -168,10 +168,6 @@ class Task:
     read_deps: list[str] = field(default_factory=list)
     base_commit: Optional[str] = None
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
-
-
-def _module_id(file: str) -> str:
-    return f"{file}::{MODULE_SYMBOL}"
 
 
 def _load_parcel(conn: sqlite3.Connection, parcel_id: str) -> Optional[Parcel]:

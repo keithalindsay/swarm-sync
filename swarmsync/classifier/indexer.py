@@ -42,11 +42,14 @@ from typing import Optional, Union
 
 from swarmsync.blackboard.models import Parcel
 
+# Re-export (WP4.4): the id scheme now lives in `blackboard.parcel_id`, but
+# `hooks/adapter.py` and tests historically import MODULE_SYMBOL from here --
+# keep that path working.
+from swarmsync.blackboard.parcel_id import MODULE_SYMBOL as MODULE_SYMBOL
+
 logger = logging.getLogger(__name__)
 
 StrPath = Union[str, Path]
-
-MODULE_SYMBOL = "<module>"
 
 # Directory name fragments to never descend into when walking a repo tree.
 _SKIP_DIRS = {"__pycache__", ".git", ".venv", "venv", ".pytest_cache", "node_modules"}
