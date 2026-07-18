@@ -35,6 +35,7 @@ target parcel on the task's default `lease_mode`.
 """
 from __future__ import annotations
 
+import logging
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -48,6 +49,8 @@ StrPath = Union[str, Path]
 
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 5.0
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class AgentResult:
@@ -55,7 +58,7 @@ class AgentResult:
 
     agent_id: str
     task: str
-    status: str  # "done" | "lease_denied"
+    status: str  # "done" | "lease_denied" | "error"
     branch: Optional[str] = None
     commit_sha: Optional[str] = None
     lease_ids: dict[str, int] = field(default_factory=dict)
@@ -67,6 +70,10 @@ class AgentResult:
     # actually granted -- lets a caller/test confirm a frozen-contract target
     # really was leased `exclusive` (DESIGN §5.3, test case #3, U15), not
     # just whatever `lease_mode` it happened to pass.
+    error: Optional[str] = None  # "ExcType: message" summary when status == "error" (C11)
+    error_type: Optional[str] = None  # exception class name -- the broker's bounded
+    # GitOpsError retry (WP3.6) keys off this, so it must survive the
+    # exception object itself not crossing the thread boundary.
 
 
 class _Heartbeater:
@@ -202,6 +209,17 @@ def run_agent(
     ever created for a task that can't get all of its locks (DESIGN §5.2: a
     misprediction just loses the CAS race and serializes, it never partially
     proceeds).
+
+    C11 failure containment (WP3.6): an `Exception` anywhere in the work phase
+    (contract fetch, `add_worktree`, the mutator, `commit_all`, or the HTTP
+    calls after them) does NOT raise out of this function -- every lease this
+    attempt holds is released best-effort, the worktree is torn down as usual,
+    and a `status="error"` result is returned carrying the exception summary
+    (`error`) and class name (`error_type`). `KeyboardInterrupt`/`SystemExit`
+    still propagate. This covers IN-PROCESS exceptions only, and deliberately
+    does not change the crash-recovery story: a SIGKILLed agent process has
+    nothing to run an except path, so its leases still leak until TTL expiry /
+    the reaper reclaims them (DESIGN §6) -- that remains by design.
     """
     mutator_kwargs = mutator_kwargs or {}
     repo = Path(repo)
@@ -240,23 +258,39 @@ def run_agent(
         lease_ids[parcel_id] = result["lease_id"]
         lease_modes_used[parcel_id] = mode
 
-    # 4. read-dependency contracts (drift detection vs. a plan-time snapshot
-    # is the broker's/U12's job; this unit fetches the current state).
-    contract_snapshot: dict[str, Optional[dict]] = {
-        symbol: client.contract(symbol) for symbol in (read_contracts or [])
-    }
-
     heartbeater = _Heartbeater(client, agent_id, interval=heartbeat_interval)
     for lease_id in lease_ids.values():
         heartbeater.add(lease_id)
     heartbeater.start()
 
-    # Everything from here owns a worktree; the outer `finally` tears it down
-    # after integrate/release -- and on any mid-way failure too -- so nothing
-    # leaks for a rerun to collide with (S5). `landed` stays False unless the
-    # integrator reports `merged`, so a failure anywhere in here keeps the branch.
+    # Everything from here holds leases (and soon a worktree); the outer `finally`
+    # tears the worktree down after integrate/release -- and on any mid-way failure
+    # too -- so nothing leaks for a rerun to collide with (S5). `landed` stays False
+    # unless the integrator reports `merged`, so a failure anywhere in here keeps
+    # the branch.
+    #
+    # C11 failure containment (the `except` below): any `Exception` out of this
+    # work phase -- the contract fetch, `add_worktree`, the mutator, `commit_all`,
+    # or the HTTP calls that follow -- used to propagate to the caller with every
+    # acquired lease still ACTIVE until TTL expiry (leaked), and the broker then
+    # re-raised it out of `future.result()`, aborting the whole run. Now the
+    # except path releases every lease this attempt holds (best-effort) and
+    # returns a structured `status="error"` result instead of raising.
+    # `KeyboardInterrupt`/`SystemExit` are deliberately NOT masked (Exception,
+    # not BaseException). This covers in-process exceptions ONLY and does not
+    # change the crash-recovery story: a SIGKILLed agent process runs no except
+    # path, so its leases still leak until TTL/reaper reclaim (DESIGN §6) -- by
+    # design, and the reaper is exactly the backstop for that case.
+    contract_snapshot: dict[str, Optional[dict]] = {}
     landed = False
     try:
+        # 4. read-dependency contracts (drift detection vs. a plan-time snapshot
+        # is the broker's/U12's job; this unit fetches the current state). Inside
+        # containment because the leases are already held here: a failing GET must
+        # release them like any other work-phase failure.
+        for symbol in read_contracts or []:
+            contract_snapshot[symbol] = client.contract(symbol)
+
         # 5. isolated worktree + the scripted (or real) edit.
         #
         # The heartbeat must outlive this block: step 6 posts /parcel/update and
@@ -315,6 +349,43 @@ def run_agent(
             contract_snapshot=contract_snapshot,
             integrate_result=integrate_result,
             lease_modes_used=lease_modes_used,
+        )
+    except Exception as exc:
+        # C11: contain the failure -- see the comment above the `try`. Release
+        # every lease this attempt still holds so siblings/retries can proceed
+        # immediately instead of waiting out the TTL. Best-effort: a lease that
+        # was already released on the success path just fails its re-release
+        # harmlessly, and a release the server refuses (or can't receive) is
+        # logged and left to the reaper.
+        for parcel_id, lease_id in lease_ids.items():
+            try:
+                client.release(agent_id, lease_id)
+            except Exception as release_exc:
+                logger.warning(
+                    "run_agent(%s): best-effort release of lease %s (%s) failed "
+                    "during error containment: %s -- leaving it to the TTL/reaper",
+                    agent_id,
+                    lease_id,
+                    parcel_id,
+                    release_exc,
+                )
+        summary = f"{type(exc).__name__}: {exc}"
+        logger.warning(
+            "run_agent(%s): task %r failed in the work phase (%s); leases released, "
+            "returning a structured error result",
+            agent_id,
+            task,
+            summary,
+        )
+        return AgentResult(
+            agent_id=agent_id,
+            task=task,
+            status="error",
+            lease_ids=lease_ids,
+            contract_snapshot=contract_snapshot,
+            lease_modes_used=lease_modes_used,
+            error=summary,
+            error_type=type(exc).__name__,
         )
     finally:
         # Stopping the beat here (rather than after commit_all) is what keeps this

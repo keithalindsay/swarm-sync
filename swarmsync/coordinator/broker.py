@@ -117,6 +117,7 @@ Design notes (this unit's own decisions):
 """
 from __future__ import annotations
 
+import logging
 import sqlite3
 import threading
 import time
@@ -134,12 +135,15 @@ from swarmsync.classifier.graph import (
     co_schedulable,
 )
 from swarmsync.coordinator import reaper
+from swarmsync.worktree.git_ops import GitOpsError
 
 StrPath = Union[str, Path]
 
 MODULE_SYMBOL = "<module>"
 DEFAULT_MAX_ATTEMPTS = 5
 DEFAULT_RETRY_BACKOFF = 0.2
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -383,6 +387,101 @@ def _run_task_with_retries(
     return result
 
 
+def _error_result(task: Task, exc: Exception) -> AgentResult:
+    """A structured `status="error"` result for a task whose runner RAISED (rather
+    than returning `run_agent`'s own contained error result) -- same shape either
+    way, so `run`'s callers see one uniform error surface."""
+    return AgentResult(
+        agent_id=f"{task.task_id}-broker",
+        task=task.task_id,
+        status="error",
+        error=f"{type(exc).__name__}: {exc}",
+        error_type=type(exc).__name__,
+    )
+
+
+def _contained_attempt(
+    conn: sqlite3.Connection,
+    repo: StrPath,
+    client: Any,
+    task: Task,
+    mode: str,
+    retry_backoff: float,
+    frozen_ids: Optional[set[str]] = None,
+) -> AgentResult:
+    """One full `_run_task_with_retries` pass that can FAIL but never RAISE.
+
+    `run_agent` already contains its own work-phase exceptions (C11), so a raise
+    reaching here means something outside that containment blew up (resolve_task
+    against a mutated blackboard, the reaper pass, or a runner bug). Either way
+    the broker's contract is the same: record an error result for THIS task and
+    let the rest of the run proceed."""
+    try:
+        return _run_task_with_retries(
+            conn, repo, client, task, mode, retry_backoff, frozen_ids=frozen_ids
+        )
+    except Exception as exc:
+        logger.warning(
+            "broker: task %r raised %s: %s -- recording an error result and "
+            "continuing the run",
+            task.task_id,
+            type(exc).__name__,
+            exc,
+        )
+        return _error_result(task, exc)
+
+
+def _is_transient_git_failure(result: AgentResult) -> bool:
+    """True iff this error result came from a `GitOpsError` -- git's own transient
+    ref/index lock contention, the one failure class concurrent `git worktree
+    add`/checkout in a single repo can hit under exactly the concurrency the
+    broker creates, and therefore the one class worth a bounded retry."""
+    return result.status == "error" and result.error_type == GitOpsError.__name__
+
+
+def _run_task_contained(
+    conn: sqlite3.Connection,
+    repo: StrPath,
+    client: Any,
+    task: Task,
+    mode: str,
+    retry_backoff: float,
+    frozen_ids: Optional[set[str]] = None,
+) -> AgentResult:
+    """C11/WP3.6 broker containment: drive one task, absorbing failure.
+
+    A per-task failure -- whether `run_agent`'s contained `status="error"` result
+    or an outright raise -- is recorded as that task's result; it never aborts the
+    run or discards sibling results. One class gets a single bounded retry: a
+    `GitOpsError` (identified via `error_type`, since the exception object itself
+    is contained inside the runner) is transient git lock contention, so the task
+    is re-run ONCE under the same task id (fresh worktree -- `add_worktree` prunes
+    the failed attempt's leftovers). The retry is logged at WARNING so it is
+    inspectable; a second failure of any kind records the error result. Arbitrary
+    non-git errors are NOT presumed transient and are never silently re-run."""
+    result = _contained_attempt(
+        conn, repo, client, task, mode, retry_backoff, frozen_ids=frozen_ids
+    )
+    if _is_transient_git_failure(result):
+        logger.warning(
+            "broker: task %r failed with a GitOpsError (%s) -- transient git "
+            "lock contention; retrying once",
+            task.task_id,
+            result.error,
+        )
+        result = _contained_attempt(
+            conn, repo, client, task, mode, retry_backoff, frozen_ids=frozen_ids
+        )
+        if result.status == "error":
+            logger.warning(
+                "broker: task %r failed again after its one GitOpsError retry "
+                "(%s) -- recording the error result",
+                task.task_id,
+                result.error,
+            )
+    return result
+
+
 def run(
     conn: sqlite3.Connection,
     repo: StrPath,
@@ -403,7 +502,11 @@ def run(
        `_SerializingIntegrateClient`.
 
     Returns `{task_id: AgentResult}` for every task in `tasks`, keyed by
-    `task.task_id` (its LAST attempt's result if it needed retries).
+    `task.task_id` (its LAST attempt's result if it needed retries). A task
+    that FAILS (C11/WP3.6) comes back as `status="error"` in that same dict --
+    one task's failure never aborts the run or discards sibling results, and a
+    `GitOpsError` failure (transient git lock contention) gets one bounded,
+    logged retry first -- see `_run_task_contained`.
 
     `mode="symbol"` refuses before ANY side effect (parked -- see
     `classifier.graph.check_file_granularity`): guarded on entry rather than
@@ -425,7 +528,7 @@ def run(
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {
                 pool.submit(
-                    _run_task_with_retries,
+                    _run_task_contained,
                     conn,
                     repo,
                     serial_client,
@@ -437,5 +540,19 @@ def run(
                 for task in wave
             }
             for future, task in futures.items():
-                results[task.task_id] = future.result()
+                # C11/WP3.6: a per-task failure must never abort the run --
+                # `_run_task_contained` absorbs Exceptions, and this catch is the
+                # last line of defense should one still escape: record it as THIS
+                # task's error result and keep collecting the siblings' results.
+                try:
+                    results[task.task_id] = future.result()
+                except Exception as exc:
+                    logger.warning(
+                        "broker: task %r escaped containment with %s: %s -- "
+                        "recording an error result and continuing the run",
+                        task.task_id,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    results[task.task_id] = _error_result(task, exc)
     return results
