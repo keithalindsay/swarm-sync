@@ -22,7 +22,7 @@ Endpoints (all JSON):
   POST /release               -> release a lease
   GET  /contract/{symbol}     -> frozen signature + version (404 if unknown)
   POST /parcel/update         -> agent posts new content_hash + state_summary on done
-  GET  /events?since={seq}    -> tail the event log
+  GET  /events?since={seq}    -> tail the event log (or ?tail={n}: newest n, asc)
   POST /integrate             -> submit branch to the serial integrator (U10)
 
 `POST /integrate` (U10) calls straight into `coordinator.integrator.integrate`
@@ -83,9 +83,11 @@ from swarmsync.blackboard.models import (
     HeartbeatBody,
     IntegrateBody,
     IntentBody,
+    Lease,
     LeaseRequest,
     LeaseResult,
     ParcelUpdateBody,
+    ParcelWithLeases,
 )
 from swarmsync.classifier.graph import FREEZE_THRESHOLD
 from swarmsync.classifier.indexer import IndexLimitError
@@ -503,7 +505,12 @@ def create_app(
 
     # --- GET /parcels ----------------------------------------------------------
 
-    @app.get("/parcels")
+    # WP4.5 (A6): `response_model` declares the wire shape this endpoint has
+    # ALWAYS returned (raw parcel columns + the active-lease join) -- previously
+    # implicit in this handler's dict-building, duck-typed against by the hook
+    # adapter, and absent from the OpenAPI schema. The JSON is byte-identical;
+    # only the contract is now written down and response-validated.
+    @app.get("/parcels", response_model=list[ParcelWithLeases])
     def get_parcels(conn=Depends(get_conn)):
         now = time.time()
         parcel_rows = conn.execute("SELECT * FROM parcels ORDER BY id").fetchall()
@@ -525,7 +532,11 @@ def create_app(
 
     # --- GET /leases -------------------------------------------------------------
 
-    @app.get("/leases")
+    # WP4.5 (A6): `blackboard.models.Lease` matches the `leases` schema columns
+    # field-for-field (verified against schema.sql), so declaring it changes no
+    # bytes on the wire -- it just makes the previously implicit contract typed,
+    # validated, and visible in OpenAPI.
+    @app.get("/leases", response_model=list[Lease])
     def get_leases(conn=Depends(get_conn)):
         now = time.time()
         rows = conn.execute(
@@ -729,17 +740,38 @@ def create_app(
         )
         return {"ok": True, "parcel_id": body.parcel_id, "event_seq": seq}
 
-    # --- GET /events?since= --------------------------------------------------------
+    # --- GET /events?since= | ?tail= ------------------------------------------------
 
     @app.get("/events", response_model=list[EventOut])
     def get_events(
-        since: int = 0,
+        # WP4.5 (prep C17): `since` is now Optional so an EXPLICIT `?since=` can
+        # be told apart from the default -- omitting it still means "from seq 0",
+        # so every existing caller's wire behavior is unchanged.
+        since: Optional[int] = None,
+        # WP4.5: newest-first window. `?tail=N` returns the newest N events (in
+        # ascending seq order, same as every other page) -- the "what happened
+        # recently" read the agent runner's read-the-world step needs, without
+        # paging the whole log forward from 0. Mutually exclusive with `since`:
+        # the two name incompatible anchors (a forward page vs. a newest window),
+        # and silently preferring one would misread the caller's intent -- same
+        # loud-422 posture as the limit clamp below. Bounded by the same cap.
+        tail: Optional[int] = Query(default=None, ge=1, le=MAX_EVENTS_LIMIT),
         # WP3.1 S2: bounded surface -- see the MAX_EVENTS_LIMIT comment above.
         # `since` semantics are untouched (any int, page forward from that seq).
         limit: int = Query(default=1000, ge=0, le=MAX_EVENTS_LIMIT),
         conn=Depends(get_conn),
     ):
-        return events_mod.tail(conn, since_seq=since, limit=limit)
+        if tail is not None:
+            if since is not None:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "`since` and `tail` are mutually exclusive: page forward "
+                        "with since=, or take the newest window with tail=, not both"
+                    ),
+                )
+            return events_mod.tail_newest(conn, tail)
+        return events_mod.tail(conn, since_seq=since if since is not None else 0, limit=limit)
 
     # --- POST /integrate -----------------------------------------------------------
 

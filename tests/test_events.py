@@ -163,6 +163,48 @@ def test_tail_returns_event_models_with_expected_fields(conn):
 # --- pheromone: drop is an upsert keyed on (parcel_id, agent_id, kind) ------------
 
 
+# --- WP4.5 (prep C17): tail_newest -- the newest n, still ascending ----------------
+
+
+def test_tail_newest_returns_newest_n_in_ascending_order(conn):
+    for i in range(5):
+        events.emit(conn, "planned", f"agent-{i}", ts=float(i))
+    everything = events.tail(conn)
+    assert len(everything) == 5
+
+    newest = events.tail_newest(conn, 2)
+    assert [e.seq for e in newest] == [e.seq for e in everything[-2:]]
+    assert [e.seq for e in newest] == sorted(e.seq for e in newest)
+    assert [e.agent_id for e in newest] == ["agent-3", "agent-4"]
+
+
+def test_tail_newest_more_than_available_returns_all(conn):
+    events.emit(conn, "planned", "agent-1")
+    events.emit(conn, "done", "agent-1")
+    newest = events.tail_newest(conn, 100)
+    assert [e.seq for e in newest] == [e.seq for e in events.tail(conn)]
+
+
+def test_tail_newest_empty_log_returns_empty(conn):
+    assert events.tail_newest(conn, 10) == []
+
+
+def test_tail_newest_rejects_nonpositive_n(conn):
+    with pytest.raises(ValueError):
+        events.tail_newest(conn, 0)
+    with pytest.raises(ValueError):
+        events.tail_newest(conn, -3)
+
+
+def test_tail_newest_serves_registry_external_marker_rows(conn):
+    """Same decoding as `tail`: an `events_compacted` maintenance row (outside
+    the frozen EventType registry) is served, not dropped or 500'd."""
+    events.emit(conn, "heartbeat", "a1", ts=time.time() - 8000)
+    assert events.compact_events(conn) == 1
+    newest = events.tail_newest(conn, 10)
+    assert [e.type for e in newest] == [events.EVENTS_COMPACTED]
+
+
 def test_drop_pheromone_creates_row(conn):
     parcel_id = _make_parcel(conn)
     ph = events.drop_pheromone(conn, parcel_id, "agent-1", "planned", 1.0)
@@ -256,6 +298,98 @@ def test_decay_pheromone_clock_skew_guard_does_not_grow_strength(conn):
 
     row = conn.execute("SELECT * FROM pheromone").fetchone()
     assert row["strength"] == pytest.approx(0.5, abs=1e-9)
+
+
+# --- C15 (WP4.5): decay must be one atomic UPDATE, no read-modify-write -----------
+# The old shape SELECTed strengths, computed decay in Python, and executemany-
+# UPDATEd by PK -- a drop_pheromone landing between the read and the write (the
+# reaper decays every 1s on its own connection) was overwritten with a stale
+# decayed value. A true in-process race is not deterministically forceable here,
+# so the fix gets (a) a SEMANTIC test -- decay derives from the CURRENT committed
+# strength at execution time, i.e. a re-drop is never resurrected stale -- and
+# (b) a code-SHAPE test asserting the single-UPDATE implementation directly.
+
+
+def test_decay_pheromone_decays_from_the_current_committed_strength(conn):
+    parcel_id = _make_parcel(conn)
+    events.drop_pheromone(conn, parcel_id, "agent-1", "touched", 1.0, ts=0.0)
+    # A later drop REPLACES the row (strength 0.8 at t=10) -- the C15 stand-in
+    # for "a drop landed before the decay executed". The decay at t=20 must
+    # start from 0.8/updated_at=10, never from any earlier snapshot of the row.
+    events.drop_pheromone(conn, parcel_id, "agent-1", "touched", 0.8, ts=10.0)
+
+    events.decay_pheromone(conn, half_life=10.0, ts=20.0)
+
+    row = conn.execute("SELECT * FROM pheromone").fetchone()
+    assert row["strength"] == pytest.approx(0.4, abs=1e-9)  # 0.8 * 0.5 ** (10/10)
+    assert row["updated_at"] == 20.0
+
+
+def test_decay_pheromone_dropped_row_decays_from_its_committed_value(conn):
+    # The prompt's semantic anchor: dropped at 1.0, decayed with a now far in
+    # the future -> decays from the committed 1.0 (to ~0), never goes negative.
+    parcel_id = _make_parcel(conn)
+    events.drop_pheromone(conn, parcel_id, "agent-1", "planned", 1.0, ts=0.0)
+
+    touched = events.decay_pheromone(conn, half_life=5.0, ts=1_000_000.0)
+
+    assert touched == 1
+    row = conn.execute("SELECT * FROM pheromone").fetchone()
+    assert 0.0 <= row["strength"] == pytest.approx(0.0, abs=1e-9)
+    assert row["updated_at"] == 1_000_000.0
+
+
+class _TracingConn:
+    """Wraps a real connection, recording every SQL statement text. Duck-typed:
+    decay_pheromone only needs `execute`/`executemany`."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.statements: list[str] = []
+
+    def execute(self, sql, *args):
+        self.statements.append(sql)
+        return self._inner.execute(sql, *args)
+
+    def executemany(self, sql, *args):
+        self.statements.append(sql)
+        return self._inner.executemany(sql, *args)
+
+
+def test_decay_pheromone_works_through_the_python_pow_fallback(conn):
+    """C15: on SQLite builds without SQLITE_ENABLE_MATH_FUNCTIONS,
+    `db._configure` registers `db._pow_fallback` as `pow`. This box HAS the
+    built-in, so force the fallback onto the connection (create_function
+    overrides the built-in) and prove the decay statement still computes
+    identically through it."""
+    conn.create_function("pow", 2, db._pow_fallback, deterministic=True)
+    parcel_id = _make_parcel(conn)
+    events.drop_pheromone(conn, parcel_id, "agent-1", "touched", 1.0, ts=0.0)
+
+    assert events.decay_pheromone(conn, half_life=10.0, ts=10.0) == 1
+    row = conn.execute("SELECT * FROM pheromone").fetchone()
+    assert row["strength"] == pytest.approx(0.5, abs=1e-9)
+
+
+def test_decay_pheromone_is_a_single_update_statement(conn):
+    """C15 code-shape guard: exactly ONE statement, an UPDATE, and no SELECT of
+    strengths anywhere -- reverting to read-modify-write fails here even though
+    the arithmetic (and every semantic test above) would still pass."""
+    parcel_id = _make_parcel(conn)
+    events.drop_pheromone(conn, parcel_id, "agent-1", "touched", 1.0, ts=0.0)
+    events.drop_pheromone(conn, parcel_id, "agent-2", "planned", 0.7, ts=5.0)
+
+    tracer = _TracingConn(conn)
+    touched = events.decay_pheromone(tracer, half_life=10.0, ts=10.0)
+
+    assert touched == 2
+    assert len(tracer.statements) == 1, (
+        f"decay must be one atomic statement, ran {len(tracer.statements)}: "
+        f"{tracer.statements}"
+    )
+    only = tracer.statements[0].strip().upper()
+    assert only.startswith("UPDATE PHEROMONE")
+    assert "SELECT" not in only  # no read-modify-write round trip
 
 
 # --- regression: leases.py now funnels through events.emit ------------------------
