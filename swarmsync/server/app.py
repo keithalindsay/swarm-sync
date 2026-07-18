@@ -70,6 +70,7 @@ from pathlib import Path
 from typing import Optional, Union
 
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
@@ -109,6 +110,29 @@ class IndexBody(BaseModel):
 class ReleaseBody(BaseModel):
     agent_id: str
     lease_id: int
+
+
+# --- WP3.3 (finding S5): request body-size cap -----------------------------------
+# Nothing bounded request bodies before uvicorn/Starlette buffer them: a client that
+# clears the token gate (or any client, when no token is set) could POST an arbitrarily
+# large body and have it read fully into memory before validation rejects it. The cap
+# is generous (10 MB default -- every legitimate body here is a small JSON document)
+# and env-tunable without a code change.
+
+DEFAULT_MAX_BODY_BYTES = 10 * 1024 * 1024
+MAX_BODY_BYTES_ENV = "SWARMSYNC_MAX_BODY_BYTES"
+
+
+def _max_body_bytes() -> int:
+    """Body cap, read from the env per request (test-friendly); unset/garbage
+    values fall back to the generous default."""
+    raw = os.environ.get(MAX_BODY_BYTES_ENV)
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+    return DEFAULT_MAX_BODY_BYTES
 
 
 def get_conn(request: Request):
@@ -338,6 +362,36 @@ def create_app(
     # queue without tying up threadpool workers -- exactly DESIGN §5.4's "serial
     # test-gated integrator: trunk is never poisoned by a partial edit".
     app.state.integrate_lock = asyncio.Lock()
+
+    # --- WP3.3 (S5): reject oversized request bodies with 413 ---------------------
+    # Declared-length check: when Content-Length is present (every real client here
+    # -- the hook adapter, httpx, requests, TestClient -- sends it for a body), a
+    # too-large request is rejected up front, before the framework buffers a byte of
+    # the body. Chunked/absent-length bodies PASS THROUGH deliberately: counting a
+    # stream inside BaseHTTPMiddleware means re-plumbing the receive channel for a
+    # transfer shape none of our clients use, and the S3 token gate already bounds
+    # WHO can reach the mutating routes at all. Stated trade-off, not an oversight.
+    @app.middleware("http")
+    async def enforce_body_size_cap(request: Request, call_next):
+        content_length = request.headers.get("content-length")
+        if content_length is not None:
+            cap = _max_body_bytes()
+            try:
+                declared = int(content_length)
+            except ValueError:
+                declared = None  # malformed header: let the server stack handle it
+            if declared is not None and declared > cap:
+                return JSONResponse(
+                    status_code=413,
+                    content={
+                        "detail": (
+                            f"request body of {declared} bytes exceeds the "
+                            f"{cap}-byte cap (raise {MAX_BODY_BYTES_ENV} if "
+                            "this is legitimate)"
+                        )
+                    },
+                )
+        return await call_next(request)
 
     # --- POST /index ---------------------------------------------------------
 
@@ -626,8 +680,16 @@ def main(argv: Optional[list[str]] = None) -> None:
     holds no auth by default and gates real editing sessions, so it must not be
     reachable from the network unless the operator deliberately opts in with
     `--host`). Mirrors `server/serve.py`'s argparse surface (--host/--port/--db).
+
+    WP3.3 C3: this launcher (the `swarm-sync` console script) previously skipped the
+    C13 clock assertion that `swarmsync-serve` runs, so the exact same server started
+    via the other entry point silently forwent the double-lease clock guard. The
+    import is LAZY (inside this function) because `serve` imports `app` at module
+    level -- a top-level import here would be a genuine import cycle.
     """
     import uvicorn
+
+    from swarmsync.server.serve import assert_clock_agreement
 
     parser = argparse.ArgumentParser(
         prog="swarm-sync", description="swarm-sync blackboard server"
@@ -644,6 +706,10 @@ def main(argv: Optional[list[str]] = None) -> None:
         help="blackboard SQLite path (default: $SWARM_SYNC_DB or blackboard.db)",
     )
     args = parser.parse_args(argv)
+
+    # C13: verify the SQLite-vs-Python clock invariant before serving anything --
+    # same guard, same ordering, as `serve.main`.
+    assert_clock_agreement()
 
     app = create_app(args.db)
     uvicorn.run(app, host=args.host, port=args.port)
