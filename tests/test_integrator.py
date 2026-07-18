@@ -1399,3 +1399,144 @@ def test_start_emit_and_projection_row_are_atomic(conn, repo):
     assert _open_rows(conn) == []
     # The failure happened before the merge -- trunk must be untouched.
     assert git_ops.current_commit(r, ref="integration") == pre
+
+
+# --- WP3.5 (C14): post-land re-index retires ghost parcels/contracts ----------------
+
+
+def test_landed_rename_retires_ghost_parcels_and_contracts(conn, repo):
+    """A file renamed by a LANDED merge must not leave ghost rows behind.
+
+    Pre-WP3.5, `classifier.store.run_index` documented "no stale-row pruning": the
+    old path's `parcels` rows and the old symbol's `contracts` row survived every
+    re-index, so `GET /parcels` kept serving a file that no longer exists,
+    `GET /contract/{old_symbol}` kept 200-ing a dead signature, and a renamed
+    symbol NEVER emitted `contract_change` (the old row simply never changed), so
+    dependents were never told. The honest rename story needs no rename detection:
+    the new path's rows appear via the normal re-index, and the old path's rows
+    retire with `parcel_retired`/`contract_retired` events.
+    """
+    r, base = repo
+    # threshold=0: every cross-module function/class symbol is a frozen contract,
+    # so mod_a.py::helper (imported by tests/test_a.py) has a contracts row.
+    run_index(conn, r, threshold=0)
+    assert conn.execute(
+        "SELECT 1 FROM contracts WHERE symbol = 'mod_a.py::helper'"
+    ).fetchone() is not None
+
+    wt = git_ops.add_worktree(r, "agent-mv", base)
+    (wt / "mod_a.py").rename(wt / "mod_renamed.py")
+    (wt / "tests" / "test_a.py").write_text(
+        "from mod_renamed import helper\n\n\n"
+        "def test_helper():\n"
+        "    assert isinstance(helper(1), int)\n",
+        encoding="utf-8",
+    )
+    git_ops.commit_all(wt, "agent-mv: rename mod_a.py -> mod_renamed.py")
+
+    result = integrator.integrate(
+        conn, r, "agent-mv", base_commit=base, agent_id="agent-mv", threshold=0
+    )
+    assert result.status == "merged"
+
+    # The old path's parcels are gone from the blackboard (what /parcels serves).
+    assert conn.execute(
+        "SELECT id FROM parcels WHERE path = 'mod_a.py'"
+    ).fetchall() == []
+    # The old symbol's contract row is gone (GET /contract/mod_a.py::helper -> 404).
+    assert conn.execute(
+        "SELECT 1 FROM contracts WHERE symbol = 'mod_a.py::helper'"
+    ).fetchone() is None
+    # The new path's rows appeared via the normal re-index (the rename's other half).
+    assert conn.execute(
+        "SELECT 1 FROM parcels WHERE id = 'mod_renamed.py::helper'"
+    ).fetchone() is not None
+    assert conn.execute(
+        "SELECT 1 FROM contracts WHERE symbol = 'mod_renamed.py::helper'"
+    ).fetchone() is not None
+
+    # One parcel_retired event per retired parcel, why=file_deleted.
+    events = events_mod.tail(conn, since_seq=0)
+    retired_payloads = [
+        json.loads(e.payload) for e in events if e.type == "parcel_retired"
+    ]
+    retired_ids = {p["parcel"] for p in retired_payloads}
+    assert "mod_a.py::helper" in retired_ids
+    assert "mod_a.py::<module>" in retired_ids
+    assert all(p["why"] == "file_deleted" for p in retired_payloads)
+    # The retired contract is announced too (its own event -- see integrator docs).
+    contract_retired = [
+        json.loads(e.payload) for e in events if e.type == "contract_retired"
+    ]
+    assert [p["symbol"] for p in contract_retired] == ["mod_a.py::helper"]
+    assert all(p["why"] == "symbol_deleted" for p in contract_retired)
+
+    # The result reports what was retired, for callers/tests.
+    assert "mod_a.py::helper" in result.retired_parcels
+    assert result.retired_contracts == ["mod_a.py::helper"]
+
+    # trunk stays green.
+    assert _full_suite_green(r)
+
+
+def test_retirement_respects_fk_dependents_and_scopes_to_touched_paths(conn, repo):
+    """Retiring a parcel must delete its FK dependents (leases, pheromone) first --
+    `foreign_keys=ON` would otherwise raise -- and must ONLY consider paths the
+    landed merge touched: an unrelated ghost row is never swept up per-merge."""
+    r, base = repo
+    run_index(conn, r)
+    now = time.time()
+    # An active lease + a pheromone row on a parcel the merge will delete.
+    conn.execute(
+        "INSERT INTO leases (parcel_id, agent_id, mode, acquired_at, ttl_expires_at,"
+        " heartbeat_at, status) VALUES (?, ?, 'write', ?, ?, ?, 'active')",
+        ("mod_a.py::helper", "agent-old", now, now + 300.0, now),
+    )
+    conn.execute(
+        "INSERT INTO pheromone (parcel_id, agent_id, kind, strength, updated_at)"
+        " VALUES (?, ?, 'touched', 1.0, ?)",
+        ("mod_a.py::helper", "agent-old", now),
+    )
+    # An unrelated ghost parcel (its file never existed) that this merge does NOT
+    # touch -- retirement is scoped to the merge's changed files, not a full sweep.
+    conn.execute(
+        "INSERT INTO parcels (id, path, blast_radius, updated_at)"
+        " VALUES ('ghost.py::<module>', 'ghost.py', 0, ?)",
+        (now,),
+    )
+
+    wt = git_ops.add_worktree(r, "agent-del", base)
+    (wt / "mod_a.py").unlink()
+    (wt / "tests" / "test_a.py").unlink()  # its test goes with it, gate stays green
+    git_ops.commit_all(wt, "agent-del: delete mod_a.py outright")
+
+    result = integrator.integrate(
+        conn, r, "agent-del", base_commit=base, agent_id="agent-del"
+    )
+    assert result.status == "merged"
+
+    # Parcel + FK dependents all gone -- no FK violation, no ghost lease.
+    assert conn.execute(
+        "SELECT id FROM parcels WHERE path = 'mod_a.py'"
+    ).fetchall() == []
+    assert conn.execute(
+        "SELECT 1 FROM leases WHERE parcel_id = 'mod_a.py::helper'"
+    ).fetchone() is None
+    assert conn.execute(
+        "SELECT 1 FROM pheromone WHERE parcel_id = 'mod_a.py::helper'"
+    ).fetchone() is None
+    # The event names the lease holder whose lease was closed by retirement.
+    events = events_mod.tail(conn, since_seq=0)
+    helper_retired = next(
+        json.loads(e.payload)
+        for e in events
+        if e.type == "parcel_retired"
+        and json.loads(e.payload)["parcel"] == "mod_a.py::helper"
+    )
+    assert helper_retired["why"] == "file_deleted"
+    assert "agent-old" in helper_retired.get("released_leases", [])
+
+    # Scope: the untouched ghost row survives (no full-table sweep per merge).
+    assert conn.execute(
+        "SELECT 1 FROM parcels WHERE id = 'ghost.py::<module>'"
+    ).fetchone() is not None

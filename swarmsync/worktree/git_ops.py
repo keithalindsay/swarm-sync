@@ -25,6 +25,7 @@ an argv list, never `shell=True`, so paths/branch names with spaces are safe):
   merge_branch(repo, branch, into="integration") -> (bool, list[str])  # --no-ff; conflict paths on failure
   changed_files(repo, branch, base)              -> list[str]  # git diff --name-only base..branch
   reset_hard(repo, commit, branch=None)          -> None        # undo a landed-but-rejected merge (U10)
+  park_branch(repo, name)                        -> str         # rejected/<name>-<UTC ts> ref pruning never deletes (WP3.5)
 
 `merge_branch` is the primitive the integrator (U10) serializes calls to. Because the
 scheduler only ever runs file-disjoint (or span-disjoint) work concurrently (DESIGN §5.4),
@@ -44,8 +45,15 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+
+# WP3.5: namespace for parked rejected-attempt branches. Everything under this
+# prefix is OFF-LIMITS to `_prune_stale_worktree`'s branch delete -- a parked
+# branch is the only reference to a rejected attempt's commits.
+REJECTED_BRANCH_PREFIX = "rejected/"
 
 
 class GitOpsError(RuntimeError):
@@ -166,7 +174,14 @@ def _prune_stale_worktree(repo: Path, name: str, worktree_path: Path) -> None:
     if worktree_path.exists():
         shutil.rmtree(worktree_path, ignore_errors=True)
     _run(["git", "worktree", "prune"], cwd=repo, check=False)
-    _run(["git", "branch", "-D", "--end-of-options", name], cwd=repo, check=False)
+    # WP3.5: NEVER delete a parked `rejected/*` branch (see `park_branch`) -- it is
+    # the ONLY reference to a rejected attempt's commits, and broker attempt ids
+    # are deterministic (`{task_id}-attempt-{n}`), so re-running the same task
+    # list reaches this prune with the same name before doing anything else.
+    # Defense in depth: even if a stale worktree sits ON a rejected branch, the
+    # worktree is pruned above but the branch survives.
+    if not name.startswith(REJECTED_BRANCH_PREFIX):
+        _run(["git", "branch", "-D", "--end-of-options", name], cwd=repo, check=False)
 
 
 def add_worktree(repo: Path | str, name: str, base_commit: str | None = None) -> Path:
@@ -231,6 +246,47 @@ def remove_worktree(repo: Path | str, name: str, delete_branch: bool = True) -> 
         _run(["git", "branch", "-D", "--end-of-options", name], cwd=repo, check=False)
 
 
+def park_branch(repo: Path | str, name: str) -> str:
+    """Park branch `name`'s tip under a timestamped `rejected/<name>-<UTC>` ref (WP3.5).
+
+    Called by the agent runner on the kept-branch rejection path: the integrator
+    reset trunk, so branch `name` is the ONLY reference to the rejected attempt's
+    commits -- yet `name` is a deterministic broker attempt id
+    (`{task_id}-attempt-{n}`), and `_prune_stale_worktree` deletes that exact
+    branch name at the top of every future `add_worktree`. Parking puts a second
+    ref on the commits in a namespace pruning never touches (see the
+    `REJECTED_BRANCH_PREFIX` guard in `_prune_stale_worktree`), under a
+    timestamped name no future attempt can collide with.
+
+    The parked ref is CREATED ALONGSIDE the original branch rather than renaming
+    it away: the R3 P1-6 contract (tests/test_agent.py) pins the original branch
+    name surviving its own rejection for the immediate rebase-and-resubmit story;
+    durability across RE-RUNS is the parked ref's job (the rerun's prune deletes
+    the original name, but the commits stay reachable from `rejected/*`).
+    Timestamp is UTC to microseconds; on the (pathological) collision the suffix
+    is bumped rather than clobbering an existing parked ref. Returns the parked
+    branch name. Parked refs accumulate by design -- they are the preserved
+    evidence -- and are an operator's to garbage-collect deliberately.
+    """
+    _reject_unsafe_name(name, "branch name to park")
+    repo = Path(repo)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    parked = f"{REJECTED_BRANCH_PREFIX}{name}-{stamp}"
+    attempt = 1
+    while _run(
+        ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{parked}"],
+        cwd=repo,
+        check=False,
+    ).returncode == 0:
+        attempt += 1
+        parked = f"{REJECTED_BRANCH_PREFIX}{name}-{stamp}-{attempt}"
+    # `git branch <new> <start>`: creates the ref without any checkout. Both
+    # positionals are fenced behind `--end-of-options`; `parked` is derived from
+    # the validated `name` plus our own constant prefix/timestamp.
+    _run(["git", "branch", "--end-of-options", parked, name], cwd=repo)
+    return parked
+
+
 def commit_all(worktree: Path | str, message: str, allow_empty: bool = False) -> str:
     """`git add -A && git commit` inside `worktree`. Returns the new commit's sha."""
     worktree = Path(worktree)
@@ -257,11 +313,18 @@ def changed_files(repo: Path | str, branch: str, base: str) -> list[str]:
 
     Used by the integrator (U10) to resolve which parcels a merged branch actually touched,
     for impact test selection + re-indexing (DESIGN §5.4).
+
+    `--no-renames` (WP3.5): with git's default rename detection, a renamed file
+    reports ONLY its new path under `--name-only`, so the OLD path never entered
+    the changed set -- the integrator's ghost retirement (and impact selection
+    keyed on the old module's stem) never saw that the old file was deleted.
+    Disabling detection reports the rename as delete(old) + add(new): strictly
+    MORE files, never fewer, so impact selection only gets more conservative.
     """
     _reject_option_like(base, "base ref")
     _reject_option_like(branch, "branch")
     result = _run(
-        ["git", "diff", "--name-only", "--end-of-options", f"{base}..{branch}"],
+        ["git", "diff", "--name-only", "--no-renames", "--end-of-options", f"{base}..{branch}"],
         cwd=Path(repo),
     )
     return [line for line in result.stdout.splitlines() if line]

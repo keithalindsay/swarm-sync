@@ -66,6 +66,13 @@ EventType = Literal[
     # resets out and records as `integrate_orphaned`.
     "integrate_started",
     "integrate_orphaned",
+    # WP3.5 (C14): the integrator's post-land re-index retires `parcels` rows whose
+    # file a landed merge deleted/renamed (`parcel_retired`, why=file_deleted) and
+    # `contracts` rows whose symbol no longer exists (`contract_retired`,
+    # why=symbol_deleted). Dependents observe these instead of polling a ghost row
+    # that would otherwise never change again.
+    "parcel_retired",
+    "contract_retired",
 ]
 
 
