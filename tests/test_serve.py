@@ -184,3 +184,93 @@ def test_assert_clock_agreement_passes_in_this_environment():
     """Direct call: the real host's SQLite and Python clocks must agree (this is the
     invariant every other test implicitly relies on)."""
     serve.assert_clock_agreement()  # must not raise
+
+
+# --- WP3.6: --fresh moves a stale DB aside (never deletes) and boots empty ----------
+
+
+def _seed_db_with_one_event(db_path):
+    """A real blackboard DB with one recognizable row in it."""
+    from swarmsync.blackboard import db as db_mod
+
+    conn = db_mod.init_db(db_path)
+    conn.execute(
+        "INSERT INTO events(agent_id, type, payload, ts) VALUES('old-agent','planned','{}',1.0)"
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_serve_fresh_moves_existing_db_aside_and_boots_an_empty_schema(
+    monkeypatch, tmp_path, capsys
+):
+    """`--fresh` on an existing DB: the old file is MOVED (bytes intact) to a
+    timestamped `<db>.stale-<YYYYmmdd-HHMMSS>` backup -- never deleted -- the
+    backup path is printed, and the server boots on a fresh, empty schema."""
+    import sqlite3 as sqlite3_mod
+
+    db_path = tmp_path / "bb.db"
+    _seed_db_with_one_event(db_path)
+    original_bytes = db_path.read_bytes()
+
+    monkeypatch.setattr("uvicorn.run", lambda app, host, port: None)
+    monkeypatch.setattr(
+        sys, "argv", ["swarmsync-serve", "--db", str(db_path), "--fresh"]
+    )
+
+    serve.main()
+
+    # exactly one timestamped backup, holding the OLD bytes.
+    backups = sorted(tmp_path.glob("bb.db.stale-*"))
+    assert len(backups) == 1, f"expected one backup, found {backups!r}"
+    backup = backups[0]
+    assert backup.read_bytes() == original_bytes, "the backup is not the old DB's bytes"
+
+    # one boot line names the backup path.
+    out = capsys.readouterr().out
+    assert str(backup) in out
+
+    # the live DB is a fresh schema with none of the old rows.
+    conn = sqlite3_mod.connect(db_path)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM leases").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_serve_without_fresh_reuses_the_existing_db_unchanged(monkeypatch, tmp_path):
+    """No `--fresh`: behavior unchanged -- the existing DB (and its rows) is reused,
+    and nothing is moved aside."""
+    import sqlite3 as sqlite3_mod
+
+    db_path = tmp_path / "bb.db"
+    _seed_db_with_one_event(db_path)
+
+    monkeypatch.setattr("uvicorn.run", lambda app, host, port: None)
+    monkeypatch.setattr(sys, "argv", ["swarmsync-serve", "--db", str(db_path)])
+
+    serve.main()
+
+    assert list(tmp_path.glob("bb.db.stale-*")) == []
+    conn = sqlite3_mod.connect(db_path)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_serve_fresh_with_no_existing_db_just_boots(monkeypatch, tmp_path, capsys):
+    """`--fresh` when there is nothing to move: no backup, no backup line, normal boot."""
+    ran = []
+    db_path = tmp_path / "bb.db"
+    monkeypatch.setattr("uvicorn.run", lambda app, host, port: ran.append(True))
+    monkeypatch.setattr(
+        sys, "argv", ["swarmsync-serve", "--db", str(db_path), "--fresh"]
+    )
+
+    serve.main()
+
+    assert ran == [True]
+    assert list(tmp_path.glob("bb.db.stale-*")) == []
+    assert ".stale-" not in capsys.readouterr().out
