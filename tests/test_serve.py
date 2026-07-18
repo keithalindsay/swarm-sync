@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 
 import pytest
 from fastapi import FastAPI
@@ -142,3 +143,44 @@ def test_serve_announces_its_root_even_when_defaulted(monkeypatch, tmp_path, cap
     out = capsys.readouterr().out
     assert "managed root" in out
     assert "403" in out, "the 403 consequence is not surfaced at boot"
+
+
+# --- C13: startup refuses to serve on a bad host clock -----------------------------
+
+
+def test_serve_starts_when_clocks_agree(monkeypatch, tmp_path):
+    """The clock-agreement assertion must be a no-op under normal conditions: SQLite's
+    julianday('now') and Python's time.time() agree to well under a second, so `main`
+    proceeds to build the app and call uvicorn.run."""
+    ran = []
+    monkeypatch.setattr("uvicorn.run", lambda app, host, port: ran.append(True))
+    monkeypatch.setattr(sys, "argv", ["swarmsync-serve", "--db", str(tmp_path / "bb.db")])
+
+    serve.main()
+
+    assert ran == [True]
+
+
+def test_serve_refuses_to_start_when_clocks_disagree(monkeypatch, tmp_path):
+    """C13: lease liveness is checked on SQLite's clock while leases are stamped from
+    Python's, an unstated cross-clock invariant. If the two disagree, a lease can look
+    alive to one path and expired to the other (double-lease). Simulate a wrong host
+    clock by pushing Python's time an hour off SQLite's; startup must refuse rather
+    than serve a config that silently corrupts lease liveness."""
+    ran = []
+    monkeypatch.setattr("uvicorn.run", lambda app, host, port: ran.append(True))
+    real_time = time.time
+    monkeypatch.setattr(serve.time, "time", lambda: real_time() + 3600.0)
+    monkeypatch.setattr(sys, "argv", ["swarmsync-serve", "--db", str(tmp_path / "bb.db")])
+
+    with pytest.raises(SystemExit) as excinfo:
+        serve.main()
+
+    assert ran == [], "the server started anyway on a skewed clock"
+    assert "clock" in str(excinfo.value).lower()
+
+
+def test_assert_clock_agreement_passes_in_this_environment():
+    """Direct call: the real host's SQLite and Python clocks must agree (this is the
+    invariant every other test implicitly relies on)."""
+    serve.assert_clock_agreement()  # must not raise
