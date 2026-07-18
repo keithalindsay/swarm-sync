@@ -630,6 +630,43 @@ def test_integrate_rejects_a_textual_conflict(tmp_path):
         assert (target_repo / "mod_a.py").read_text() == "def helper():\n    return 10\n"
 
 
+# --- U8/WP3.4: the DB is bound to its repo at startup ------------------------------
+
+
+def test_lifespan_binds_db_to_managed_root_and_refuses_a_different_root(
+    tmp_path, monkeypatch
+):
+    """Parcel ids are root-relative, so reusing one DB file against a DIFFERENT
+    root silently mixes two repos' parcel maps. First boot binds the root into
+    `meta`; a later boot with another root must refuse to start, naming both
+    roots (`db.ManagedRootMismatchError`). Same root again boots fine. Removing
+    the `bind_managed_root` call in the lifespan makes the refusal assertion
+    here fail."""
+    from swarmsync.blackboard import db as db_mod
+
+    db_path = tmp_path / "bb.db"
+    root_a = tmp_path / "repo-a"
+    root_a.mkdir()
+    root_b = tmp_path / "repo-b"
+    root_b.mkdir()
+
+    monkeypatch.setenv("SWARMSYNC_ROOTS", str(root_a))
+    with TestClient(create_app(db_path)) as c:
+        assert c.get("/leases").status_code == 200
+    # Same root, same DB: boots fine (binding is idempotent).
+    with TestClient(create_app(db_path)) as c:
+        assert c.get("/leases").status_code == 200
+
+    # Different root, same DB: refused, loudly, before serving anything.
+    monkeypatch.setenv("SWARMSYNC_ROOTS", str(root_b))
+    with pytest.raises(db_mod.ManagedRootMismatchError) as excinfo:
+        with TestClient(create_app(db_path)):
+            pass
+    # The message names both roots so the operator can pick a remedy.
+    assert str(root_a) in str(excinfo.value)
+    assert str(root_b) in str(excinfo.value)
+
+
 # --- C4 regression: shutdown must close connections even if the reaper died --------
 
 
