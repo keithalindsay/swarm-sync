@@ -172,6 +172,13 @@ class LeaseResult(BaseModel):
     granted: bool
     lease_id: Optional[int] = None
     reason: Optional[str] = None
+    # On a DENY, the identity + expiry of the conflicting active lease that best
+    # explains the denial, so a caller (the hook adapter) can name the holder and say
+    # when it frees WITHOUT a second /leases round-trip. Both stay None on the granted
+    # path and on any deny where no single holder is identifiable (e.g. a race in which
+    # the blocker released between the CAS and the lookup). See server.leases.acquire.
+    holder: Optional[str] = None  # conflicting write/exclusive (or blocking read) agent_id
+    holder_ttl_expires_at: Optional[float] = None  # that lease's ttl_expires_at (epoch s)
 
 
 class IntentBody(BaseModel):
