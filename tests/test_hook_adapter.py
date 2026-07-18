@@ -822,3 +822,61 @@ def test_in_repo_symlink_alias_shares_one_lease_with_its_target(
         held = c.get("/leases").json()
         assert len(held) == 1, f"one inode took {len(held)} leases: {held}"
         assert held[0]["parcel_id"] == f"real.py::{MODULE_SYMBOL}"
+
+
+# --- C9: SWARMSYNC_LEASE_TTL must be validated, not silently trusted ----------------
+
+
+def test_hook_lease_ttl_defaults_when_env_unset(monkeypatch):
+    monkeypatch.delenv("SWARMSYNC_LEASE_TTL", raising=False)
+    assert adapter._hook_lease_ttl() == adapter.DEFAULT_HOOK_LEASE_TTL_SECONDS
+
+
+def test_hook_lease_ttl_zero_falls_back_to_default_not_disable(monkeypatch):
+    """C9: a single config typo `SWARMSYNC_LEASE_TTL=0` used to parse as a valid float
+    and silently disable ALL hook-path lease protection (every lease born expired ->
+    two writers granted while prechecks kept saying "allow"). It must instead fall
+    back to the safe default and say so on stderr, never returning the poison value."""
+    monkeypatch.setenv("SWARMSYNC_LEASE_TTL", "0")
+    err = io.StringIO()
+    assert adapter._hook_lease_ttl(err=err) == adapter.DEFAULT_HOOK_LEASE_TTL_SECONDS
+    assert "SWARMSYNC_LEASE_TTL" in err.getvalue()
+
+
+def test_hook_lease_ttl_negative_falls_back_to_default(monkeypatch):
+    monkeypatch.setenv("SWARMSYNC_LEASE_TTL", "-5")
+    err = io.StringIO()
+    assert adapter._hook_lease_ttl(err=err) == adapter.DEFAULT_HOOK_LEASE_TTL_SECONDS
+    assert err.getvalue() != ""
+
+
+def test_hook_lease_ttl_non_float_falls_back_to_default(monkeypatch):
+    monkeypatch.setenv("SWARMSYNC_LEASE_TTL", "not-a-number")
+    err = io.StringIO()
+    assert adapter._hook_lease_ttl(err=err) == adapter.DEFAULT_HOOK_LEASE_TTL_SECONDS
+    assert "not a number" in err.getvalue()
+
+
+def test_hook_lease_ttl_over_ceiling_falls_back_to_default(monkeypatch):
+    """The symmetric hazard: an absurdly large TTL is an effectively permanent lease
+    the reaper never fires on. Rejected the same way as ttl<=0."""
+    monkeypatch.setenv("SWARMSYNC_LEASE_TTL", "999999999")
+    err = io.StringIO()
+    assert adapter._hook_lease_ttl(err=err) == adapter.DEFAULT_HOOK_LEASE_TTL_SECONDS
+    assert err.getvalue() != ""
+
+
+def test_hook_lease_ttl_below_floor_is_used_but_warns(monkeypatch):
+    """Defense-in-depth floor (C13): a sub-floor TTL is still HONORED (the keepalive
+    tests run sub-second TTLs on purpose) but warned about."""
+    monkeypatch.setenv("SWARMSYNC_LEASE_TTL", "0.5")
+    err = io.StringIO()
+    assert adapter._hook_lease_ttl(err=err) == 0.5  # used, not clamped
+    assert "floor" in err.getvalue()
+
+
+def test_hook_lease_ttl_in_bounds_value_is_used_without_warning(monkeypatch):
+    monkeypatch.setenv("SWARMSYNC_LEASE_TTL", "120")
+    err = io.StringIO()
+    assert adapter._hook_lease_ttl(err=err) == 120.0
+    assert err.getvalue() == ""
