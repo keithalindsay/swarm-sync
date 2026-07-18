@@ -160,3 +160,65 @@ def test_legacy_server_import_paths_still_work() -> None:
     assert legacy_leases.heartbeat is leases.heartbeat
     assert legacy_leases.release is leases.release
     assert legacy_leases.DEFAULT_TTL_SECONDS == leases.DEFAULT_TTL_SECONDS
+
+
+# --- WP4.2 (A4/U9): config.py is the ONE module that reads the environment ---------
+
+
+def _environ_reads(path: Path) -> list[str]:
+    """Every `os.environ` attribute/subscript access and `os.getenv`-style read
+    in `path`, AST-parsed (never imported/executed).
+
+    Flags, with line numbers:
+      * any `os.environ` / `os.getenv` / `os.putenv` / `os.unsetenv` attribute
+        access -- this covers `.get(...)`, subscripting, `{**os.environ}`, and
+        bare writes alike, since the subscript/call node always contains the
+        Attribute node;
+      * `from os import environ` / `getenv` / `putenv` / `unsetenv`, which
+        would otherwise smuggle the same reads in under a local name.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    rel = path.relative_to(PACKAGE_ROOT.parent).as_posix()
+    banned = {"environ", "environb", "getenv", "getenvb", "putenv", "unsetenv"}
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "os"
+            and node.attr in banned
+        ):
+            found.append(f"{rel}:{node.lineno} accesses os.{node.attr}")
+        elif isinstance(node, ast.ImportFrom) and node.module == "os":
+            for alias in node.names:
+                if alias.name in banned:
+                    found.append(f"{rel}:{node.lineno} imports os.{alias.name}")
+    return found
+
+
+def test_only_config_reads_the_environment() -> None:
+    """WP4.2: every env knob is read through `swarmsync.config`'s typed accessors.
+
+    Before this WP, ~12 `SWARMSYNC_*` variables were each parsed at point of use
+    with local fallback copies that drifted (the gate-timeout pair) and one
+    misnamed outlier (`SWARM_SYNC_DB`). The accessors (and the one sanctioned
+    env WRITE, `config.set_roots`, plus the one sanctioned passthrough,
+    `config.subprocess_env`) now live in `swarmsync/config.py` -- and NOTHING
+    else under `swarmsync/` may touch the environment. No other whitelist: a
+    site that can't go through config is a design finding, not an exemption.
+    """
+    config_py = PACKAGE_ROOT / "config.py"
+    assert config_py.exists(), "swarmsync/config.py has moved -- update this guard"
+    # Guard the guard: the detector must actually see config.py's own reads.
+    assert _environ_reads(config_py), "the env-read detector detects nothing"
+
+    violations: list[str] = []
+    for path in sorted(PACKAGE_ROOT.rglob("*.py")):
+        if path == config_py:
+            continue
+        violations.append("\n".join(_environ_reads(path)))
+    violations = [v for v in violations if v]
+    assert not violations, (
+        "only swarmsync/config.py may read (or write) the process environment; "
+        "route these through a config accessor:\n" + "\n".join(violations)
+    )

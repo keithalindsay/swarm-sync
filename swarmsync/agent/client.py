@@ -23,10 +23,11 @@ SDK worker later: the wire protocol/methods below stay identical; only
 """
 from __future__ import annotations
 
-import os
 from typing import Any, Optional, Protocol, cast
 
 import httpx
+
+from swarmsync import config
 
 # Ordinary blackboard calls (lease, heartbeat, parcel_update, ...) are small SQLite
 # writes behind a localhost socket -- milliseconds. 30s is a generous ceiling that
@@ -38,10 +39,12 @@ DEFAULT_TIMEOUT_SECONDS = 30.0
 # `/integrate` is different in kind: it blocks on the integrator's pytest gate, which
 # bounds ITSELF at SWARMSYNC_GATE_TIMEOUT (default 600s). The client must therefore
 # outlive the gate, or it reports a failure the server is about to turn into a
-# successful merge. Mirrors `coordinator.integrator._gate_timeout`'s env contract
-# rather than importing it (the agent client must not depend on the coordinator).
+# successful merge. WP4.2: both this module and the gate now read the SAME
+# accessor, `config.gate_timeout()` (the previous local re-parse of the env var
+# had every opportunity to drift), and `swarmsync.config` sits below every layer
+# so the agent client still does not depend on the coordinator.
 INTEGRATE_TIMEOUT_MARGIN_SECONDS = 60.0
-DEFAULT_GATE_TIMEOUT_SECONDS = 600.0
+DEFAULT_GATE_TIMEOUT_SECONDS = config.DEFAULT_GATE_TIMEOUT_SECONDS
 
 
 def _integrate_timeout() -> float:
@@ -50,16 +53,7 @@ def _integrate_timeout() -> float:
     The margin covers the merge, the whole-repo re-index and the rollback that
     bracket the gate inside `integrate()` -- none of which the gate timeout counts.
     """
-    raw = os.environ.get("SWARMSYNC_GATE_TIMEOUT")
-    gate = DEFAULT_GATE_TIMEOUT_SECONDS
-    if raw:
-        try:
-            parsed = float(raw)
-            if parsed > 0:
-                gate = parsed
-        except ValueError:
-            pass
-    return gate + INTEGRATE_TIMEOUT_MARGIN_SECONDS
+    return config.gate_timeout() + INTEGRATE_TIMEOUT_MARGIN_SECONDS
 
 
 class _HttpLike(Protocol):
