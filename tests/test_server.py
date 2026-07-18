@@ -677,3 +677,94 @@ def test_two_apps_on_different_db_paths_are_isolated(tmp_path, fixture_repo):
         _index(c1, fixture_repo)
         assert c1.get("/parcels").json() != []
         assert c2.get("/parcels").json() == []
+
+
+# --- WP3.3 B (S5): request body-size cap -> 413 ------------------------------------
+
+
+def test_oversized_body_is_rejected_with_413(client, monkeypatch):
+    """A request whose declared Content-Length exceeds SWARMSYNC_MAX_BODY_BYTES must
+    be rejected with 413 before any handler runs. The cap is read per request, so a
+    small env value takes effect immediately."""
+    monkeypatch.setenv("SWARMSYNC_MAX_BODY_BYTES", "1024")
+
+    big = {"agent_id": "a", "parcel_id": "x.py::<module>", "padding": "z" * 5000}
+    r = client.post("/lease", json=big)
+    assert r.status_code == 413
+    assert "SWARMSYNC_MAX_BODY_BYTES" in r.json()["detail"]
+
+
+def test_normal_sized_bodies_pass_the_cap(client, fixture_repo, monkeypatch):
+    """Under the cap (even a small one), every existing endpoint works unchanged --
+    the middleware only inspects Content-Length, it never consumes the body."""
+    monkeypatch.setenv("SWARMSYNC_MAX_BODY_BYTES", "100000")
+    _index(client, fixture_repo)
+    r = client.post(
+        "/lease",
+        json={"agent_id": "a1", "parcel_id": "mod_a.py::helper", "mode": "write"},
+    )
+    assert r.status_code == 200
+    assert r.json()["granted"] is True
+
+
+def test_body_cap_default_is_generous(client):
+    """With the env knob unset, a comfortably-large-but-legitimate body (1 MB, well
+    under the 10 MB default) is not rejected by the cap."""
+    r = client.post(
+        "/lease",
+        json={
+            "agent_id": "a1",
+            "parcel_id": "mod_a.py::helper",
+            "mode": "write",
+            "intent": "x" * (1024 * 1024),
+            "ensure_parcel": True,
+        },
+    )
+    assert r.status_code == 200
+
+
+# --- WP3.3 C3: the `swarm-sync` launcher runs the C13 clock assertion ---------------
+
+
+def test_app_main_asserts_clock_agreement_before_serving(tmp_path, monkeypatch):
+    """`swarmsync-serve` refuses to start on SQLite/Python clock disagreement (C13),
+    but the `swarm-sync` console script (app.main) previously skipped that guard
+    entirely -- same server, weaker startup invariant, depending on which command
+    launched it. main() must call assert_clock_agreement() BEFORE uvicorn.run."""
+    import uvicorn
+
+    from swarmsync.server import app as app_mod
+    from swarmsync.server import serve as serve_mod
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        serve_mod, "assert_clock_agreement", lambda: calls.append("clock")
+    )
+    monkeypatch.setattr(
+        uvicorn, "run", lambda *a, **kw: calls.append("serve")
+    )
+
+    app_mod.main(["--db", str(tmp_path / "bb.db")])
+    assert calls == ["clock", "serve"], (
+        "the clock guard must run, and run before the server starts"
+    )
+
+
+def test_app_main_clock_failure_prevents_serving(tmp_path, monkeypatch):
+    """If the clock assertion raises (skew beyond tolerance -> SystemExit), the
+    launcher must NOT fall through to serving."""
+    import uvicorn
+
+    from swarmsync.server import app as app_mod
+    from swarmsync.server import serve as serve_mod
+
+    def bad_clock():
+        raise SystemExit("clock skew")
+
+    served: list[bool] = []
+    monkeypatch.setattr(serve_mod, "assert_clock_agreement", bad_clock)
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **kw: served.append(True))
+
+    with pytest.raises(SystemExit):
+        app_mod.main(["--db", str(tmp_path / "bb.db")])
+    assert served == []
