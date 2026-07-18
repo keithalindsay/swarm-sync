@@ -73,11 +73,11 @@ from pathlib import Path
 from typing import Optional, Union
 
 from swarmsync.blackboard.models import Contract, Parcel
+from swarmsync.blackboard.parcel_id import module_id
 
 StrPath = Union[str, Path]
 
 FREEZE_THRESHOLD = 3
-MODULE_SYMBOL = "<module>"
 
 
 @dataclass
@@ -179,7 +179,7 @@ def build_graph(parcels: list[Parcel], root: StrPath) -> DepGraph:
 
     files = sorted({p.path for p in parcels})
     file_by_dotted = _module_namespace(files)
-    module_parcel_id = {f: f"{f}::{MODULE_SYMBOL}" for f in files}
+    module_parcel_id = {f: module_id(f) for f in files}
 
     top_level_symbols: dict[str, dict[str, str]] = {}
     for p in parcels:

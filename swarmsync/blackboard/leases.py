@@ -80,6 +80,7 @@ from typing import Optional
 
 from swarmsync.blackboard.models import LeaseMode, LeaseResult
 from swarmsync.blackboard.events import emit as _emit
+from swarmsync.blackboard.parcel_id import split as _split_parcel_id
 
 DEFAULT_TTL_SECONDS = 30.0
 
@@ -174,7 +175,7 @@ def _ensure_parcel(conn: sqlite3.Connection, parcel_id: str) -> None:
     `content_hash` and the byte span are deliberately left NULL: this parcel exists to
     be LEASED, and nothing has parsed the file. A real `POST /index` fills them in.
     """
-    path, _, _symbol = parcel_id.partition("::")
+    path, _symbol = _split_parcel_id(parcel_id)
     conn.execute(
         """
         INSERT OR IGNORE INTO parcels (id, path, kind, symbol, updated_at)

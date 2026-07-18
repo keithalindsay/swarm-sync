@@ -110,6 +110,33 @@ def test_blackboard_imports_no_other_swarmsync_layer() -> None:
     assert not violations, "blackboard must not import upper layers:\n" + "\n".join(violations)
 
 
+def test_module_symbol_is_assigned_exactly_once() -> None:
+    """WP4.4 (A5): the parcel-id scheme has ONE home.
+
+    The literal `"<module>"` may be ASSIGNED to a name in exactly one place --
+    `swarmsync/blackboard/parcel_id.py` (the `MODULE_SYMBOL` definition). Every
+    other module must import the constant, so an id-scheme change stays a
+    one-file edit. Only assignment statements are checked (via AST), so
+    docstring/comment mentions and uses of the imported constant are free.
+    """
+    assignments: list[str] = []
+    for path in sorted(PACKAGE_ROOT.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                value = node.value
+                if isinstance(value, ast.Constant) and value.value == "<module>":
+                    rel = path.relative_to(PACKAGE_ROOT.parent).as_posix()
+                    assignments.append(f"{rel}:{node.lineno}")
+    assert len(assignments) == 1 and assignments[0].startswith(
+        "swarmsync/blackboard/parcel_id.py:"
+    ), (
+        "the literal '<module>' must be assigned exactly once, in "
+        "swarmsync/blackboard/parcel_id.py (import MODULE_SYMBOL from there); "
+        f"found: {assignments}"
+    )
+
+
 def test_coordinator_does_not_import_server() -> None:
     """Rule 2: no coordinator->server imports (verified zero; no whitelist needed)."""
     violations = _violations("coordinator", ("swarmsync.server",))
