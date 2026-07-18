@@ -52,15 +52,17 @@ needing to enter it as an ASGI lifespan context first) and registers a lifespan
 that closes that connection on shutdown for callers that do use
 `with TestClient(app) as client: ...` or run it under uvicorn.
 
-`main()` launches uvicorn (referenced by the `swarm-sync` console script),
-building a fresh app rooted at `$SWARM_SYNC_DB` (default `blackboard.db` in the
-current directory) -- deliberately NOT a module-level `app = create_app()`,
-since that would create/open a DB file as a side effect of merely importing
-this module (e.g. from a test).
+There is deliberately NO module-level `app = create_app()` (that would
+create/open a DB file as a side effect of merely importing this module, e.g.
+from a test) and, since WP4.2, no `main()` here either: the `swarm-sync` and
+`swarmsync-serve` console scripts are BOTH `server.serve:main` -- one launcher,
+one set of defaults (port 8787, `swarmsync.db`, `--root`/`--fresh`, boot
+banner, C13 clock assertion). The old second launcher (port 8000,
+`blackboard.db`/`$SWARM_SYNC_DB`, no `--root`) silently mismatched the hook
+adapter's default URL, which was a fail-open trap.
 """
 from __future__ import annotations
 
-import argparse
 import asyncio
 import dataclasses
 import hmac
@@ -76,6 +78,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
+from swarmsync import config
 from swarmsync.blackboard import db
 from swarmsync.blackboard.models import (
     Contract,
@@ -155,20 +158,13 @@ REAPER_SHUTDOWN_TIMEOUT = 30.0
 # is generous (10 MB default -- every legitimate body here is a small JSON document)
 # and env-tunable without a code change.
 
-DEFAULT_MAX_BODY_BYTES = 10 * 1024 * 1024
-MAX_BODY_BYTES_ENV = "SWARMSYNC_MAX_BODY_BYTES"
+# WP4.2: value + env read live in `swarmsync.config`; aliases kept for importers.
+DEFAULT_MAX_BODY_BYTES = config.DEFAULT_MAX_BODY_BYTES
+MAX_BODY_BYTES_ENV = config.MAX_BODY_BYTES_ENV
 
-
-def _max_body_bytes() -> int:
-    """Body cap, read from the env per request (test-friendly); unset/garbage
-    values fall back to the generous default."""
-    raw = os.environ.get(MAX_BODY_BYTES_ENV)
-    if raw:
-        try:
-            return int(raw)
-        except ValueError:
-            pass
-    return DEFAULT_MAX_BODY_BYTES
+# Body cap, read from the env per request (test-friendly); unset/garbage values
+# fall back to the generous default (`swarmsync.config.max_body_bytes`).
+_max_body_bytes = config.max_body_bytes
 
 
 def get_conn(request: Request):
@@ -214,7 +210,7 @@ def get_conn(request: Request):
 def require_token(request: Request) -> None:
     """FastAPI dependency guarding a mutating route. No-op when SWARMSYNC_TOKEN is
     unset; otherwise requires a matching `Authorization: Bearer <token>` header."""
-    token = os.environ.get("SWARMSYNC_TOKEN")
+    token = config.token()
     if not token:
         return
     header = request.headers.get("Authorization", "")
@@ -236,13 +232,9 @@ class MultiRootError(ValueError):
     """Raised at startup when more than one managed root is configured."""
 
 
-def _managed_roots() -> list[str]:
-    raw = os.environ.get("SWARMSYNC_ROOTS")
-    if raw:
-        candidates = [r for r in raw.split(os.pathsep) if r]
-    else:
-        candidates = [os.getcwd()]
-    return [os.path.realpath(r) for r in candidates]
+# WP4.2: the env read + parse (pathsep split, realpath) is `config.roots()`;
+# this alias keeps the local call sites and the historical name.
+_managed_roots = config.roots
 
 
 def check_single_root() -> str:
@@ -806,45 +798,3 @@ def create_app(
         return dataclasses.asdict(result)
 
     return app
-
-
-def main(argv: Optional[list[str]] = None) -> None:
-    """Launch the blackboard under uvicorn (the `swarm-sync` console script).
-
-    S3 hardening: binds to 127.0.0.1 by DEFAULT (was 0.0.0.0 -- the blackboard
-    holds no auth by default and gates real editing sessions, so it must not be
-    reachable from the network unless the operator deliberately opts in with
-    `--host`). Mirrors `server/serve.py`'s argparse surface (--host/--port/--db).
-
-    WP3.3 C3: this launcher (the `swarm-sync` console script) previously skipped the
-    C13 clock assertion that `swarmsync-serve` runs, so the exact same server started
-    via the other entry point silently forwent the double-lease clock guard. The
-    import is LAZY (inside this function) because `serve` imports `app` at module
-    level -- a top-level import here would be a genuine import cycle.
-    """
-    import uvicorn
-
-    from swarmsync.server.serve import assert_clock_agreement
-
-    parser = argparse.ArgumentParser(
-        prog="swarm-sync", description="swarm-sync blackboard server"
-    )
-    parser.add_argument(
-        "--host", default="127.0.0.1", help="bind address (default: 127.0.0.1)"
-    )
-    parser.add_argument(
-        "--port", type=int, default=8000, help="bind port (default: 8000)"
-    )
-    parser.add_argument(
-        "--db",
-        default=os.environ.get("SWARM_SYNC_DB", "blackboard.db"),
-        help="blackboard SQLite path (default: $SWARM_SYNC_DB or blackboard.db)",
-    )
-    args = parser.parse_args(argv)
-
-    # C13: verify the SQLite-vs-Python clock invariant before serving anything --
-    # same guard, same ordering, as `serve.main`.
-    assert_clock_agreement()
-
-    app = create_app(args.db)
-    uvicorn.run(app, host=args.host, port=args.port)

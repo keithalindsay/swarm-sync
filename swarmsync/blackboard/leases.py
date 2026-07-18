@@ -73,11 +73,11 @@ grant; after release, the parcel must be acquirable again.
 """
 from __future__ import annotations
 
-import os
 import sqlite3
 import time
 from typing import Optional
 
+from swarmsync import config
 from swarmsync.blackboard.models import LeaseMode, LeaseResult
 from swarmsync.blackboard.events import emit as _emit
 from swarmsync.blackboard.parcel_id import split as _split_parcel_id
@@ -90,8 +90,9 @@ DEFAULT_TTL_SECONDS = 30.0
 # deliberately generous -- a legitimate broker wave leases tens of parcels, not
 # hundreds -- and the knob is an env var so an operator with a genuinely huge repo can
 # raise it without a code change.
-DEFAULT_MAX_LEASES_PER_AGENT = 256
-MAX_LEASES_PER_AGENT_ENV = "SWARMSYNC_MAX_LEASES_PER_AGENT"
+# WP4.2: value + env read live in `swarmsync.config`; aliases kept for importers.
+DEFAULT_MAX_LEASES_PER_AGENT = config.DEFAULT_MAX_LEASES_PER_AGENT
+MAX_LEASES_PER_AGENT_ENV = config.MAX_LEASES_PER_AGENT_ENV
 
 # WP3.3 (finding S1/P2): bound on parcel-id shape for the `ensure_parcel` auto-create
 # path. Legitimate ids are `<relative-path>::<symbol>` (e.g. `path.py::<module>`,
@@ -101,16 +102,10 @@ MAX_LEASES_PER_AGENT_ENV = "SWARMSYNC_MAX_LEASES_PER_AGENT"
 MAX_PARCEL_ID_LENGTH = 512
 
 
-def _max_leases_per_agent() -> int:
-    """Per-agent active-lease cap, read from the env each call (test-friendly);
-    an unset/garbage value falls back to the generous default."""
-    raw = os.environ.get(MAX_LEASES_PER_AGENT_ENV)
-    if raw:
-        try:
-            return int(raw)
-        except ValueError:
-            pass
-    return DEFAULT_MAX_LEASES_PER_AGENT
+# Per-agent active-lease cap, read from the env each call (test-friendly);
+# an unset/garbage value falls back to the generous default. WP4.2: the read
+# is `config.max_leases_per_agent()`; this alias keeps the local call sites.
+_max_leases_per_agent = config.max_leases_per_agent
 
 
 def _parcel_id_problem(parcel_id: str) -> Optional[str]:

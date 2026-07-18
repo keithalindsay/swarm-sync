@@ -22,6 +22,7 @@ from collections import deque
 from pathlib import Path
 from typing import Union
 
+from swarmsync import config
 from swarmsync.classifier.graph import build_graph
 from swarmsync.classifier.indexer import index_repo
 
@@ -37,7 +38,10 @@ DEFAULT_TEST_DIR = "tests"
 # left carrying the un-gated merge commit. A timeout converts that from "the
 # coordinator is dead until someone restarts it" into an ordinary rejection.
 # Override per-deployment via SWARMSYNC_GATE_TIMEOUT (seconds).
-DEFAULT_GATE_TIMEOUT_SECONDS = 600.0
+# WP4.2: the value (and its parse/fallback) now lives in `swarmsync.config`;
+# these names survive as aliases because `coordinator.integrator` re-exports
+# them as part of its public surface (and tests drive them there).
+DEFAULT_GATE_TIMEOUT_SECONDS = config.DEFAULT_GATE_TIMEOUT_SECONDS
 
 # How long to wait for a killed gate's output after the group kill. Short by design:
 # by this point the verdict (rejected) is already decided and the log is a nicety, so
@@ -46,15 +50,8 @@ DEFAULT_GATE_TIMEOUT_SECONDS = 600.0
 _DRAIN_TIMEOUT_SECONDS = 5.0
 
 
-def _gate_timeout() -> float:
-    raw = os.environ.get("SWARMSYNC_GATE_TIMEOUT")
-    if not raw:
-        return DEFAULT_GATE_TIMEOUT_SECONDS
-    try:
-        value = float(raw)
-    except ValueError:
-        return DEFAULT_GATE_TIMEOUT_SECONDS
-    return value if value > 0 else DEFAULT_GATE_TIMEOUT_SECONDS
+# WP4.2: the single env read for the gate timeout is `config.gate_timeout()`.
+_gate_timeout = config.gate_timeout
 
 
 def _reverse_dep_files(repo: Path, changed_py: set[str]) -> set[str]:
@@ -210,7 +207,7 @@ def run_impact_tests(
             # full-suite fallback per DESIGN §5.4.
             cmd = [*base_cmd, test_dir]
 
-    env = {**os.environ, "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"}
+    env = config.subprocess_env(PYTEST_DISABLE_PLUGIN_AUTOLOAD="1")
     timeout = _gate_timeout()
     # `start_new_session=True` puts the gate in its own process GROUP so a timeout
     # can kill the whole tree. `subprocess.run(timeout=...)` alone kills only the

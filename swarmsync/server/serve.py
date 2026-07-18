@@ -1,9 +1,19 @@
-"""Standalone launcher for the swarm-sync blackboard server.
+"""THE launcher for the swarm-sync blackboard server.
 
 Runs the FastAPI blackboard (swarmsync.server.app.create_app) under uvicorn so a
 coordinated multi-agent session has a shared blackboard to lease against.
 
     swarmsync-serve --db /tmp/swarmsync.db --port 8787
+
+WP4.2: `swarm-sync` (the package's namesake console script) is an ALIAS of this
+`main` -- both `[project.scripts]` entries point here. There used to be a second
+launcher in `server/app.py` with different defaults for everything (port 8000,
+`blackboard.db`/`$SWARM_SYNC_DB`, no `--root`, no banner, no clock assertion);
+since the hook adapter's default URL only matched THIS one, an operator who
+followed the wrong launcher got a hook that silently failed open against the
+wrong port. One launcher, one set of defaults: port 8787, DB from
+`SWARMSYNC_DB` (default `swarmsync.db`), `--root`/`--fresh`, boot banner, C13
+clock assertion.
 
 See DESIGN.md for the coordination model.
 """
@@ -11,7 +21,6 @@ See DESIGN.md for the coordination model.
 from __future__ import annotations
 
 import argparse
-import os
 import sqlite3
 import time
 from datetime import datetime
@@ -20,6 +29,7 @@ from typing import Optional
 
 import uvicorn
 
+from swarmsync import config
 from swarmsync.server.app import MultiRootError, check_single_root, create_app
 from swarmsync.blackboard.leases import _NOW_SQL
 
@@ -90,9 +100,16 @@ def rotate_stale_db(db_path: Path) -> Optional[Path]:
     return backup
 
 
-def main() -> None:
+def main(argv: Optional[list[str]] = None) -> None:
+    """Entry point for BOTH the `swarmsync-serve` and `swarm-sync` console scripts
+    (WP4.2 -- see the module docstring). `argv=None` parses `sys.argv[1:]`."""
     parser = argparse.ArgumentParser(prog="swarmsync-serve", description=__doc__)
-    parser.add_argument("--db", default="swarmsync.db", help="blackboard SQLite path")
+    parser.add_argument(
+        "--db",
+        default=config.db_path(),
+        help="blackboard SQLite path (default: $SWARMSYNC_DB or swarmsync.db; "
+        "the deprecated $SWARM_SYNC_DB alias is still honored, with a warning)",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8787)
     parser.add_argument(
@@ -110,7 +127,7 @@ def main() -> None:
         "aside to <db>.stale-<YYYYmmdd-HHMMSS> (a backup -- never deleted) before "
         "the schema is created. Without this flag an existing DB is reused as-is.",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     # C13: verify the cross-clock invariant before doing anything else. A wrong host
     # clock silently corrupts lease liveness, so fail here with a readable message
@@ -118,7 +135,9 @@ def main() -> None:
     assert_clock_agreement()
 
     if args.root:
-        os.environ["SWARMSYNC_ROOTS"] = args.root
+        # WP4.2: the env var stays the transport to `app.py`'s per-request root
+        # readers, but the WRITE now has one documented home in config.
+        config.set_roots(args.root)
 
     # Say the managed roots out loud at boot. Getting them wrong does not raise --
     # it makes /index 403, which leaves the parcel map empty, which makes every hook

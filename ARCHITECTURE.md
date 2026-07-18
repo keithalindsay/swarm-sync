@@ -134,7 +134,8 @@ branch.
 | **Lease** (the lock) | [`blackboard/leases.py`](swarmsync/blackboard/leases.py) | `acquire` (atomic CAS), `heartbeat`, `release`, `_ensure_parcel`. The mutual-exclusion primitive. |
 | **Pheromone trail / event log** | [`blackboard/events.py`](swarmsync/blackboard/events.py) | `emit` — the single write path into the append-only `events` table: the audit/observability log. The SQLite tables are the state of record; crash recovery reads the `open_integrations` projection (WP3.2), not this log. |
 | **HTTP API** | [`server/app.py`](swarmsync/server/app.py) | FastAPI wiring every endpoint; `check_single_root` enforces the one-managed-root rule. |
-| ↳ launcher | [`server/serve.py`](swarmsync/server/serve.py) | `swarmsync-serve` — starts the blackboard server. |
+| ↳ launcher | [`server/serve.py`](swarmsync/server/serve.py) | `swarmsync-serve` — starts the blackboard server (the `swarm-sync` script is an alias of the same `main`; WP4.2). |
+| ↳ config | [`config.py`](swarmsync/config.py) | The one module that reads the environment: typed accessors for every `SWARMSYNC_*` knob (README has the full table). |
 | **Broker** (scheduler) | [`coordinator/broker.py`](swarmsync/coordinator/broker.py) | Matches tasks to parcels, spawns agents in file-disjoint waves, reassigns on reap (`resolve_task`, `_run_task_once`). |
 | **Integrator** (the gate) | [`coordinator/integrator.py`](swarmsync/coordinator/integrator.py) | Serial, pytest-gated merge with rollback-on-red, post-merge re-index, and orphan recovery (`reconcile_orphaned_integrations`). |
 | **Reaper** | [`coordinator/reaper.py`](swarmsync/coordinator/reaper.py) | Expires the leases of crashed agents past TTL and decays pheromone. |
