@@ -45,7 +45,7 @@ integrate(conn, repo, branch, base_commit=None, into="integration", ...) -> Inte
      (`regenerate_summary`) for every parcel the branch actually touched --
      never trust the agent's self-reported note (DESIGN §5.4/§6 "lying
      blackboard"). Emits `reindexed` with the touched parcel ids.
-  5. **Frozen-contract change detection** (DESIGN §5.3, money-shot #3, U15):
+  5. **Frozen-contract change detection** (DESIGN §5.3, test case #3, U15):
      bracketing step 4's re-index, this snapshots `contracts.type_hash` for
      every symbol whose file this branch touched, BEFORE re-indexing, and
      compares it against the same symbols' type_hash AFTER. Any symbol whose
@@ -584,7 +584,7 @@ def integrate(
         # --- step 4: re-index + authoritative state_summary regen ---------------
         changed_set = set(changed)
 
-        # Frozen-contract change detection (DESIGN §5.3, money-shot #3, U15):
+        # Frozen-contract change detection (DESIGN §5.3, test case #3, U15):
         # snapshot every contract whose symbol lives in a file this branch
         # touched BEFORE re-indexing, so it can be diffed against the same
         # symbols' post-re-index state below. Restricted to `changed_set` since

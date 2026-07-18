@@ -1,5 +1,5 @@
-"""Covers calc.py -- the merge gate for money-shot #1 (two agents concurrently
-editing `add`/`sub` in this same file) and for money-shot #5 (a deliberately
+"""Covers calc.py -- the merge gate for test case #1 (two agents concurrently
+editing `add`/`sub` in this same file) and for test case #5 (a deliberately
 test-breaking edit here must fail this suite so the integrator rejects it)."""
 from __future__ import annotations
 

@@ -14,7 +14,7 @@ Core API:
 
 GRANULARITY: emit at symbol granularity, but the ENFORCED lease granularity is chosen
 in graph.py / server config and defaults to FILE (see DESIGN §2 de-risking). Keep the
-symbol spans so symbol-mode can be switched on per parcel for money-shot #1.
+symbol spans so symbol-mode can be switched on per parcel for test case #1.
 
 Span/hash design note (this unit's own decision, not spec-mandated in this much
 detail): a top-level `def`/`async def` and a method inside a class get a concrete,

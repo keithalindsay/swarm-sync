@@ -395,8 +395,7 @@ Reusing a DB against a different repo silently mixes parcel maps (compounds C14)
 `swarmsync reset` / `--fresh`; default the DB under `$XDG_RUNTIME_DIR` keyed by root hash.
 
 ### U9 · Minor — Papercuts
-Not on PyPI, name unclaimed (squatting risk) · README sample output says `PASS: case #1`, demo
-prints `PASS: money-shot #1` · `requirements.txt` duplicates pyproject (drift trap) ·
+Not on PyPI, name unclaimed (squatting risk) · `requirements.txt` duplicates pyproject (drift trap) ·
 `/docs` (Swagger) works and is mentioned nowhere · broker `BlackboardClient` against a down server
 surfaces a raw `httpx.ConnectError` traceback · `swarmsync init-hooks` would replace a 20-line
 hand-edited settings.json paste.

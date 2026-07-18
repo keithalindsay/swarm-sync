@@ -1,8 +1,8 @@
-"""End-to-end demo: the five money shots. DESIGN.md §7.
+"""End-to-end demo: the five test cases. DESIGN.md §7.
 
-Built in Unit U14 (money shots #1, #2, #4, #5); money-shot #3 (frozen-contract
+Built in Unit U14 (test cases #1, #2, #4, #5); test case #3 (frozen-contract
 change + dependent re-plan, DESIGN §5.3) was added on top of this file by U15.
-All five money shots now print PASS/FAIL and the final summary says so.
+All five test cases now print PASS/FAIL and the final summary says so.
 
 This demo drives the SHIPPING product: file-granularity locking. Every lease is
 a whole-file `<file>::<module>` lock (symbol granularity is parked -- see
@@ -13,16 +13,16 @@ Flow:
   1. copy `sample_repo/` into a fresh temp dir and `git init` it as the shared
      "integration" trunk checkout (`worktree.git_ops.init_repo`).
   2. init the blackboard DB and boot a REAL `uvicorn` server (in a background
-     thread, in this same process) -- money-shot #4 needs an agent that lives
+     thread, in this same process) -- test case #4 needs an agent that lives
      in a genuinely separate OS process to SIGKILL, which only proves anything
      if the blackboard is reachable over a real socket rather than FastAPI's
-     in-process TestClient/ASGI transport. Every money shot below (not just #4)
+     in-process TestClient/ASGI transport. Every test case below (not just #4)
      therefore talks HTTP over a real port, exercising the actual wire protocol.
   3. `POST /index` to populate parcels + contracts from the fresh repo.
   4. run each scripted scenario, printing the event stream and a PASS/FAIL line
      per assertion, then a final summary block.
 
-Money shots exercised here (DESIGN §7):
+Test cases exercised here (DESIGN §7):
   #1 THREE agents edit three DIFFERENT files -- `calc.py`'s `sub`,
      `formats.py`'s `money`, `api.py`'s `apply_discount` -- concurrently, each
      under its own whole-file `<file>::<module>` lease (file granularity, the
@@ -75,7 +75,7 @@ Money shots exercised here (DESIGN §7):
 
 OVERALL: zero same-file textual collisions (git merge conflicts) reached
 `integration` across the whole run, every landed commit left `sample_repo`'s
-test suite green, and all five money-shot assertions print PASS.
+test suite green, and all five test case assertions print PASS.
 Exit code is 0 iff every check above passed.
 """
 from __future__ import annotations
@@ -108,11 +108,11 @@ SAMPLE_REPO_SRC = REPO_ROOT / "sample_repo"
 CRASH_AGENT_SCRIPT = Path(__file__).resolve().with_name("_crash_agent.py")
 
 SHOT_LABELS = {
-    "shot1": "money-shot #1 (three agents on three files land concurrently, clean)",
-    "shot2": "money-shot #2 (contended whole-file parcel serializes)",
-    "shot3": "money-shot #3 (frozen-contract change notifies + dependent re-plans)",
-    "shot4": "money-shot #4 (crash mid-edit is recovered)",
-    "shot5": "money-shot #5 (serial gated integration rejects a bad edit)",
+    "shot1": "test case #1 (three agents on three files land concurrently, clean)",
+    "shot2": "test case #2 (contended whole-file parcel serializes)",
+    "shot3": "test case #3 (frozen-contract change notifies + dependent re-plans)",
+    "shot4": "test case #4 (crash mid-edit is recovered)",
+    "shot5": "test case #5 (serial gated integration rejects a bad edit)",
     "overall": "overall (zero collisions, trunk green throughout)",
 }
 SHOT_ORDER = ["shot1", "shot2", "shot3", "shot4", "shot5", "overall"]
@@ -130,9 +130,9 @@ def _free_port() -> int:
 class _ServerThread:
     """A real `uvicorn` server for `app`, running in a background thread.
 
-    Money-shot #4 needs an agent process this demo can genuinely SIGKILL
+    Test case #4 needs an agent process this demo can genuinely SIGKILL
     without taking the coordinator down with it -- that only works if agents
-    talk to the blackboard over a real socket, so every money shot in this
+    talk to the blackboard over a real socket, so every test case in this
     file (not only #4) is driven over HTTP against this one server.
     """
 
@@ -234,7 +234,7 @@ def _print_event_stream(client: BlackboardClient) -> None:
         print(f"  seq={ev['seq']:>4}  {ev['type']:<16} agent={agent:<28} {payload}")
 
 
-# --- money shot #1: three agents on three DIFFERENT files, concurrently -------------
+# --- test case #1: three agents on three DIFFERENT files, concurrently -------------
 
 _timeline_lock = threading.Lock()
 
@@ -242,7 +242,7 @@ _timeline_lock = threading.Lock()
 # this demo contends on directly.
 CALC_MODULE = "calc.py::<module>"
 
-# Money-shot #1's three concurrent tasks -- one per file, each a real,
+# Test case #1's three concurrent tasks -- one per file, each a real,
 # behavior-preserving edit its own test suite still passes:
 #   calc.py::sub   -> body rewritten, still `a - b`   (test_sub: sub(5,3)==2)
 #   formats.py::money -> body rewritten, same output  (test_money: money(12.5)=="$12.50")
@@ -359,7 +359,7 @@ def _run_shot1(conn, repo: Path, client: BlackboardClient, reporter: _Reporter) 
     )
 
 
-# --- money shot #2: a contended whole-file parcel serializes ------------------------
+# --- test case #2: a contended whole-file parcel serializes ------------------------
 
 
 def _run_shot2(conn, repo: Path, client: BlackboardClient, reporter: _Reporter) -> None:
@@ -436,14 +436,14 @@ def _run_shot2(conn, repo: Path, client: BlackboardClient, reporter: _Reporter) 
     reporter.check("shot2", "a merged event landed for the contended parcel's branch", len(div_merged) >= 1)
 
 
-# --- money shot #3 (U15): frozen-contract change + dependent re-plan ----------------
+# --- test case #3 (U15): frozen-contract change + dependent re-plan ----------------
 
 CONTRACT_SYMBOL = "calc.py::add"
 NEW_ADD_SIGNATURE = "def add(a, b, rounding=None)"
 
 
 def _run_shot3(conn, repo: Path, client: BlackboardClient, reporter: _Reporter) -> None:
-    """DESIGN §5.3/§7 money-shot #3: `calc.py::add` is sample_repo's registered
+    """DESIGN §5.3/§7 test case #3: `calc.py::add` is sample_repo's registered
     frozen contract (U13's fixture design; `blast_radius >= FREEZE_THRESHOLD`
     across `formats.py`, `api.py`, and their own test suites). One task changes
     its signature; two more -- REAL dependents that already call `calc.add` --
@@ -471,7 +471,7 @@ def _run_shot3(conn, repo: Path, client: BlackboardClient, reporter: _Reporter) 
     deliberately backward-compatible: `sample_repo/tests/test_calc.py` calls
     `add(2, 3)` directly and must keep passing on the signature-change task's
     OWN impact-selected test gate -- this shot proves the NOTIFY + RE-PLAN
-    protocol, not a crash-and-recover story (that is money-shot #4's job).
+    protocol, not a crash-and-recover story (that is test case #4's job).
     """
     task_change = broker.Task(
         task_id="shot3-change-add-signature",
@@ -603,7 +603,7 @@ def _run_shot3(conn, repo: Path, client: BlackboardClient, reporter: _Reporter) 
     )
 
 
-# --- money shot #4: real SIGKILL + reaper recovery ----------------------------------
+# --- test case #4: real SIGKILL + reaper recovery ----------------------------------
 
 
 def _run_shot4(
@@ -618,7 +618,7 @@ def _run_shot4(
     parcel_id = "formats.py::<module>"
     ttl = 3.0
     # Trunk's formats.py right before this shot's crash-agent starts -- NOT
-    # sample_repo's static on-disk source: money-shot #3 (U15) legitimately
+    # sample_repo's static on-disk source: test case #3 (U15) legitimately
     # edits formats.py::total_with_tax earlier in the run, so the static
     # source and trunk's actual pre-this-shot content can genuinely differ.
     # What must hold is narrower and order-independent: whatever trunk looked
@@ -707,7 +707,7 @@ def _run_shot4(
             proc.wait(timeout=10.0)
 
 
-# --- money shot #5: a test-breaking edit is rejected -----------------------------
+# --- test case #5: a test-breaking edit is rejected -----------------------------
 
 
 def _run_shot5(repo: Path, client: BlackboardClient, reporter: _Reporter) -> None:
@@ -719,7 +719,7 @@ def _run_shot5(repo: Path, client: BlackboardClient, reporter: _Reporter) -> Non
         client=client,
         repo=repo,
         task="shot5-break-summarize",
-        # Whole-file lock (file granularity) -- see money-shot #4's note.
+        # Whole-file lock (file granularity) -- see test case #4's note.
         target_parcels=["api.py::<module>"],
         mutator=mutators.break_a_test,
         mutator_kwargs={"path": "api.py", "symbol": "summarize"},
@@ -767,19 +767,19 @@ def run_demo(workdir: Optional[Path] = None, keep: bool = False) -> dict[str, An
         conn = app.state.conn
         client = BlackboardClient(server.base_url)
 
-        print("\n=== money shot #1: three agents on three files land concurrently ===")
+        print("\n=== test case #1: three agents on three files land concurrently ===")
         _run_shot1(conn, repo, client, reporter)
 
-        print("\n=== money shot #2: a contended whole-file parcel serializes ===")
+        print("\n=== test case #2: a contended whole-file parcel serializes ===")
         _run_shot2(conn, repo, client, reporter)
 
-        print("\n=== money shot #3: frozen-contract change + dependent re-plan ===")
+        print("\n=== test case #3: frozen-contract change + dependent re-plan ===")
         _run_shot3(conn, repo, client, reporter)
 
-        print("\n=== money shot #4: crash mid-edit is recovered ===")
+        print("\n=== test case #4: crash mid-edit is recovered ===")
         _run_shot4(repo, server.base_url, client, reporter)
 
-        print("\n=== money shot #5: serial gated integration rejects a bad edit ===")
+        print("\n=== test case #5: serial gated integration rejects a bad edit ===")
         _run_shot5(repo, client, reporter)
 
         _print_event_stream(client)
@@ -817,13 +817,13 @@ def main() -> int:
         print(f"  {'PASS' if ok else 'FAIL'}: {SHOT_LABELS[key]}")
     print("=" * 72)
     if result["all_ok"]:
-        print("ALL FIVE MONEY SHOTS PASS (DESIGN §7): three agents on three files land "
+        print("ALL FIVE TEST CASES PASS (DESIGN §7): three agents on three files land "
               "clean and concurrently, a contended whole-file parcel serializes, a "
               "frozen-contract change notifies its dependents and they re-plan, a crash "
               "mid-edit is recovered, and a test-breaking edit is rejected by the gated "
               "integrator -- all under file-granularity locking, the shipping default.")
     else:
-        print("AT LEAST ONE MONEY SHOT FAILED.")
+        print("AT LEAST ONE TEST CASE FAILED.")
 
     return 0 if result["all_ok"] else 1
 

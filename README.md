@@ -96,11 +96,11 @@ You should see:
 
 ```
 RESULTS
-  PASS: case #1 (three agents on three files land concurrently, clean)
-  PASS: case #2 (contended whole-file parcel serializes)
-  PASS: case #3 (frozen-contract change notifies + dependent re-plans)
-  PASS: case #4 (crash mid-edit is recovered)
-  PASS: case #5 (serial gated integration rejects a bad edit)
+  PASS: test case #1 (three agents on three files land concurrently, clean)
+  PASS: test case #2 (contended whole-file parcel serializes)
+  PASS: test case #3 (frozen-contract change notifies + dependent re-plans)
+  PASS: test case #4 (crash mid-edit is recovered)
+  PASS: test case #5 (serial gated integration rejects a bad edit)
   PASS: overall (zero collisions, trunk green throughout)
 ```
 

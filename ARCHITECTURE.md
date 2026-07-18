@@ -142,7 +142,7 @@ branch.
 | **Agent** | [`agent/runner.py`](swarmsync/agent/runner.py), [`agent/client.py`](swarmsync/agent/client.py) | The full sync-protocol lifecycle in a worktree; `client.py` is the thin, swappable interface a real Claude Agent SDK worker drops into. |
 | ↳ demo stand-in | [`agent/mutators.py`](swarmsync/agent/mutators.py) | Deterministic scripted edits used in place of a live LLM so the demo/tests are reproducible. |
 | **Claude Code hooks** | [`hooks/adapter.py`](swarmsync/hooks/adapter.py), [`scripts/swarmsync-hook-guard`](scripts/swarmsync-hook-guard) | The transparent enforcement path: gates every `Edit`/`Write` a Claude subagent makes. The guard is a zero-overhead shim when coordination is off. |
-| **Demo** | [`demo/run_demo.py`](demo/run_demo.py) | Boots everything and runs the five "money shot" scenarios end to end. |
+| **Demo** | [`demo/run_demo.py`](demo/run_demo.py) | Boots everything and runs the five "test case" scenarios end to end. |
 
 ---
 
@@ -200,7 +200,7 @@ unless you set `SWARMSYNC_TOKEN`.
 
 ## Further reading
 
-- [`DESIGN.md`](DESIGN.md) — the full spec: schema, every endpoint, all five money-shot demos, the
+- [`DESIGN.md`](DESIGN.md) — the full spec: schema, every endpoint, all five test case demos, the
   complete failure-handling table, and the operational surface (env vars, launchers).
 - [`SYMBOL_MODE_DESIGN.md`](SYMBOL_MODE_DESIGN.md) — why per-symbol leasing is parked and how it
   would come back.

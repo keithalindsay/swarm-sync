@@ -13,7 +13,7 @@ Unit U9. Implements the per-agent loop DESIGN §4.3 specifies:
      against; this unit fetches the current contract so that snapshot exists).
   5. `git_ops.add_worktree`; apply the edit via a scripted mutator
      (`agent/mutators.py`); heartbeat on a background daemon thread the whole
-     time so a hard-killed process (SIGKILL, money-shot #4) simply stops
+     time so a hard-killed process (SIGKILL, test case #4) simply stops
      heartbeating with no explicit cleanup needed -- the reaper (U11)
      reclaims the lease once its TTL lapses.
   6. `commit_all`; for each target parcel, re-derive its real `content_hash`
@@ -30,7 +30,7 @@ for the caller (a test, or later the broker/U12) to assert against.
 
 U15 adds `lease_modes`: a per-parcel lease-mode override so a caller (the
 broker) can force `"exclusive"` on exactly the target parcels that are
-frozen contracts (DESIGN §5.3, money-shot #3) while leaving every other
+frozen contracts (DESIGN §5.3, test case #3) while leaving every other
 target parcel on the task's default `lease_mode`.
 """
 from __future__ import annotations
@@ -65,7 +65,7 @@ class AgentResult:
     integrate_result: Optional[dict] = None
     lease_modes_used: dict[str, str] = field(default_factory=dict)  # parcel_id -> mode
     # actually granted -- lets a caller/test confirm a frozen-contract target
-    # really was leased `exclusive` (DESIGN §5.3, money-shot #3, U15), not
+    # really was leased `exclusive` (DESIGN §5.3, test case #3, U15), not
     # just whatever `lease_mode` it happened to pass.
 
 
@@ -73,7 +73,7 @@ class _Heartbeater:
     """Background daemon thread bumping TTL on a set of leases until stopped.
 
     Runs off the main thread (DESIGN §4.3 step 5) so a hard-killed agent
-    process (SIGKILL, money-shot #4) simply stops heartbeating -- there is
+    process (SIGKILL, test case #4) simply stops heartbeating -- there is
     nothing to explicitly clean up in that scenario; the reaper (U11)
     reclaims the lease once `ttl_expires_at` lapses. Under a normal
     (non-crashed) run, `stop()` is called from `run_agent`'s OUTER `finally` --

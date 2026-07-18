@@ -10,7 +10,7 @@ those imports the same way.
 
 Shape:
   calc.py      — add/sub/mul/div: four independent top-level functions, none call each
-                 other. add/sub (or mul/div) is money-shot #1's target: two agents editing
+                 other. add/sub (or mul/div) is test case #1's target: two agents editing
                  two different functions in the SAME file, concurrently, at symbol
                  granularity.
   formats.py   — money(), percent(), total_with_tax(): depend on calc.add/mul/div (named
@@ -19,11 +19,11 @@ Shape:
                  both calc (module-level, attribute calls) and formats (named). Between
                  formats.py, api.py, and their own tests all calling it, calc.py::add's
                  blast_radius clears FREEZE_THRESHOLD (3) — it's sample_repo's
-                 frozen-contract candidate (money-shot #3, DESIGN §3 step 5): api.py's/
+                 frozen-contract candidate (test case #3, DESIGN §3 step 5): api.py's/
                  formats.py's call sites are what a dependent agent re-plans if add's
                  signature ever changes.
   tests/       — pytest covering each module; this is the integrator's merge gate for
-                 money-shots #1 and #5 (a deliberately test-breaking edit here must make
+                 test cases #1 and #5 (a deliberately test-breaking edit here must make
                  the gate reject).
 
 Verified in `tests/test_sample_repo.py` (project root): >=3 modules with a real

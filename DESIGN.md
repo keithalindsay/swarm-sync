@@ -307,7 +307,7 @@ break by observing the `contract_change` event on its own (polling `GET /events`
 integrator's `expected_read_deps` optimistic re-check at its *own* integrate time, §5.5). Between the
 change landing on trunk and a dependent noticing it, that dependent's in-flight work is silently
 building against a stale signature; the test gate (§5.4) is the backstop that eventually catches a
-resulting break, not this mechanism. Money-shot #3 demonstrates the happy path (a dependent that does
+resulting break, not this mechanism. Test case #3 demonstrates the happy path (a dependent that does
 poll and re-plans in time), not a guarantee that every dependent will.
 
 ### 5.4 Serial test-gated integrator (detection + resolution)
@@ -341,11 +341,11 @@ read-dependencies. A mismatch means a dependency shifted mid-work → forced reb
 ## 7. The end-to-end demo the prototype MUST show
 
 A single script `demo/run_demo.py` boots the server, indexes `sample_repo/`, and runs agents against a
-fixed task list, printing the event stream. It must demonstrate **five money shots**, each an
+fixed task list, printing the event stream. It must demonstrate **five test cases**, each an
 assertion the script checks and prints PASS/FAIL for:
 
 1. **Concurrent disjoint edits land clean.** Three agents lease and edit **different files** at the
-   same time (file-granularity leasing, §2 — two agents in *one* file is what money-shot #2 shows
+   same time (file-granularity leasing, §2 — two agents in *one* file is what test case #2 shows
    instead: it serializes); all three branches merge green with **zero conflicts**.
    *Proof:* three `merged` events with overlapping work windows, integration branch tests green, git
    log shows all three commits.
@@ -365,8 +365,8 @@ assertion the script checks and prints PASS/FAIL for:
 
 **Overall success criterion:** across a run with ≥3 concurrent agents on the sample repo, **zero
 textual collisions reach the integration branch** (no two agents ever hold the same file at once —
-§2's file granularity is what makes that true, and money-shot #2 is the case where it bites), every
-landed commit leaves the sample repo's test suite green, and all five money-shot assertions print
+§2's file granularity is what makes that true, and test case #2 is the case where it bites), every
+landed commit leaves the sample repo's test suite green, and all five test case assertions print
 PASS.
 
 ## 7a. Operational surface (env + launchers)
