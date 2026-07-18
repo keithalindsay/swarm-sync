@@ -1323,3 +1323,87 @@ def test_race_deny_consumes_acquire_result_without_second_leases_roundtrip(repo)
     assert "left on the current hold" in reason
     assert "renews while its holder stays active" in reason
     assert client.leases_calls == 1, "deny path did a second /leases round-trip"
+
+
+# --- WP3.5 (C6-interim): a deleted file gets an honest tombstone, not a stale hash --
+
+
+def test_postupdate_pushes_deleted_tombstone_when_file_is_gone(
+    monkeypatch, repo, indexed_client
+):
+    """If the edit removed the file from disk, postupdate must NOT return early
+    leaving the blackboard advertising the last-good content_hash of a file that
+    no longer exists. It pushes the DELETED sentinel hash + a state_summary with
+    a clear DELETED marker naming the agent (same shape as the DIRTY/UNPARSEABLE
+    mechanism). This matters on the HOOK path, where no integrator re-index ever
+    runs to supersede the ghost."""
+    monkeypatch.setenv("SWARMSYNC_ACTIVE", "1")
+    parcel_id = f"mod_a.py::{MODULE_SYMBOL}"
+    good_hash = {p["id"]: p for p in indexed_client.get("/parcels").json()}[parcel_id][
+        "content_hash"
+    ]
+    # Real flow: the deleting agent holds the write lease from its precheck.
+    assert indexed_client.post(
+        "/lease", json={"agent_id": "a1", "parcel_id": parcel_id, "mode": "write"}
+    ).json()["granted"]
+
+    (repo / "mod_a.py").unlink()  # the edit deleted the file
+
+    payload = _payload("Edit", file_path=str(repo / "mod_a.py"), cwd=str(repo), agent_id="a1")
+    code, out, err = _run("postupdate", payload, http_factory=_http_factory(indexed_client))
+    assert code == 0
+
+    after = {p["id"]: p for p in indexed_client.get("/parcels").json()}[parcel_id]
+    assert after["content_hash"] != good_hash, (
+        "blackboard still advertises the stale last-good hash of a deleted file"
+    )
+    assert after["content_hash"] == adapter.DELETED_SENTINEL_HASH
+    assert "DELETED" in after["state_summary"]
+    assert "a1" in after["state_summary"]
+
+
+def test_postupdate_deleted_tombstone_is_deterministic(monkeypatch, repo, indexed_client):
+    """Two tombstones for the same deleted file + agent are byte-identical
+    (state_summary stays deterministic, like the DIRTY marker)."""
+    monkeypatch.setenv("SWARMSYNC_ACTIVE", "1")
+    parcel_id = f"mod_a.py::{MODULE_SYMBOL}"
+    assert indexed_client.post(
+        "/lease", json={"agent_id": "a1", "parcel_id": parcel_id, "mode": "write"}
+    ).json()["granted"]
+    (repo / "mod_a.py").unlink()
+    payload = _payload("Edit", file_path=str(repo / "mod_a.py"), cwd=str(repo), agent_id="a1")
+
+    _run("postupdate", payload, http_factory=_http_factory(indexed_client))
+    first = {p["id"]: p for p in indexed_client.get("/parcels").json()}[parcel_id]
+
+    _run("postupdate", payload, http_factory=_http_factory(indexed_client))
+    second = {p["id"]: p for p in indexed_client.get("/parcels").json()}[parcel_id]
+
+    assert "DELETED" in first["state_summary"]
+    assert (first["content_hash"], first["state_summary"]) == (
+        second["content_hash"], second["state_summary"]
+    )
+
+
+def test_postupdate_refused_tombstone_fails_open_with_logged_note(
+    monkeypatch, repo, indexed_client
+):
+    """Edge: the deleting agent's lease lapsed before the tombstone landed --
+    /parcel/update refuses it (WP1.4 requires the write lease). The hook must
+    stay fail-open: exit 0, a note on stderr, no crash, parcel left as-is."""
+    monkeypatch.setenv("SWARMSYNC_ACTIVE", "1")
+    parcel_id = f"mod_a.py::{MODULE_SYMBOL}"
+    before = {p["id"]: p for p in indexed_client.get("/parcels").json()}[parcel_id]
+
+    (repo / "mod_a.py").unlink()  # deleted, but NO lease held by this agent
+
+    payload = _payload(
+        "Edit", file_path=str(repo / "mod_a.py"), cwd=str(repo), agent_id="no-lease"
+    )
+    code, out, err = _run("postupdate", payload, http_factory=_http_factory(indexed_client))
+
+    assert code == 0
+    assert out == ""  # postupdate never emits deny JSON
+    assert "tombstone" in err.lower()
+    after = {p["id"]: p for p in indexed_client.get("/parcels").json()}[parcel_id]
+    assert after == before  # refused update changed nothing

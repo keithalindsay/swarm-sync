@@ -22,9 +22,11 @@ process invocation):
                 `classifier.indexer.parse_file` and POSTs the freshly re-derived
                 content_hash + a deterministic state_summary to /parcel/update
                 (or a raw-byte hash + 'dirty/unparseable' marker if the edit left
-                the file syntactically invalid). Refreshes the lease TTL (S5).
-                Never releases the lease here -- the agent keeps it until it
-                stops (SubagentStop/Stop -> `release`).
+                the file syntactically invalid; or, WP3.5, the DELETED-tombstone
+                sentinel hash + marker if the edit removed the file from disk --
+                never a stale last-good hash for a file that is gone). Refreshes
+                the lease TTL (S5). Never releases the lease here -- the agent
+                keeps it until it stops (SubagentStop/Stop -> `release`).
   release       SubagentStop/Stop. Releases every active lease this agent_id
                 holds (GET /leases, filter, POST /release each).
   session-start SessionStart. Best-effort POST /index of the repo root if the
@@ -465,12 +467,29 @@ def _dirty_summary(relpath: str, agent_id: str, exc: Exception) -> str:
     )
 
 
+# WP3.5 (C6-interim): the sentinel content_hash a deleted file's tombstone carries.
+# `sha256(b"deleted")` -- a CONSTANT, like the DIRTY path's raw-byte hash it is
+# shaped after, chosen over hashing empty bytes because sha256(b"") is a famous
+# value real empty files legitimately hash to; this one can never collide with any
+# genuine on-disk content (parcel hashes are digests of bytes that exist) and is
+# trivially recognizable/greppable. Deterministic by design, matching the module's
+# "same input -> identical row" rule for summaries.
+DELETED_SENTINEL_HASH = hashlib.sha256(b"deleted").hexdigest()
+
+
+def _deleted_summary(relpath: str, agent_id: str) -> str:
+    """DETERMINISTIC tombstone marker for a file the edit removed from disk,
+    naming the deleting agent (same shape as `_dirty_summary`)."""
+    return f"swarm-sync hook: {relpath} DELETED by {agent_id}"
+
+
 def cmd_postupdate(
     tool_name: Optional[str],
     tool_input: Mapping[str, Any],
     client: BlackboardClient,
     repo_root: Path,
     agent_id: str,
+    err: TextIO = sys.stderr,
 ) -> None:
     """Re-parse the just-edited file and POST its fresh content_hash (never
     the agent's self-reported one -- DESIGN §5.4/§6 "lying blackboard" rule)
@@ -485,6 +504,18 @@ def cmd_postupdate(
     'DIRTY/UNPARSEABLE' state_summary, so the parcel's content_hash genuinely
     changes and the summary flags that it can't be parsed until the agent fixes
     it (the integrator's re-index/test gate is the eventual backstop).
+
+    WP3.5 (C6-interim): if the edit DELETED the file outright, the same logic
+    applies -- the old early return left the blackboard advertising the last-good
+    hash of a file that is gone. Now a tombstone is posted instead: the constant
+    `DELETED_SENTINEL_HASH` + a state_summary with a DELETED marker naming this
+    agent. Since WP1.4 `/parcel/update` requires the caller's write lease; the
+    deleting agent holds it from its own precheck, so the tombstone lands. If the
+    lease lapsed (edge), the refusal stays FAIL-OPEN: a one-line stderr note, no
+    crash, no deny. Note the tombstone matters most on THIS hook path, where no
+    integrator ever runs: on the broker path the integrator's authoritative
+    post-land re-index (WP3.5 task A) retires the parcel row itself and
+    supersedes any tombstone.
     """
     if tool_name not in EDIT_TOOLS:
         return
@@ -492,15 +523,43 @@ def cmd_postupdate(
     if relpath is None:
         return
     abs_path = repo_root / relpath
-    if not abs_path.exists():
-        return  # e.g. the edit deleted the file; nothing left to re-hash
     parcel_id = _parcel_id(relpath)
 
     # KEEPALIVE (S5): refresh this agent's lease on the edited parcel before
     # anything that could raise, so a long edit doesn't let the lease expire.
+    # Runs for the deleted-file tombstone path too -- the parcel row (and this
+    # agent's lease on it) outlives the file until an integrator retires it.
     lease = _find_lease(client.leases(), parcel_id)
     if lease is not None and lease.get("agent_id") == agent_id:
         _keepalive(client, agent_id, lease)
+
+    if not abs_path.exists():
+        # The edit deleted the file. Post an honest tombstone instead of the old
+        # early return that kept advertising a stale hash for a gone file.
+        # A refusal is FAIL-OPEN either way it arrives: the server reports a
+        # missing lease as a soft 200 `{"ok": false, "reason": ...}` (checked
+        # below), while transport/4xx failures raise (caught below) -- both end
+        # in a stderr note, never a crash or a deny.
+        try:
+            result = client.parcel_update(
+                agent_id,
+                parcel_id,
+                DELETED_SENTINEL_HASH,
+                _deleted_summary(relpath, agent_id),
+            )
+            if not result.get("ok", True):
+                err.write(
+                    f"swarmsync-hook: postupdate: DELETED tombstone for {relpath} was "
+                    f"refused ({result.get('reason')!r}); failing open -- the "
+                    "integrator's re-index is the authoritative backstop\n"
+                )
+        except Exception as exc:  # noqa: BLE001 -- fail-open by contract (see docstring)
+            err.write(
+                f"swarmsync-hook: postupdate: DELETED tombstone for {relpath} "
+                f"failed ({exc!r}); failing open -- the integrator's re-index "
+                "is the authoritative backstop\n"
+            )
+        return
 
     try:
         parcels = parse_file(abs_path, rel_path=relpath)
@@ -763,7 +822,7 @@ def _dispatch(
                 out.write(json.dumps(decision))
                 out.write("\n")
         elif subcommand == "postupdate":
-            cmd_postupdate(tool_name, tool_input, client, repo_root, agent_id)
+            cmd_postupdate(tool_name, tool_input, client, repo_root, agent_id, err=err)
         elif subcommand == "release":
             cmd_release(client, agent_id)
         elif subcommand == "session-start":
