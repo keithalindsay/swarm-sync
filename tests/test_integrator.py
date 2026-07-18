@@ -1540,3 +1540,42 @@ def test_retirement_respects_fk_dependents_and_scopes_to_touched_paths(conn, rep
     assert conn.execute(
         "SELECT 1 FROM parcels WHERE id = 'ghost.py::<module>'"
     ).fetchone() is not None
+
+
+def test_each_event_stamps_its_own_time_not_the_call_entry_time(
+    conn, repo, monkeypatch
+):
+    """C16: every event one `integrate()` emits must carry ITS OWN wall-clock
+    `ts`, not a single timestamp captured at call entry. One integrate spans the
+    whole pytest gate -- up to SWARMSYNC_GATE_TIMEOUT (600s default) -- so a
+    call-entry timestamp threaded through would stamp the `merged` verdict
+    minutes stale, and `ts` ordering across the call's own events would lie."""
+    r, base = repo
+    run_index(conn, r)
+
+    real_gate = integrator.run_impact_tests
+
+    def slow_gate(*args, **kwargs):
+        time.sleep(0.05)  # stand-in for a long (up to 600s) gate run
+        return real_gate(*args, **kwargs)
+
+    monkeypatch.setattr(integrator, "run_impact_tests", slow_gate)
+
+    wt = git_ops.add_worktree(r, "agent-slow", base)
+    (wt / "mod_a.py").write_text(
+        "def helper(x):\n    return x + 9\n", encoding="utf-8"
+    )
+    git_ops.commit_all(wt, "agent-slow: edit")
+    result = integrator.integrate(
+        conn, r, "agent-slow", base_commit=base, agent_id="agent-slow"
+    )
+    assert result.status == "merged"
+
+    events = events_mod.tail(conn, since_seq=0)
+    started = next(e for e in events if e.type == "integrate_started")
+    merged = next(e for e in events if e.type == "merged")
+    assert merged.ts > started.ts, (
+        f"`merged` (ts={merged.ts}) is not stamped after `integrate_started` "
+        f"(ts={started.ts}): the verdict carries a stale call-entry timestamp "
+        "instead of its own emit time (C16)"
+    )
