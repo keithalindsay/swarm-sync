@@ -206,9 +206,49 @@ def acquire(
         {"parcel_id": parcel_id, "mode": mode},
         ts=now,
     )
+
+    # Name the holder that best explains the denial so the caller (the hook adapter)
+    # need not make a second /leases round-trip. This mirrors the CAS's own conflict
+    # predicate exactly -- same parcel, same active/liveness/conflict/self-exemption
+    # clauses -- but tests liveness against SQLITE'S clock (`_NOW_SQL`), NOT the Python
+    # `:now` bound before execute, matching `heartbeat`. A stale Python `now` would name
+    # a holder whose lease has since lapsed (the reverse of a fresh clock, which surfaces
+    # None -> "no single holder identifiable", the honest answer). This lookup is purely
+    # descriptive; the deny itself was already decided atomically by the CAS above.
+    #
+    # Tie-break when several leases block (e.g. multiple readers vs. an incoming write):
+    #   1. a write/exclusive holder first -- it is the exclusive owner and the one whose
+    #      release actually frees the parcel;
+    #   2. otherwise the SOONEST-to-expire (smallest ttl_expires_at) -- the reader that
+    #      frees the parcel first, i.e. the earliest moment the caller could retry.
+    holder_row = conn.execute(
+        f"""
+        SELECT l.agent_id AS holder, l.ttl_expires_at AS holder_ttl_expires_at
+        FROM leases l
+        WHERE l.parcel_id = :parcel_id
+          AND l.status = 'active'
+          AND l.ttl_expires_at > {_NOW_SQL}
+          AND (l.mode IN ('write', 'exclusive') OR :mode IN ('write', 'exclusive'))
+          AND NOT (l.agent_id = :agent_id AND l.mode = :mode)
+        ORDER BY (l.mode IN ('write', 'exclusive')) DESC, l.ttl_expires_at ASC
+        LIMIT 1
+        """,  # noqa: S608 - _NOW_SQL is a module constant, never caller input
+        {"parcel_id": parcel_id, "mode": mode, "agent_id": agent_id},
+    ).fetchone()
+
+    holder: Optional[str] = None
+    holder_ttl_expires_at: Optional[float] = None
+    reason = f"conflicting active lease on {parcel_id!r}"
+    if holder_row is not None:
+        holder = holder_row["holder"]
+        holder_ttl_expires_at = holder_row["holder_ttl_expires_at"]
+        reason = f"conflicting active lease on {parcel_id!r} held by {holder!r}"
+
     return LeaseResult(
         granted=False,
-        reason=f"conflicting active lease on {parcel_id!r}",
+        reason=reason,
+        holder=holder,
+        holder_ttl_expires_at=holder_ttl_expires_at,
     )
 
 
