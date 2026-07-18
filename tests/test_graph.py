@@ -328,3 +328,117 @@ def test_build_graph_survives_an_undecodable_file_on_disk(tmp_path):
 
     graph = build_graph(parcels, tmp_path)
     assert "good.py::kept" in graph.signatures
+
+
+# --- A8: reachable-but-uncovered build_graph branches ------------------------------
+#
+# Each feeds blast-radius -> contracts -> impact-test selection and would fail
+# silently if broken. Each asserts a SPECIFIC rendered/resolved value so it catches a
+# regression, not merely executes the line.
+
+import ast  # noqa: E402 -- kept beside the tests that use it
+
+from swarmsync.classifier.graph import (  # noqa: E402
+    _class_signature,
+    _function_signature,
+    _resolve_relative_module,
+)
+
+
+def _first_def(src):
+    return ast.parse(src).body[0]
+
+
+# (1) relative-import resolution -- `from .foo import bar` / `from ..pkg import baz`
+
+
+def test_resolve_relative_module_single_level_appends_to_own_package():
+    """`from .foo import bar` in pkg/sub/mod.py resolves to `pkg.sub.foo`."""
+    node = _first_def("from .foo import bar")
+    assert _resolve_relative_module("pkg/sub/mod.py", node) == "pkg.sub.foo"
+
+
+def test_resolve_relative_module_double_level_climbs_one_package():
+    """`from ..foo import baz` in pkg/sub/mod.py climbs to the parent package: `pkg.foo`."""
+    node = _first_def("from ..foo import baz")
+    assert _resolve_relative_module("pkg/sub/mod.py", node) == "pkg.foo"
+
+
+def test_resolve_relative_module_bare_dot_import_is_the_package_itself():
+    """`from . import thing` resolves to the importing file's own package (no module part)."""
+    node = _first_def("from . import thing")
+    assert _resolve_relative_module("pkg/sub/mod.py", node) == "pkg.sub"
+
+
+def test_relative_import_edge_resolves_end_to_end_through_build_graph(tmp_path):
+    """The relative-import branch is REACHABLE via the public API and really wires the
+    dependency edge that blast-radius/impact-selection ride on."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "foo.py").write_text("def bar(x):\n    return x\n", encoding="utf-8")
+    (pkg / "mod.py").write_text(
+        "from .foo import bar\n\n\ndef caller(x):\n    return bar(x)\n", encoding="utf-8"
+    )
+    parcels = index_repo(tmp_path)
+    graph = build_graph(parcels, tmp_path)
+    # `caller` -> `bar` was resolved across the relative import.
+    assert "pkg/mod.py::caller" in graph.reverse_edges["pkg/foo.py::bar"]
+    assert blast_radius(graph)["pkg/foo.py::bar"] >= 1
+
+
+# (2) class signatures -- public methods only
+
+
+def test_class_signature_renders_public_methods_only():
+    node = _first_def(
+        "class Widget:\n"
+        "    def run(self, x):\n        return x\n"
+        "    def resize(self, w, h=1):\n        return w\n"
+        "    def _private(self):\n        return 0\n"
+    )
+    # public methods in source order, private (underscore) method omitted.
+    assert _class_signature(node) == "class Widget(run(self, x), resize(self, w, h=1))"
+
+
+def test_class_signature_with_no_public_methods_is_empty_parens():
+    node = _first_def("class Bag:\n    def _hidden(self):\n        return 1\n")
+    assert _class_signature(node) == "class Bag()"
+
+
+def test_class_signature_is_produced_by_build_graph(tmp_path):
+    """The class branch is reachable via build_graph and lands in `graph.signatures`."""
+    (tmp_path / "w.py").write_text(
+        "class Widget:\n    def run(self, x):\n        return x\n", encoding="utf-8"
+    )
+    parcels = index_repo(tmp_path)
+    graph = build_graph(parcels, tmp_path)
+    sig, _hashed = graph.signatures["w.py::Widget"]
+    assert sig == "class Widget(run(self, x))"
+
+
+# (3) vararg / kw-only signature rendering
+
+
+def test_function_signature_renders_vararg_and_kwonly_with_defaults():
+    """`*args`, a kw-only arg, and `**kw` all render, kw-only default included."""
+    node = _first_def("def f(a, b=2, *args, c, d=4, **kw):\n    return None")
+    assert _function_signature(node) == "f(a, b=2, *args, c, d=4, **kw)"
+
+
+def test_function_signature_bare_star_for_kwonly_without_vararg():
+    """Kw-only args with NO `*args` render the bare `*` separator (line 127 branch)."""
+    node = _first_def("def g(x, *, y, z=3):\n    return None")
+    assert _function_signature(node) == "g(x, *, y, z=3)"
+
+
+def test_function_signature_kwonly_rendering_via_build_graph(tmp_path):
+    """The vararg/kw-only rendering is reachable via build_graph and feeds the contract
+    signature/type_hash pair."""
+    (tmp_path / "s.py").write_text(
+        "def f(a, *args, c, **kw):\n    return None\n", encoding="utf-8"
+    )
+    parcels = index_repo(tmp_path)
+    graph = build_graph(parcels, tmp_path)
+    sig, _hashed = graph.signatures["s.py::f"]
+    assert sig == "f(a, *args, c, **kw)"

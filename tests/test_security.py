@@ -116,6 +116,38 @@ def test_index_rejects_symlink_escaping_managed_root(monkeypatch, tmp_path, clie
     assert r.status_code == 403  # realpath resolves outside -> rejected
 
 
+def test_index_rejects_sibling_prefix_of_managed_root(monkeypatch, tmp_path, client):
+    """M-2: a path whose PARENT DIR NAME merely extends the managed root is a DIFFERENT
+    tree and must be rejected.
+
+    The allow-list check is `real == root or real.startswith(root + os.sep)`. The
+    `+ os.sep` is load-bearing: with managed root `.../managed`, the sibling `.../managed-evil`
+    string-starts-with the root but is NOT under it. Dropping `+ os.sep` (the documented
+    M-2 mutation survivor) makes a bare `startswith(root)` accept it -- the existing
+    outside-path and symlink tests both use paths that are NOT string-prefixes of the
+    root, so neither catches that mutation. This one does.
+    """
+    managed = _tiny_repo(tmp_path / "managed")
+    # A SIBLING whose name extends the root string ("managed" is a prefix of
+    # "managed-evil") but which lives in a completely different directory tree.
+    evil = _tiny_repo(tmp_path / "managed-evil")
+    monkeypatch.setenv("SWARMSYNC_ROOTS", str(managed))
+
+    # sanity: the attacker path really IS a string-prefix match on the root...
+    assert str(evil).startswith(str(managed))
+    # ...yet it must be rejected, because it is not UNDER the managed root.
+    r = client.post("/index", json={"root": str(evil)})
+    assert r.status_code == 403
+
+    # a real file inside that sibling tree is likewise rejected.
+    r = client.post("/index", json={"root": str(evil / "mod_a.py")})
+    assert r.status_code == 403
+
+    # control: the genuine managed root is still accepted, so 403 above is the
+    # boundary check firing, not a blanket refusal.
+    assert client.post("/index", json={"root": str(managed)}).status_code == 200
+
+
 def test_integrate_rejects_repo_outside_managed_roots(monkeypatch, tmp_path, client):
     managed = tmp_path / "managed"
     managed.mkdir()
