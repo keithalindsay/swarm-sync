@@ -1,9 +1,13 @@
 """Serial, test-gated integrator. DESIGN.md §5.4, §5.5.
 
-Unit U10. Every merge goes through `integrate()` -- called one branch at a time
-by whatever drives it (a test, the demo harness, or later `POST /integrate` /
-the broker, U12) -- so trunk (the `into` branch, "integration" by convention
-per `worktree.git_ops.init_repo`) is never poisoned by a partial edit.
+Every merge goes through `integrate()` -- called one branch at a time by
+whatever drives it (a test, the demo harness, or `POST /integrate`) -- so trunk
+(the `into` branch, "integration" by convention per `worktree.git_ops.init_repo`)
+is never poisoned by a partial edit.
+
+The pytest gate itself -- impact selection, the subprocess sandbox, timeout and
+group-kill machinery -- lives in `coordinator.gate`; this module consumes only
+its `(ok, log)` verdict.
 
 integrate(conn, repo, branch, base_commit=None, into="integration", ...) -> IntegrateResult
   1. **Optimistic re-check** (DESIGN §5.5, opt-in via `expected_read_deps`): if the
@@ -22,9 +26,10 @@ integrate(conn, repo, branch, base_commit=None, into="integration", ...) -> Inte
      signal of touch-set misprediction**: reject, emit `merge_rejected` with
      the conflicted paths, do not retry or auto-resolve (`merge_branch` already
      aborts the failed merge itself, so `into` is untouched).
-  3. Run `run_impact_tests` -- pytest restricted to test files that plausibly
-     exercise the changed modules (impact selection), falling back to the full
-     suite under `test_dir` when selection is uncertain (nothing matched).
+  3. Run the pytest gate (`gate.run_impact_tests`) -- pytest restricted to test
+     files that plausibly exercise the changed modules (impact selection),
+     falling back to the full suite under `test_dir` when selection is
+     uncertain (nothing matched).
      Green -> land: emit `merged`. Red -> `git_ops.reset_hard(repo, pre_merge_sha)`
      to undo the just-landed merge commit, emit `merge_rejected` with the
      captured pytest log, trunk (`into`) is left exactly as it was pre-merge.
@@ -53,8 +58,9 @@ integrate(conn, repo, branch, base_commit=None, into="integration", ...) -> Inte
      per vanished symbol (why: symbol_deleted), scoped to the merge's own
      changed files (never a full-table sweep). A rename is simply the new
      path's rows appearing via re-index + the old path's rows retiring.
-  5. **Frozen-contract change detection** (DESIGN §5.3, test case #3, U15):
-     bracketing step 4's re-index, this snapshots `contracts.type_hash` for
+  5. **Frozen-contract change detection** (DESIGN §5.3; `_snapshot_touched_contracts`
+     / `_diff_contract_changes`): bracketing step 4's re-index, this snapshots
+     `contracts.type_hash` for
      every symbol whose file this branch touched, BEFORE re-indexing, and
      compares it against the same symbols' type_hash AFTER. Any symbol whose
      type_hash genuinely changed emits a `contract_change` event (old/new
@@ -77,55 +83,36 @@ thin shell around this function, not a separate implementation.
 """
 from __future__ import annotations
 
-import os
-import signal
 import sqlite3
-import subprocess
-import sys
+import subprocess  # noqa: F401 -- re-exported: tests patch `integrator.subprocess.Popen`
 import time
-from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Union
 
 from swarmsync.blackboard import db
 from swarmsync.blackboard.models import Parcel
-from swarmsync.classifier.graph import DepGraph, build_graph
-from swarmsync.classifier.indexer import index_repo
+from swarmsync.classifier.graph import DepGraph
 from swarmsync.classifier.store import retire_rows, run_index
 from swarmsync.blackboard import events as events_mod
+from swarmsync.coordinator import gate
 from swarmsync.worktree import git_ops
 
 StrPath = Union[str, Path]
 
-DEFAULT_TEST_DIR = "tests"
-
-# Wall-clock ceiling for the pytest gate. The gate executes just-merged, agent-
-# authored test code of unbounded runtime while `app.post_integrate` holds the ONE
-# global `integrate_lock`, so an infinite loop (or a test that blocks on input, a
-# socket, a dead network mount) in any agent's branch does not merely fail that
-# merge -- it wedges integration for every other agent, permanently, with trunk
-# left carrying the un-gated merge commit. A timeout converts that from "the
-# coordinator is dead until someone restarts it" into an ordinary rejection.
-# Override per-deployment via SWARMSYNC_GATE_TIMEOUT (seconds).
-DEFAULT_GATE_TIMEOUT_SECONDS = 600.0
-
-# How long to wait for a killed gate's output after the group kill. Short by design:
-# by this point the verdict (rejected) is already decided and the log is a nicety, so
-# there is no reason to let an escaped descendant holding the pipes delay the caller
-# -- which holds the global integrate_lock.
-_DRAIN_TIMEOUT_SECONDS = 5.0
-
-
-def _gate_timeout() -> float:
-    raw = os.environ.get("SWARMSYNC_GATE_TIMEOUT")
-    if not raw:
-        return DEFAULT_GATE_TIMEOUT_SECONDS
-    try:
-        value = float(raw)
-    except ValueError:
-        return DEFAULT_GATE_TIMEOUT_SECONDS
-    return value if value > 0 else DEFAULT_GATE_TIMEOUT_SECONDS
+# Compatibility aliases for the gate machinery, which moved wholesale to
+# `coordinator.gate` (WP4.3). Existing tests and monkeypatch sites reach it
+# through THIS module (`integrator.run_impact_tests`, `integrator._gate_timeout`,
+# `integrator._kill_process_group`, ...), and `integrate` below calls the
+# module-global `run_impact_tests` -- never `gate.run_impact_tests` directly --
+# so patching `integrator.run_impact_tests` still intercepts the gate.
+DEFAULT_TEST_DIR = gate.DEFAULT_TEST_DIR
+DEFAULT_GATE_TIMEOUT_SECONDS = gate.DEFAULT_GATE_TIMEOUT_SECONDS
+run_impact_tests = gate.run_impact_tests
+_gate_timeout = gate._gate_timeout
+_kill_process_group = gate._kill_process_group
+_close_streams = gate._close_streams
+_reverse_dep_files = gate._reverse_dep_files
 
 
 @dataclass
@@ -173,209 +160,70 @@ def _check_read_deps(
     return stale
 
 
-def _reverse_dep_files(repo: Path, changed_py: set[str]) -> set[str]:
-    """Every repo file that TRANSITIVELY reverse-depends on a changed `.py` file,
-    via the classifier's real import/call dependency graph.
+def _snapshot_touched_contracts(
+    conn, changed_set: set[str]
+) -> dict[str, tuple[str, str, int]]:
+    """Pre-re-index snapshot of every contract whose symbol lives in a file this
+    merge touched: `{symbol: (signature, type_hash, version)}`.
 
-    This is the correctness core of impact selection: a test that exercises the
-    changed code only *indirectly* (it imports module M, which imports the changed
-    module C -- and the test's own source never names C) is a genuine dependent
-    the old bare-stem-substring scan silently skipped. We re-index the (already
-    merged) repo on disk, build the dep graph, seed a BFS at every parcel whose
-    file is a changed file, walk `reverse_edges` to the transitive dependent set,
-    and map those parcel ids back to their files. Returns an empty set on any
-    failure (a broken repo, etc.) -- the substring heuristic + full-suite fallback
-    below still backstop selection, so this only ever ADDS coverage, never removes.
+    Taken BEFORE `run_index` re-parses the repo, so `_diff_contract_changes` can
+    compare it against the same symbols' post-re-index state. Restricted to
+    `changed_set` since `run_index` re-parses the WHOLE repo every call (per
+    `classifier.store`'s own "no incremental diffing" note) -- an unrelated
+    file's contract rows cannot have changed from THIS branch's edit, so there
+    is nothing to gain (and a real false-positive risk to avoid) by comparing
+    those too.
     """
-    if not changed_py:
-        return set()
-    try:
-        parcels = index_repo(repo)
-        graph = build_graph(parcels, repo)
-    except Exception:  # noqa: BLE001 -- selection is best-effort; never fail the gate here
-        return set()
-    changed_parcel_ids = {p.id for p in parcels if p.path in changed_py}
-    affected: set[str] = set()
-    queue: deque[str] = deque(changed_parcel_ids)
-    while queue:
-        pid = queue.popleft()
-        for dependent in graph.reverse_edges.get(pid, set()):
-            if dependent not in affected:
-                affected.add(dependent)
-                queue.append(dependent)
     return {
-        graph.parcels_by_id[a].path for a in affected if a in graph.parcels_by_id
+        row["symbol"]: (row["signature"], row["type_hash"], row["version"])
+        for row in conn.execute(
+            "SELECT symbol, signature, type_hash, version FROM contracts"
+        ).fetchall()
+        if row["symbol"].split("::", 1)[0] in changed_set
     }
 
 
-def _close_streams(proc: subprocess.Popen) -> None:
-    """Drop our read ends of a killed gate's pipes. Best-effort: this runs only on
-    the already-failing timeout path and must not raise into it."""
-    for stream in (proc.stdout, proc.stderr):
-        try:
-            if stream is not None:
-                stream.close()
-        except OSError:
-            pass
+def _diff_contract_changes(
+    conn, before_contracts: dict[str, tuple[str, str, int]], branch: str, into: str
+) -> tuple[list[str], list[dict]]:
+    """Frozen-contract change detection (DESIGN §5.3): diff post-re-index contract
+    state against `_snapshot_touched_contracts`'s pre-re-index snapshot.
 
+    A symbol whose `type_hash` genuinely changed means a frozen signature really
+    did change on this landed merge, so dependents watching `GET /events` (or
+    holding a plan-time `read_contracts` snapshot, `agent/runner.py`) must be
+    told to re-read `GET /contract/{symbol}` and re-plan (DESIGN §5.3/§4.3).
+    This is the one place a real, LANDED before/after diff is known for certain
+    -- an agent's own self-report would be exactly the "lying blackboard"
+    DESIGN §5.4/§6 rejects.
 
-def _kill_process_group(proc: subprocess.Popen) -> None:
-    """SIGKILL the gate's whole process group, falling back to the direct child.
-
-    Best-effort by design: the process (or group) may already be gone, and a gate
-    that has timed out must never turn its own cleanup into an exception that
-    escapes into `integrate`'s error path.
-
-    NEVER signals our OWN process group. The gate is spawned with
-    `start_new_session=True` so it leads its own group, and this SIGKILLs that group.
-    But if that ever stops holding -- a refactor drops the flag, a platform ignores it,
-    someone reuses this helper for a plainly-spawned child -- then `getpgid(child)`
-    IS our group, and a gate timeout would SIGKILL the server itself: the coordinator
-    dies to reap a hanging test. Observed for real: a mutation run that flipped
-    `start_new_session` to False killed the harness that was running it. The child is
-    still killed directly in that case, so the timeout still works; it just stops
-    taking us with it.
+    Returns `(changed_symbols, contract_change_event_payloads)`. Deliberately
+    emits NOTHING itself: the caller holds the payloads until the whole atomic
+    post-merge block is known to have succeeded, so a rolled-back merge never
+    leaves a dangling `contract_change` in the log.
     """
-    try:
-        pgid = os.getpgid(proc.pid)
-    except (ProcessLookupError, OSError):
-        pgid = None
-
-    if pgid is not None and pgid != os.getpgrp():
-        try:
-            os.killpg(pgid, signal.SIGKILL)
-            return
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
-    try:
-        proc.kill()
-    except (ProcessLookupError, OSError):
-        pass
-
-
-def run_impact_tests(
-    repo: StrPath, changed_files: list[str], test_dir: str = DEFAULT_TEST_DIR
-) -> tuple[bool, str]:
-    """Run pytest restricted to tests reachable from `changed_files` (DESIGN §5.4
-    step 3): a CONSERVATIVE over-selection with a full-suite fallback.
-
-    A test file is selected if EITHER:
-      - the dependency graph shows it transitively reverse-depends on a changed
-        file (`_reverse_dep_files`) -- the authoritative signal, and the one that
-        catches indirect dependents a textual scan misses; OR
-      - the changed file's module stem appears as a token in the test's source
-        (the old bare-stem heuristic, KEPT as a backstop for edges the classifier
-        can't see -- dynamic dispatch / string imports, DESIGN §6 "classifier
-        miss": over-selecting a test is always safe, skipping an affected one is
-        the bug we're fixing).
-    Selecting the UNION is a strict over-approximation of the old behavior, so it
-    can only run more tests, never fewer -- it never skips an affected test.
-    If nothing matches -- selection is genuinely uncertain (no changed `.py`
-    files, or no test relates to the change) -- fall back to the whole `test_dir`
-    rather than risk a silent skip. If `test_dir` doesn't exist under `repo` at
-    all, falls back further to running pytest across the whole repo.
-
-    Returns `(ok, combined_stdout_stderr_log)`. Uses `sys.executable -m pytest`
-    so it runs against whichever Python/venv is already running this process
-    (the repo under test has no independent environment of its own in this
-    prototype).
-    """
-    repo = Path(repo)
-    tests_root = repo / test_dir
-
-    # S3 security: sandbox the gate's pytest run against the untrusted agent branch
-    # we just merged. `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` + `-p no:cacheprovider`
-    # stop third-party pytest plugins / conftest side effects on $PATH from being
-    # auto-loaded and running arbitrary code inside our process's environment;
-    # `--import-mode=importlib` avoids mutating `sys.path`/polluting the parent's
-    # module namespace via legacy prepend-import. These narrow WHAT the gate can do
-    # without changing whether a genuinely passing/failing suite passes/fails.
-    base_cmd = [
-        sys.executable,
-        "-m",
-        "pytest",
-        "-q",
-        "-p",
-        "no:cacheprovider",
-        "--import-mode=importlib",
-    ]
-
-    if not tests_root.exists():
-        cmd = base_cmd
-    else:
-        changed_py = {f for f in changed_files if f.endswith(".py")}
-        changed_stems = {Path(f).stem for f in changed_py}
-        # Authoritative dependency-graph reverse-deps (transitive), plus the
-        # substring backstop -- their union is the conservative over-select.
-        affected_files = _reverse_dep_files(repo, changed_py)
-        selected: list[str] = []
-        for test_file in sorted(tests_root.rglob("test_*.py")):
-            rel_posix = test_file.relative_to(repo).as_posix()
-            try:
-                text = test_file.read_text(encoding="utf-8")
-            except OSError:
-                continue
-            hit_graph = rel_posix in affected_files
-            hit_substr = any(stem and stem in text for stem in changed_stems)
-            if hit_graph or hit_substr:
-                selected.append(str(test_file.relative_to(repo)))
-        if selected:
-            cmd = [*base_cmd, *selected]
-        else:
-            # Selection uncertain (nothing matched, or no changed .py files) --
-            # full-suite fallback per DESIGN §5.4.
-            cmd = [*base_cmd, test_dir]
-
-    env = {**os.environ, "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"}
-    timeout = _gate_timeout()
-    # `start_new_session=True` puts the gate in its own process GROUP so a timeout
-    # can kill the whole tree. `subprocess.run(timeout=...)` alone kills only the
-    # direct child -- pytest spawns (xdist workers, subprocesses under test), and
-    # those orphans would keep running, holding the repo and the CPU, after we'd
-    # already reported the merge rejected.
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(repo),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        env=env,
-        start_new_session=True,
-    )
-    try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-        returncode = proc.returncode
-    except subprocess.TimeoutExpired:
-        _kill_process_group(proc)
-        # Draining the pipes must ALSO be bounded. `communicate()` waits for EOF on
-        # stdout/stderr, not for the direct child to die -- and EOF only arrives once
-        # EVERY holder of the write end has exited. A grandchild that re-`setsid`s
-        # (`subprocess.Popen(..., start_new_session=True)`, a double-forking daemon)
-        # is in its own process group, so the killpg above never reaches it, and it
-        # keeps the inherited pipe open. An unbounded drain here therefore blocks for
-        # that descendant's whole lifetime while `post_integrate` holds the global
-        # `integrate_lock` -- reinstating the exact permanent wedge this timeout
-        # exists to prevent. Reachable whenever the merged branch turns pytest's
-        # fd-capture off (`addopts = -s`), which the agent-authored repo controls.
-        try:
-            stdout, stderr = proc.communicate(timeout=_DRAIN_TIMEOUT_SECONDS)
-        except subprocess.TimeoutExpired:
-            # A descendant escaped the group kill and still holds the pipes. Abandon
-            # the output rather than wait on it; the verdict does not depend on it.
-            stdout, stderr = "", ""
-            _close_streams(proc)
-        return False, (
-            f"{stdout}{stderr}\n"
-            f"swarm-sync: test gate exceeded {timeout:.0f}s and was killed "
-            f"(SWARMSYNC_GATE_TIMEOUT to change). Treating as a gate FAILURE: a "
-            f"branch whose tests do not terminate cannot be shown to keep trunk green."
+    changed_symbols: list[str] = []
+    payloads: list[dict] = []
+    for row in conn.execute(
+        "SELECT symbol, signature, type_hash, version FROM contracts"
+    ).fetchall():
+        symbol = row["symbol"]
+        before = before_contracts.get(symbol)
+        if before is None or before[1] == row["type_hash"]:
+            continue  # unknown before this merge, or genuinely unchanged
+        changed_symbols.append(symbol)
+        payloads.append(
+            {
+                "symbol": symbol,
+                "branch": branch,
+                "into": into,
+                "old_signature": before[0],
+                "new_signature": row["signature"],
+                "old_version": before[2],
+                "new_version": row["version"],
+            }
         )
-    # pytest exit code 5 == "no tests were collected" -- e.g. a repo/fixture with
-    # no test suite yet, or an impact-selection pass that (correctly) found no
-    # test touches this change. Nothing to gate on is not a rejection reason.
-    ok = returncode in (0, 5)
-    log = stdout + stderr
-    return ok, log
+    return changed_symbols, payloads
 
 
 def regenerate_summary(parcel: Parcel, graph: Optional[DepGraph] = None) -> str:
@@ -421,7 +269,11 @@ def integrate(
     trunk has since moved past.
     """
     repo = Path(repo)
-    now = time.time()
+    # C16: no single call-entry timestamp is threaded through this function.
+    # Each emit stamps its own wall-clock time (`events.emit` defaults `ts` to
+    # `time.time()`): one integrate spans a gate of up to SWARMSYNC_GATE_TIMEOUT
+    # (600s default), so a `merged` stamped with the call-entry time would be
+    # minutes stale and event `ts` ordering within the call would be a lie.
 
     # --- step 1: optimistic re-check (DESIGN §5.5), opt-in -----------------
     if expected_read_deps:
@@ -442,7 +294,6 @@ def integrate(
                     "stale_deps": stale,
                     "base_commit": base_commit,
                 },
-                ts=now,
             )
             return IntegrateResult(
                 status="needs_rebase",
@@ -523,7 +374,7 @@ def integrate(
             payload["rollback_error"] = rollback_error
             full_reason = f"{reason} (WARNING: trunk rollback also failed: {rollback_error})"
         with db.transaction(conn):
-            events_mod.emit(conn, "merge_rejected", agent_id, payload, ts=now)
+            events_mod.emit(conn, "merge_rejected", agent_id, payload)
             conn.execute(
                 "DELETE FROM open_integrations WHERE started_seq = ?", (started_seq,)
             )
@@ -553,6 +404,10 @@ def integrate(
     # transaction: a crash between them could otherwise commit a start whose orphan
     # the projection-reading reconciliation can never see (event without row), or a
     # row naming a start that never happened (row without event).
+    # `start_ts` is captured here (not at call entry) only so the
+    # `integrate_started` event and its `open_integrations` projection row carry
+    # the identical timestamp -- they are one durable fact recorded twice.
+    start_ts = time.time()
     with db.transaction(conn):
         started_seq = events_mod.emit(
             conn,
@@ -565,13 +420,13 @@ def integrate(
                 "trunk_sha_before": pre_merge_sha,
                 "repo": str(repo),
             },
-            ts=now,
+            ts=start_ts,
         )
         conn.execute(
             "INSERT INTO open_integrations "
             "(started_seq, repo, branch, into_branch, trunk_sha_before, ts) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            (started_seq, str(repo), branch, into, pre_merge_sha, now),
+            (started_seq, str(repo), branch, into, pre_merge_sha, start_ts),
         )
 
     try:
@@ -631,64 +486,29 @@ def integrate(
         # --- step 4: re-index + authoritative state_summary regen ---------------
         changed_set = set(changed)
 
-        # Frozen-contract change detection (DESIGN §5.3, test case #3, U15):
-        # snapshot every contract whose symbol lives in a file this branch
-        # touched BEFORE re-indexing, so it can be diffed against the same
-        # symbols' post-re-index state below. Restricted to `changed_set` since
-        # `run_index` re-parses the WHOLE repo every call (per `classifier.store`'s
-        # own "no incremental diffing" note) -- an unrelated file's contract rows
-        # cannot have changed from THIS branch's edit, so there is nothing to
-        # gain (and a real false-positive risk to avoid) by comparing those too.
-        before_contracts = {
-            row["symbol"]: (row["signature"], row["type_hash"], row["version"])
-            for row in conn.execute(
-                "SELECT symbol, signature, type_hash, version FROM contracts"
-            ).fetchall()
-            if row["symbol"].split("::", 1)[0] in changed_set
-        }
+        # Frozen-contract change detection (DESIGN §5.3): snapshot BEFORE the
+        # re-index, diff AFTER it -- see the two helpers' docstrings.
+        before_contracts = _snapshot_touched_contracts(conn, changed_set)
 
         index_kwargs = {} if threshold is None else {"threshold": threshold}
         index_result = run_index(conn, repo, **index_kwargs)
         touched_parcels = [p for p in index_result.parcels if p.path in changed_set]
 
+        reindex_ts = time.time()
         reindexed_ids: list[str] = []
         for parcel in touched_parcels:
             summary = regenerate_summary(parcel, index_result.graph)
             conn.execute(
                 "UPDATE parcels SET state_summary = ?, updated_at = ? WHERE id = ?",
-                (summary, now, parcel.id),
+                (summary, reindex_ts, parcel.id),
             )
             reindexed_ids.append(parcel.id)
 
-        # Diff post-re-index contract state against the pre-re-index snapshot
-        # above. A symbol whose `type_hash` genuinely changed -> a frozen
-        # signature really did change on this landed merge -> a
-        # `contract_change` (old/new signature + version) so a dependent watching
-        # `GET /events` (or holding a plan-time `read_contracts` snapshot,
-        # `agent/runner.py`) can observe it and re-plan (DESIGN §5.3/§4.3). The
-        # events are collected here and emitted below with the rest of the
-        # success-path events, once the atomic block is known to have succeeded.
-        contract_changes: list[str] = []
-        contract_change_payloads: list[dict] = []
-        for row in conn.execute(
-            "SELECT symbol, signature, type_hash, version FROM contracts"
-        ).fetchall():
-            symbol = row["symbol"]
-            before = before_contracts.get(symbol)
-            if before is None or before[1] == row["type_hash"]:
-                continue  # unknown before this merge, or genuinely unchanged
-            contract_changes.append(symbol)
-            contract_change_payloads.append(
-                {
-                    "symbol": symbol,
-                    "branch": branch,
-                    "into": into,
-                    "old_signature": before[0],
-                    "new_signature": row["signature"],
-                    "old_version": before[2],
-                    "new_version": row["version"],
-                }
-            )
+        # Payloads only -- the `contract_change` events are emitted below with
+        # the rest of the success trail, once this atomic block has succeeded.
+        contract_changes, contract_change_payloads = _diff_contract_changes(
+            conn, before_contracts, branch, into
+        )
 
         # --- WP3.5 (C14): ghost retirement -- COMPUTE the candidates here, act
         # below. `run_index` upserts but never prunes (see `classifier.store`'s
@@ -769,19 +589,17 @@ def integrate(
                 "changed_files": changed,
                 "started_seq": started_seq,
             },
-            ts=now,
         )
         conn.execute(
             "DELETE FROM open_integrations WHERE started_seq = ?", (started_seq,)
         )
     for payload in contract_change_payloads:
-        events_mod.emit(conn, "contract_change", agent_id, payload, ts=now)
+        events_mod.emit(conn, "contract_change", agent_id, payload)
     events_mod.emit(
         conn,
         "reindexed",
         agent_id,
         {"branch": branch, "into": into, "parcels": reindexed_ids},
-        ts=now,
     )
 
     # --- WP3.5 (C14): retire the ghosts computed above. Deliberately AFTER the
@@ -819,7 +637,6 @@ def integrate(
                         "started_seq": started_seq,
                         "released_leases": closed_by_parcel.get(pid, []),
                     },
-                    ts=now,
                 )
             for symbol in retired_contract_symbols:
                 events_mod.emit(
@@ -833,7 +650,6 @@ def integrate(
                         "into": into,
                         "started_seq": started_seq,
                     },
-                    ts=now,
                 )
 
     return IntegrateResult(
