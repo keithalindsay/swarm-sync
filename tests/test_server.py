@@ -768,3 +768,75 @@ def test_app_main_clock_failure_prevents_serving(tmp_path, monkeypatch):
     with pytest.raises(SystemExit):
         app_mod.main(["--db", str(tmp_path / "bb.db")])
     assert served == []
+
+
+# --- WP3.1 (S2): GET /events?limit= is clamped -------------------------------------
+#
+# Reproduced first: pre-fix, `GET /events?limit=999999999` returned 200 and
+# materialized the ENTIRE events table into memory + one JSON body, and
+# `limit=-1` did too (SQLite treats a negative LIMIT as "no limit"). Out-of-range
+# is now a loud 422 (not a silent clamp): a silently-truncated page would let a
+# caller believe it saw everything below `since + limit` and skip events.
+
+
+def test_events_limit_over_cap_is_422(client):
+    from swarmsync.server.app import MAX_EVENTS_LIMIT
+
+    r = client.get("/events", params={"limit": 999_999_999})
+    assert r.status_code == 422
+
+    r = client.get("/events", params={"limit": MAX_EVENTS_LIMIT + 1})
+    assert r.status_code == 422
+
+
+def test_events_negative_limit_is_422(client):
+    # SQLite's `LIMIT -1` means unlimited -- the same unbounded dump by another door.
+    r = client.get("/events", params={"limit": -1})
+    assert r.status_code == 422
+
+
+def test_events_limit_at_cap_and_default_still_work(client, fixture_repo):
+    from swarmsync.server.app import MAX_EVENTS_LIMIT
+
+    _index(client, fixture_repo)
+    client.post("/lease", json={"agent_id": "a1", "parcel_id": "mod_a.py::helper"})
+
+    assert client.get("/events", params={"limit": MAX_EVENTS_LIMIT}).status_code == 200
+    r = client.get("/events")  # default (1000) unchanged
+    assert r.status_code == 200
+    assert any(e["type"] == "lease_granted" for e in r.json())
+
+
+def test_events_since_semantics_preserved_with_clamped_limit(client, fixture_repo):
+    _index(client, fixture_repo)
+    client.post("/lease", json={"agent_id": "a1", "parcel_id": "mod_a.py::helper"})
+    client.post("/lease", json={"agent_id": "a2", "parcel_id": "mod_b.py::use_b"})
+
+    all_events = client.get("/events", params={"since": 0, "limit": 10}).json()
+    assert len(all_events) >= 2
+    watermark = all_events[0]["seq"]
+    rest = client.get("/events", params={"since": watermark, "limit": 10}).json()
+    assert [e["seq"] for e in rest] == [e["seq"] for e in all_events if e["seq"] > watermark]
+
+
+def test_events_endpoint_serves_compaction_marker_rows(client):
+    """WP3.1 S2: the `events_compacted` marker is outside the frozen EventType
+    registry; GET /events must serve it (the widened EventOut response model),
+    not 500 on response validation."""
+    import time as time_mod
+
+    from swarmsync.blackboard import db as db_mod
+    from swarmsync.server import events as events_mod
+
+    conn = db_mod.connect(client.app.state.db_path)
+    try:
+        events_mod.emit(conn, "heartbeat", "a1", {"lease_id": 1},
+                        ts=time_mod.time() - 7200)
+        assert events_mod.compact_events(conn) == 1
+    finally:
+        conn.close()
+
+    r = client.get("/events")
+    assert r.status_code == 200
+    types = [e["type"] for e in r.json()]
+    assert types == [events_mod.EVENTS_COMPACTED]
