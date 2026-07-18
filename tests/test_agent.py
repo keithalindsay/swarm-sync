@@ -690,3 +690,133 @@ def test_integrate_passes_its_long_timeout_to_a_real_transport_only():
     owned._http = rec  # type: ignore[assignment]  # keep _owns_http=True
     owned.integrate("a1", branch="a1", repo="/tmp/x")
     assert rec.kwargs.get("timeout") == client_mod._integrate_timeout()
+
+
+# --- C11 (WP3.6): in-process failure containment -----------------------------------
+
+
+def _exploding_mutator(worktree, **kwargs):
+    raise RuntimeError("boom mid-edit")
+
+
+def test_run_agent_contains_a_raising_mutator_releases_leases_and_returns_error(client, repo):
+    """C11: an exception in the work phase must NOT raise out of run_agent and must
+    NOT leave the acquired leases active until TTL expiry. Before the fix the
+    try/finally had no except path: the mutator's RuntimeError propagated to the
+    caller and the write-lease on mod_a.py::helper stayed `active` (leaked)."""
+    r, base = repo
+    result = run_agent(
+        agent_id="agent-crash",
+        client=client,
+        repo=r,
+        task="crash mid-edit",
+        target_parcels=["mod_a.py::helper"],
+        mutator=_exploding_mutator,
+        base_commit=base,
+    )
+
+    # structured error result, not a raise.
+    assert result.status == "error"
+    assert result.error_type == "RuntimeError"
+    assert result.error is not None and "boom mid-edit" in result.error
+
+    # every lease this attempt held was released -- nothing left active.
+    active = client.leases()
+    assert not any(le["agent_id"] == "agent-crash" for le in active), (
+        f"agent-crash leaked a lease past its own crash: {active!r}"
+    )
+    # ...and the parcel is genuinely free again, immediately (no TTL wait).
+    regrab = client.lease("agent-next", "mod_a.py::helper", mode="write")
+    assert regrab["granted"] is True, "the crashed attempt's lease was not released"
+
+    # the existing finally still tore the worktree down.
+    assert not (r / ".worktrees" / "agent-crash").exists()
+
+
+def test_run_agent_containment_covers_a_failing_commit_too(client, repo, monkeypatch):
+    """The except path must cover the whole work phase, not just the mutator --
+    commit_all raising (e.g. git's own transient ref/index lock contention) is the
+    reachable-in-production case the broker's concurrency creates."""
+    from swarmsync.agent import runner as runner_mod
+
+    r, base = repo
+
+    def failing_commit(worktree, message, allow_empty=False):
+        raise git_ops.GitOpsError("fatal: Unable to create '.git/index.lock': File exists")
+
+    monkeypatch.setattr(runner_mod.git_ops, "commit_all", failing_commit)
+
+    result = run_agent(
+        agent_id="agent-gitlock",
+        client=client,
+        repo=r,
+        task="edit helper",
+        target_parcels=["mod_a.py::helper"],
+        mutator=mutators.edit_function_body,
+        mutator_kwargs={"path": "mod_a.py", "symbol": "helper", "new_body": "return 0"},
+        base_commit=base,
+    )
+    assert result.status == "error"
+    assert result.error_type == "GitOpsError"  # the broker's retry keys off this
+    assert not any(le["agent_id"] == "agent-gitlock" for le in client.leases())
+    assert not (r / ".worktrees" / "agent-gitlock").exists()
+
+
+def test_run_agent_error_containment_swallows_a_failing_release_with_a_logged_note(
+    client, repo, monkeypatch, caplog
+):
+    """Release-on-error is best-effort: if the release itself fails (server went
+    away), containment must still return the error result -- with a logged note --
+    and leave the lease to the reaper, never raise a second exception."""
+    import logging
+
+    r, base = repo
+
+    real_release = BlackboardClient.release
+
+    def failing_release(self, agent_id, lease_id):
+        if agent_id == "agent-crash2":
+            raise ConnectionError("server went away")
+        return real_release(self, agent_id, lease_id)
+
+    monkeypatch.setattr(BlackboardClient, "release", failing_release)
+
+    with caplog.at_level(logging.WARNING, logger="swarmsync.agent.runner"):
+        result = run_agent(
+            agent_id="agent-crash2",
+            client=client,
+            repo=r,
+            task="crash mid-edit",
+            target_parcels=["mod_a.py::helper"],
+            mutator=_exploding_mutator,
+            base_commit=base,
+        )
+
+    assert result.status == "error"
+    assert result.error_type == "RuntimeError"  # the ORIGINAL error, not the release's
+    assert any("release" in rec.message.lower() for rec in caplog.records), (
+        "the swallowed release failure left no logged note"
+    )
+
+
+def test_run_agent_does_not_mask_keyboard_interrupt(client, repo):
+    """Containment catches Exception, not BaseException: a KeyboardInterrupt must
+    still propagate (the operator is killing the process; masking it would turn
+    Ctrl-C into a fake 'error' result). The finally still cleans the worktree."""
+    r, base = repo
+
+    def interrupted_mutator(worktree, **kwargs):
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        run_agent(
+            agent_id="agent-int",
+            client=client,
+            repo=r,
+            task="interrupted",
+            target_parcels=["mod_a.py::helper"],
+            mutator=interrupted_mutator,
+            base_commit=base,
+        )
+    # the existing finally still ran.
+    assert not (r / ".worktrees" / "agent-int").exists()
