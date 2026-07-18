@@ -67,7 +67,7 @@ import os
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -368,30 +368,48 @@ def create_app(
     # -- the hook adapter, httpx, requests, TestClient -- sends it for a body), a
     # too-large request is rejected up front, before the framework buffers a byte of
     # the body. Chunked/absent-length bodies PASS THROUGH deliberately: counting a
-    # stream inside BaseHTTPMiddleware means re-plumbing the receive channel for a
-    # transfer shape none of our clients use, and the S3 token gate already bounds
-    # WHO can reach the mutating routes at all. Stated trade-off, not an oversight.
-    @app.middleware("http")
-    async def enforce_body_size_cap(request: Request, call_next):
-        content_length = request.headers.get("content-length")
-        if content_length is not None:
-            cap = _max_body_bytes()
-            try:
-                declared = int(content_length)
-            except ValueError:
-                declared = None  # malformed header: let the server stack handle it
-            if declared is not None and declared > cap:
-                return JSONResponse(
-                    status_code=413,
-                    content={
-                        "detail": (
-                            f"request body of {declared} bytes exceeds the "
-                            f"{cap}-byte cap (raise {MAX_BODY_BYTES_ENV} if "
-                            "this is legitimate)"
+    # stream means re-plumbing the receive channel for a transfer shape none of our
+    # clients use, and the S3 token gate already bounds WHO can reach the mutating
+    # routes at all. Stated trade-off, not an oversight.
+    #
+    # Deliberately a PURE-ASGI wrapper, not `@app.middleware("http")`: the decorator
+    # form wraps every request in a BaseHTTPMiddleware anyio task group, whose
+    # cancel-scope teardown fires the py3.11 `Task.cancel(msg=)` deprecation pair on
+    # EVERY request (the suite went 3 -> ~1800 warnings) and adds per-request task
+    # overhead. A raw ASGI callable inspects the already-parsed header list with no
+    # task machinery at all.
+    class _BodySizeCapMiddleware:
+        def __init__(self, inner: Any) -> None:
+            self.inner = inner
+
+        async def __call__(self, scope, receive, send) -> None:
+            if scope["type"] == "http":
+                declared: Optional[int] = None
+                for name, value in scope.get("headers", []):
+                    if name == b"content-length":
+                        try:
+                            declared = int(value)
+                        except ValueError:
+                            declared = None  # malformed: let the server stack handle it
+                        break
+                if declared is not None:
+                    cap = _max_body_bytes()
+                    if declared > cap:
+                        response = JSONResponse(
+                            status_code=413,
+                            content={
+                                "detail": (
+                                    f"request body of {declared} bytes exceeds the "
+                                    f"{cap}-byte cap (raise {MAX_BODY_BYTES_ENV} if "
+                                    "this is legitimate)"
+                                )
+                            },
                         )
-                    },
-                )
-        return await call_next(request)
+                        await response(scope, receive, send)
+                        return
+            await self.inner(scope, receive, send)
+
+    app.add_middleware(_BodySizeCapMiddleware)
 
     # --- POST /index ---------------------------------------------------------
 
