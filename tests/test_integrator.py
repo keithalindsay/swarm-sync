@@ -1119,3 +1119,47 @@ def test_every_rejection_route_leaves_the_blackboard_matching_trunk(
         f"after a {rejection} rejection the blackboard still holds a hash for code that "
         f"is not on trunk: agents now plan against a state that never landed"
     )
+
+
+# --- A8: a KeyboardInterrupt mid-gate must roll trunk back AND re-raise -------------
+
+
+def test_keyboard_interrupt_mid_gate_rolls_trunk_back_and_reraises(conn, repo, monkeypatch):
+    """An operator Ctrl-C (or uvicorn shutdown) during the gate must not leave an
+    un-gated merge on trunk.
+
+    `integrate` merges to trunk FIRST, then runs the pytest gate (up to 600s) to learn
+    the verdict. A `KeyboardInterrupt`/`SystemExit` raised in that window is NOT an
+    `Exception`, so it slips past the ordinary `except Exception` post-merge handler --
+    the un-gated merge is already sitting on trunk. The `except BaseException` guard is
+    the ONLY thing that (a) resets trunk back to the pre-merge sha and (b) re-raises the
+    interrupt (it is the operator's to act on, not ours to swallow).
+
+    This pins BOTH halves: swallow it and the interrupt is lost; catch it with a bare
+    `except Exception` and the un-gated merge stays on trunk.
+    """
+    r, base = repo
+    run_index(conn, r)
+    pre = git_ops.current_commit(r, ref="integration")
+
+    worktree = git_ops.add_worktree(r, "agent-int", base)
+    (worktree / "mod_a.py").write_text(
+        "def helper(x):\n    return 'un-gated, interrupted mid-merge'\n", encoding="utf-8"
+    )
+    git_ops.commit_all(worktree, "agent-int: edit interrupted during the gate")
+
+    # The merge lands on trunk, THEN the gate is entered -- simulate Ctrl-C there.
+    def interrupt(*a, **kw):
+        raise KeyboardInterrupt("operator hit Ctrl-C during the gate")
+
+    monkeypatch.setattr(integrator, "run_impact_tests", interrupt)
+
+    # (b) the interrupt propagates -- it is NOT swallowed.
+    with pytest.raises(KeyboardInterrupt):
+        integrator.integrate(conn, r, "agent-int", base_commit=base, agent_id="agent-int")
+
+    # (a) trunk was reset to the exact pre-merge sha -- no un-gated merge survives.
+    assert git_ops.current_commit(r, ref="integration") == pre, (
+        "trunk still carries the un-gated merge after the interrupt was raised mid-gate"
+    )
+    assert "un-gated, interrupted" not in (r / "mod_a.py").read_text(encoding="utf-8")
