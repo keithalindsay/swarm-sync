@@ -12,7 +12,7 @@ import pytest
 
 from swarmsync.blackboard import db
 from swarmsync.coordinator import reaper
-from swarmsync.server import events, leases
+from swarmsync.blackboard import events, leases
 from swarmsync.server.app import create_app
 
 

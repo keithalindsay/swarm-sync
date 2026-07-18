@@ -93,7 +93,7 @@ from swarmsync.blackboard.models import Parcel
 from swarmsync.classifier.graph import DepGraph, build_graph
 from swarmsync.classifier.indexer import index_repo
 from swarmsync.classifier.store import retire_rows, run_index
-from swarmsync.server import events as events_mod
+from swarmsync.blackboard import events as events_mod
 from swarmsync.worktree import git_ops
 
 StrPath = Union[str, Path]

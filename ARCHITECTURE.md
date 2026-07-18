@@ -62,7 +62,7 @@ database serializes them: the first insert succeeds, the second's `only if none 
 and inserts nothing. One winner, one loser (`rowcount == 1` vs `0`), no gap. The loser is told
 "denied — that file's taken" and picks other work or waits. The safety comes from leaning on the
 database's own atomicity guarantee instead of hand-rolling a lock. See
-[`server/leases.py`](swarmsync/server/leases.py) — the `acquire()` docstring and SQL are the
+[`blackboard/leases.py`](swarmsync/blackboard/leases.py) — the `acquire()` docstring and SQL are the
 canonical reference.
 
 **Read vs. write.** Many agents can hold a *read* lease on one file at once (reading doesn't
@@ -104,7 +104,7 @@ End to end, what happens when an agent changes some code (the broker-driven path
    lets others avoid duplicating the work. → `POST /intent`
 4. **Acquire the lease (CAS).** The agent requests a write lease on its target file. Granted → it
    owns the file. Denied → it backs off or picks another task. → `POST /lease`,
-   `server/leases.py::acquire`
+   `blackboard/leases.py::acquire`
 5. **Edit in isolation.** The agent works in **its own git worktree** — a private checkout — so two
    agents can't even physically touch the same file on disk. It heartbeats every few seconds to keep
    the lease alive. → `worktree/git_ops.py`, `agent/runner.py`
@@ -131,8 +131,8 @@ branch.
 | ↳ write to blackboard | [`classifier/store.py`](swarmsync/classifier/store.py) | `run_index` — populates `parcels` + `contracts` (this is `POST /index`). |
 | **Blackboard** (shared memory) | [`blackboard/db.py`](swarmsync/blackboard/db.py), [`schema.sql`](swarmsync/blackboard/schema.sql) | The single SQLite-WAL database and its schema: `parcels`, `leases`, `contracts`, `pheromone`, `intents`, `events`. |
 | ↳ typed rows | [`blackboard/models.py`](swarmsync/blackboard/models.py) | Pydantic models every reader validates through (`Parcel`, `LeaseMode`, `LeaseResult`, …). |
-| **Lease** (the lock) | [`server/leases.py`](swarmsync/server/leases.py) | `acquire` (atomic CAS), `heartbeat`, `release`, `_ensure_parcel`. The mutual-exclusion primitive. |
-| **Pheromone trail / event log** | [`server/events.py`](swarmsync/server/events.py) | `emit` — the single write path into the append-only `events` table: the audit/observability log. The SQLite tables are the state of record; crash recovery reads the `open_integrations` projection (WP3.2), not this log. |
+| **Lease** (the lock) | [`blackboard/leases.py`](swarmsync/blackboard/leases.py) | `acquire` (atomic CAS), `heartbeat`, `release`, `_ensure_parcel`. The mutual-exclusion primitive. |
+| **Pheromone trail / event log** | [`blackboard/events.py`](swarmsync/blackboard/events.py) | `emit` — the single write path into the append-only `events` table: the audit/observability log. The SQLite tables are the state of record; crash recovery reads the `open_integrations` projection (WP3.2), not this log. |
 | **HTTP API** | [`server/app.py`](swarmsync/server/app.py) | FastAPI wiring every endpoint; `check_single_root` enforces the one-managed-root rule. |
 | ↳ launcher | [`server/serve.py`](swarmsync/server/serve.py) | `swarmsync-serve` — starts the blackboard server. |
 | **Broker** (scheduler) | [`coordinator/broker.py`](swarmsync/coordinator/broker.py) | Matches tasks to parcels, spawns agents in file-disjoint waves, reassigns on reap (`resolve_task`, `_run_task_once`). |
@@ -194,15 +194,15 @@ which makes them the best entry points for improving the project.
 
 - **Symbol-granularity leasing** — parked, not merely missing. The payoff and the full staged revival
   plan are in [`SYMBOL_MODE_DESIGN.md`](SYMBOL_MODE_DESIGN.md). The blocker: the lease conflict rule
-  in `server/leases.py::acquire` is a string match with no containment awareness. Teaching it that
+  in `blackboard/leases.py::acquire` is a string match with no containment awareness. Teaching it that
   `m.py::alpha` lives inside `m.py::<module>` is the crux.
 - **`exclusive` buys nothing over `write` today** — the CAS predicate treats the two identically
-  (`server/leases.py`). Reviving a true exclusive mode is Stage 1 of the symbol-mode plan and needs
+  (`blackboard/leases.py`). Reviving a true exclusive mode is Stage 1 of the symbol-mode plan and needs
   no symbol mode itself.
 - **Contract freeze is detection, not prevention** — the integrator *detects* a landed signature
   change and emits `contract_change` (`coordinator/integrator.py`), but the preventive half (an
   exclusive lock on a frozen symbol before it changes) is inert at file granularity. See DESIGN §5.3.
-- **The heartbeat clock knife-edge** — `server/leases.py::heartbeat` is the one predicate where a
+- **The heartbeat clock knife-edge** — `blackboard/leases.py::heartbeat` is the one predicate where a
   stale clock points the *unsafe* way (it could revive a dead lease). It's currently correct because
   it reads SQLite's own clock, but a deployment that shrinks the TTL toward request latency reopens
   it. Well-commented; worth hardening.

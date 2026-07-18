@@ -245,7 +245,7 @@ one file" is **structurally impossible**, and each agent gets an independent bui
 > have bitten:
 > - any file the lease layer fails to cover on that path is *completely* ungated (a hook lease
 >   on an unindexed file therefore auto-creates a coarse whole-file parcel rather than failing
->   open — `server/leases.py::_ensure_parcel`);
+>   open — `blackboard/leases.py::_ensure_parcel`);
 > - the lease is only consulted for `Edit`/`Write`-family tools, so a `Bash` write (`sed -i`,
 >   `cat >`) bypasses it entirely. The hook path is a cooperative protocol among well-behaved
 >   agents, not a sandbox.
@@ -271,7 +271,7 @@ WHERE NOT EXISTS (
 is the safety net that makes trusting the planner's predicted touch-sets acceptable: a misprediction
 that double-targets a parcel simply loses the race and serializes.
 
-**The conflict rule is `l.parcel_id = :parcel_id` — a string match** (`server/leases.py::acquire`).
+**The conflict rule is `l.parcel_id = :parcel_id` — a string match** (`blackboard/leases.py::acquire`).
 The lease store has no notion of one parcel *containing* another. That is sound here only because
 §2's file granularity means every id it ever sees is `<file>::<module>`: same-shaped ids, so string
 equality is exactly containment. It is also why symbol granularity is parked rather than optional —

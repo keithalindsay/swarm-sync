@@ -21,7 +21,7 @@ from typing import Optional
 import uvicorn
 
 from swarmsync.server.app import MultiRootError, check_single_root, create_app
-from swarmsync.server.leases import _NOW_SQL
+from swarmsync.blackboard.leases import _NOW_SQL
 
 # C13: how far SQLite's clock and Python's clock may drift before we refuse to serve.
 # A couple of seconds is generous for any real host; the failure mode we are guarding

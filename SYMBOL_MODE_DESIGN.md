@@ -108,7 +108,7 @@ Honestly, and larger than any of the three designs claimed.
 - Schema migration mechanism (`user_version` + `ALTER`) and column-level validation in `db.EXPECTED_TABLES`. This forces the open "no schema versioning" P2 to the front. ~80 lines.
 
 **Modified**
-- `server/leases.py` — the containment join in `acquire`. ~15 lines of SQL, and **the entire review burden of the change**. This is the system's atomic compare-and-swap, the most raced statement in the codebase, and a wrong predicate here fails *open* — two writers, silent corruption.
+- `blackboard/leases.py` — the containment join in `acquire`. ~15 lines of SQL, and **the entire review burden of the change**. This is the system's atomic compare-and-swap, the most raced statement in the codebase, and a wrong predicate here fails *open* — two writers, silent corruption.
 - `classifier/indexer.py` — `line_start`/`line_end` columns, duplicate-id detection. ~40 lines.
 - `classifier/graph.py` — line-gap rule replaces byte-gap. ~10 lines. (This is a real bug fix regardless.)
 - `coordinator/integrator.py` — conformance as a pre-merge precondition, `lease_violation` route. ~30 lines.
