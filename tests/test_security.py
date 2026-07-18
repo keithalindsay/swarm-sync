@@ -7,7 +7,8 @@ Each test here PROVES an S3 fix and fails on the pre-S3 source:
     SWARMSYNC_ROOTS (or a symlink escaping it) is 403 (pre-S3 walked/merged any
     path on the host);
   - index walk cap: index_repo raises IndexLimitError past its file cap;
-  - main(): binds 127.0.0.1 by default + argparse --help works;
+  - main(): the (WP4.2-unified) launcher binds 127.0.0.1 by default + argparse
+    --help works;
   - adapter: sends SWARMSYNC_TOKEN as a bearer header when set.
 """
 from __future__ import annotations
@@ -21,7 +22,8 @@ from fastapi.testclient import TestClient
 from swarmsync.classifier.indexer import IndexLimitError, index_repo
 from swarmsync.hooks import adapter
 from swarmsync.server import app as app_mod
-from swarmsync.server.app import create_app, main
+from swarmsync.server import serve as serve_mod
+from swarmsync.server.app import create_app
 from swarmsync.worktree import git_ops
 
 
@@ -195,6 +197,11 @@ def test_index_repo_caps_wall_clock(tmp_path):
 
 
 # --- (3) main() binds localhost + argparse --help ---------------------------------
+# WP4.2: the `swarm-sync` console script is now an alias of `swarmsync-serve`
+# (`serve.main`) -- app.py's second launcher (port 8000, no clock assertion) is
+# gone. These tests keep asserting the S3 property (localhost bind by default,
+# never 0.0.0.0) against the ONE launcher; the default port is 8787, the only
+# port the hook adapter's default SWARMSYNC_URL ever matched.
 
 
 def test_main_binds_localhost_by_default(monkeypatch, tmp_path):
@@ -205,9 +212,9 @@ def test_main_binds_localhost_by_default(monkeypatch, tmp_path):
         captured["port"] = port
 
     monkeypatch.setattr("uvicorn.run", fake_run)
-    main(["--db", str(tmp_path / "bb.db")])
+    serve_mod.main(["--db", str(tmp_path / "bb.db")])
     assert captured["host"] == "127.0.0.1"  # PROOF vs OLD: pre-S3 was 0.0.0.0
-    assert captured["port"] == 8000
+    assert captured["port"] == 8787  # WP4.2: the unified launcher's one default port
 
 
 def test_main_host_is_overridable_via_argparse(monkeypatch, tmp_path):
@@ -216,13 +223,15 @@ def test_main_host_is_overridable_via_argparse(monkeypatch, tmp_path):
         "uvicorn.run",
         lambda app, host, port: captured.update(host=host, port=port),
     )
-    main(["--host", "0.0.0.0", "--port", "9999", "--db", str(tmp_path / "bb.db")])
+    serve_mod.main(
+        ["--host", "0.0.0.0", "--port", "9999", "--db", str(tmp_path / "bb.db")]
+    )
     assert captured == {"host": "0.0.0.0", "port": 9999}
 
 
 def test_main_help_exits_zero(capsys):
     with pytest.raises(SystemExit) as exc:
-        main(["--help"])
+        serve_mod.main(["--help"])
     assert exc.value.code == 0
     out = capsys.readouterr().out
     assert "--host" in out and "--port" in out and "--db" in out

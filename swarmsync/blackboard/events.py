@@ -62,11 +62,11 @@ decay_pheromone(conn, half_life, ts=None) -> int
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import time
 from typing import Any, Optional, get_args
 
+from swarmsync import config
 from swarmsync.blackboard.models import EventType, Event, Pheromone
 
 _VALID_EVENT_TYPES = frozenset(get_args(EventType))
@@ -93,26 +93,14 @@ EVENTS_COMPACTED = "events_compacted"
 HEARTBEAT_EVENT_TYPES = frozenset({"heartbeat"})
 
 # Short window for heartbeat-class events, in seconds (default 1 hour).
-DEFAULT_HEARTBEAT_MAX_AGE = 3600.0
-HEARTBEAT_MAX_AGE_ENV = "SWARMSYNC_EVENTS_HEARTBEAT_MAX_AGE"
+# WP4.2: value + env read live in `swarmsync.config`; the names survive here as
+# aliases for existing importers.
+DEFAULT_HEARTBEAT_MAX_AGE = config.DEFAULT_EVENTS_HEARTBEAT_MAX_AGE
+HEARTBEAT_MAX_AGE_ENV = config.EVENTS_HEARTBEAT_MAX_AGE_ENV
 
 # Long horizon for ANY event, in seconds (default 7 days).
-DEFAULT_EVENT_MAX_AGE = 7 * 86400.0
-EVENT_MAX_AGE_ENV = "SWARMSYNC_EVENTS_MAX_AGE"
-
-
-def _age_from_env(env_var: str, default: float) -> float:
-    """Positive float from `env_var`, else `default` (unset/garbage/non-positive
-    fall back rather than raise -- same posture as `app._max_body_bytes`)."""
-    raw = os.environ.get(env_var)
-    if raw:
-        try:
-            value = float(raw)
-        except ValueError:
-            return default
-        if value > 0:
-            return value
-    return default
+DEFAULT_EVENT_MAX_AGE = config.DEFAULT_EVENTS_MAX_AGE
+EVENT_MAX_AGE_ENV = config.EVENTS_MAX_AGE_ENV
 
 
 def emit(
@@ -240,11 +228,9 @@ def compact_events(
     hb_age = (
         heartbeat_max_age
         if heartbeat_max_age is not None
-        else _age_from_env(HEARTBEAT_MAX_AGE_ENV, DEFAULT_HEARTBEAT_MAX_AGE)
+        else config.events_heartbeat_max_age()
     )
-    horizon = (
-        max_age if max_age is not None else _age_from_env(EVENT_MAX_AGE_ENV, DEFAULT_EVENT_MAX_AGE)
-    )
+    horizon = max_age if max_age is not None else config.events_max_age()
 
     type_marks = ",".join("?" * len(HEARTBEAT_EVENT_TYPES))
     # RETURNING seq: the pruned count and seq range come off this statement's own

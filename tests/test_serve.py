@@ -274,3 +274,61 @@ def test_serve_fresh_with_no_existing_db_just_boots(monkeypatch, tmp_path, capsy
     assert ran == [True]
     assert list(tmp_path.glob("bb.db.stale-*")) == []
     assert ".stale-" not in capsys.readouterr().out
+
+
+# --- WP4.2: ONE launcher -- `swarm-sync` is an alias of `swarmsync-serve` -----------
+
+
+def test_both_console_scripts_point_at_serve_main():
+    """The launcher split (port 8000 vs 8787, blackboard.db vs swarmsync.db, one
+    launcher with --root/--fresh/banner/clock-check and one without) was a
+    silent fail-open trap: the hook's default URL only ever matched
+    `swarmsync-serve`. Both `[project.scripts]` entries must target `serve:main`.
+    Asserted at the pyproject level (the environment's editable install predates
+    this change by design -- console-script wiring is declared here)."""
+    import tomllib
+    from pathlib import Path
+
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    scripts = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["scripts"]
+    assert scripts["swarm-sync"] == "swarmsync.server.serve:main"
+    assert scripts["swarmsync-serve"] == "swarmsync.server.serve:main"
+
+
+def test_app_module_no_longer_ships_a_second_launcher():
+    """`app.main` (the second argparse surface) is deleted outright -- an alias
+    that lingered would keep two divergent default sets alive."""
+    from swarmsync.server import app as app_mod
+
+    assert not hasattr(app_mod, "main")
+
+
+def test_serve_db_default_honors_swarmsync_db_env(monkeypatch, tmp_path):
+    """With no --db flag, the launcher's DB comes from `config.db_path()`:
+    SWARMSYNC_DB when set (read at main() call time, not import time)."""
+    captured: dict = {}
+    monkeypatch.setattr(
+        "uvicorn.run", lambda app, host, port: captured.update(app=app)
+    )
+    monkeypatch.setenv("SWARMSYNC_DB", str(tmp_path / "env.db"))
+    monkeypatch.setattr(sys, "argv", ["swarmsync-serve"])
+
+    serve.main()
+
+    assert captured["app"].state.db_path == str(tmp_path / "env.db")
+
+
+def test_serve_db_flag_beats_the_env(monkeypatch, tmp_path):
+    """Precedence: an explicit --db always wins over SWARMSYNC_DB."""
+    captured: dict = {}
+    monkeypatch.setattr(
+        "uvicorn.run", lambda app, host, port: captured.update(app=app)
+    )
+    monkeypatch.setenv("SWARMSYNC_DB", str(tmp_path / "env.db"))
+    monkeypatch.setattr(
+        sys, "argv", ["swarmsync-serve", "--db", str(tmp_path / "flag.db")]
+    )
+
+    serve.main()
+
+    assert captured["app"].state.db_path == str(tmp_path / "flag.db")

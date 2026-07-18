@@ -53,11 +53,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import sqlite3
 import time
 from typing import Optional
 
+from swarmsync import config
 from swarmsync.blackboard import events as events_mod
 
 logger = logging.getLogger(__name__)
@@ -79,22 +79,12 @@ DEFAULT_INTERVAL = 1.0
 # tick every second (or faster in tests), but a full-table DELETE scan every tick
 # would be pure waste -- one compaction per minute keeps the heartbeat backlog
 # bounded to ~1 minute of overshoot past the retention window.
-DEFAULT_COMPACT_INTERVAL = 60.0
-COMPACT_INTERVAL_ENV = "SWARMSYNC_EVENTS_COMPACT_INTERVAL"
+# WP4.2: value + env read live in `swarmsync.config`; aliases kept for importers
+# (tests drive `reaper._compact_interval_from_env` directly).
+DEFAULT_COMPACT_INTERVAL = config.DEFAULT_EVENTS_COMPACT_INTERVAL
+COMPACT_INTERVAL_ENV = config.EVENTS_COMPACT_INTERVAL_ENV
 
-
-def _compact_interval_from_env() -> float:
-    """Positive float from `SWARMSYNC_EVENTS_COMPACT_INTERVAL`, else the 60s
-    default (unset/garbage/non-positive fall back rather than raise)."""
-    raw = os.environ.get(COMPACT_INTERVAL_ENV)
-    if raw:
-        try:
-            value = float(raw)
-        except ValueError:
-            return DEFAULT_COMPACT_INTERVAL
-        if value > 0:
-            return value
-    return DEFAULT_COMPACT_INTERVAL
+_compact_interval_from_env = config.events_compact_interval
 
 
 def reap_once(conn: sqlite3.Connection, now: Optional[float] = None) -> list[int]:

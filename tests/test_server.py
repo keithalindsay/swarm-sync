@@ -760,51 +760,13 @@ def test_body_cap_default_is_generous(client):
     assert r.status_code == 200
 
 
-# --- WP3.3 C3: the `swarm-sync` launcher runs the C13 clock assertion ---------------
-
-
-def test_app_main_asserts_clock_agreement_before_serving(tmp_path, monkeypatch):
-    """`swarmsync-serve` refuses to start on SQLite/Python clock disagreement (C13),
-    but the `swarm-sync` console script (app.main) previously skipped that guard
-    entirely -- same server, weaker startup invariant, depending on which command
-    launched it. main() must call assert_clock_agreement() BEFORE uvicorn.run."""
-    import uvicorn
-
-    from swarmsync.server import app as app_mod
-    from swarmsync.server import serve as serve_mod
-
-    calls: list[str] = []
-    monkeypatch.setattr(
-        serve_mod, "assert_clock_agreement", lambda: calls.append("clock")
-    )
-    monkeypatch.setattr(
-        uvicorn, "run", lambda *a, **kw: calls.append("serve")
-    )
-
-    app_mod.main(["--db", str(tmp_path / "bb.db")])
-    assert calls == ["clock", "serve"], (
-        "the clock guard must run, and run before the server starts"
-    )
-
-
-def test_app_main_clock_failure_prevents_serving(tmp_path, monkeypatch):
-    """If the clock assertion raises (skew beyond tolerance -> SystemExit), the
-    launcher must NOT fall through to serving."""
-    import uvicorn
-
-    from swarmsync.server import app as app_mod
-    from swarmsync.server import serve as serve_mod
-
-    def bad_clock():
-        raise SystemExit("clock skew")
-
-    served: list[bool] = []
-    monkeypatch.setattr(serve_mod, "assert_clock_agreement", bad_clock)
-    monkeypatch.setattr(uvicorn, "run", lambda *a, **kw: served.append(True))
-
-    with pytest.raises(SystemExit):
-        app_mod.main(["--db", str(tmp_path / "bb.db")])
-    assert served == []
+# --- WP3.3 C3 (retired by WP4.2): the `swarm-sync` script IS `swarmsync-serve` -----
+# The two tests that lived here proved `app.main` ran the C13 clock assertion
+# before serving. WP4.2 deleted `app.main` outright -- both console scripts now
+# point at `serve.main`, whose clock-assertion ordering is already proven by
+# tests/test_serve.py (test_serve_starts_when_clocks_agree /
+# test_serve_refuses_to_start_when_clocks_disagree), so there is no second
+# launcher left to hold to the invariant.
 
 
 # --- WP3.1 (S2): GET /events?limit= is clamped -------------------------------------
