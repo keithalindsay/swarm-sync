@@ -7,6 +7,7 @@ map; POST /lease returns granted/denied; POST /intent, /heartbeat, /release,
 from __future__ import annotations
 
 import textwrap
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -440,6 +441,43 @@ def test_integrate_rejects_a_textual_conflict(tmp_path):
 
         # trunk keeps agent-a's change, untouched by the rejected attempt.
         assert (target_repo / "mod_a.py").read_text() == "def helper():\n    return 10\n"
+
+
+# --- C4 regression: shutdown must close connections even if the reaper died --------
+
+
+def test_lifespan_shutdown_closes_conn_even_if_reaper_task_failed(tmp_path, monkeypatch):
+    """C4 part 3: a reaper task that stored an exception must not poison shutdown.
+
+    On shutdown the lifespan does `await task`, which re-raises whatever the task
+    stored. The old handler caught only `CancelledError`, so a stored
+    `OperationalError` propagated OUT of shutdown -- aborting teardown BEFORE
+    `reaper_conn.close()` / `conn.close()` ever ran (leaked handles, and the
+    TestClient context-manager exit itself raised). The fix catches `Exception`
+    so the connections are always closed.
+    """
+    import sqlite3
+
+    from swarmsync.coordinator import reaper as reaper_mod
+
+    async def poisoned_run(*args, **kwargs):
+        # Model a reaper that died on a transient DB error and stored it on the task.
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(reaper_mod, "run", poisoned_run)
+
+    app = create_app(tmp_path / "blackboard.db", reaper_interval=0.05)
+    conn = app.state.conn
+
+    with TestClient(app):
+        # Let the loop actually run the (immediately-failing) reaper task so it is
+        # done-with-exception by the time shutdown awaits it.
+        time.sleep(0.1)
+
+    # Shutdown must have completed and closed the inspection connection despite the
+    # poisoned reaper task -- operating on it now must raise "closed database".
+    with pytest.raises(sqlite3.ProgrammingError):
+        conn.execute("SELECT 1")
 
 
 # --- a second app instance / db_path is fully isolated -----------------------------
