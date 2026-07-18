@@ -490,6 +490,92 @@ def test_hook_leasing_an_unindexed_file_does_not_brick_the_broker(conn, tmp_path
     assert broker.load_scheduling_graph(conn, repo) is not None, "a new class bricked dispatch"
 
 
+# --- C8 (P2): same-agent same-mode reacquire is idempotent, never a self-deny ------
+
+
+def test_same_agent_write_reacquire_is_granted_not_self_denied(conn):
+    """Claude Code batches parallel Edit calls from ONE agent; two prechecks both
+    see no lease and both POST /lease. The second acquire from the SAME agent in the
+    SAME mode must be GRANTED (the agent already holds the parcel), never denied --
+    otherwise the agent is blocked from a file it just locked, with itself named as
+    the blocker. Pre-fix (CAS matches ANY active write lease with no same-agent
+    exemption) the second acquire is DENIED and this fails."""
+    parcel_id = _make_parcel(conn)
+
+    r1 = leases.acquire(conn, parcel_id, "agent-A", mode="write")
+    r2 = leases.acquire(conn, parcel_id, "agent-A", mode="write")
+
+    assert r1.granted is True
+    assert r2.granted is True, "same-agent same-mode reacquire must not self-deny"
+    assert r2.lease_id is not None
+
+
+def test_same_agent_reacquire_still_blocks_a_different_agent(conn):
+    """The same-agent exemption must NOT weaken real mutual exclusion: while agent-A
+    holds the write lease (even after reacquiring it), a DIFFERENT agent must still be
+    denied, and the two different agents must never both hold a live write lease."""
+    parcel_id = _make_parcel(conn)
+
+    assert leases.acquire(conn, parcel_id, "agent-A", mode="write").granted is True
+    assert leases.acquire(conn, parcel_id, "agent-A", mode="write").granted is True
+
+    rb = leases.acquire(conn, parcel_id, "agent-B", mode="write")
+    assert rb.granted is False, "a different agent must still be denied"
+
+    live = conn.execute(
+        "SELECT DISTINCT agent_id FROM leases "
+        "WHERE parcel_id = ? AND status = 'active' AND ttl_expires_at > ? "
+        "AND mode IN ('write', 'exclusive')",
+        (parcel_id, time.time()),
+    ).fetchall()
+    assert [r["agent_id"] for r in live] == ["agent-A"], (
+        "exactly one agent may hold a live write lease"
+    )
+
+
+def test_same_agent_different_mode_reacquire_still_conflicts(conn):
+    """The idempotency is scoped to the SAME (parcel, agent, mode). A same-agent
+    request in a CONFLICTING mode (read while it holds write) is still denied, so the
+    exemption cannot be abused to smuggle in an incompatible lease."""
+    parcel_id = _make_parcel(conn)
+    assert leases.acquire(conn, parcel_id, "agent-A", mode="write").granted is True
+    assert leases.acquire(conn, parcel_id, "agent-A", mode="read").granted is False
+
+
+def test_barrier_gated_same_agent_batched_prechecks_all_grant(conn):
+    """N threads race a write-acquire on the SAME parcel as the SAME agent behind a
+    barrier -- the batched-parallel-Edit pattern the lock must support. Every one must
+    be granted (no self-deny), and no OTHER agent may sneak a live write lease in."""
+    import threading
+
+    parcel_id = _make_parcel(conn)
+    n_threads = 16
+    barrier = threading.Barrier(n_threads)
+    results: list[object] = []
+    lock = threading.Lock()
+
+    def worker(_i: int) -> None:
+        barrier.wait()
+        r = leases.acquire(conn, parcel_id, "agent-solo", mode="write")
+        with lock:
+            results.append(r)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert all(r.granted for r in results), "same-agent batched acquires must all grant"
+
+    holders = conn.execute(
+        "SELECT DISTINCT agent_id FROM leases "
+        "WHERE parcel_id = ? AND status = 'active' AND ttl_expires_at > ?",
+        (parcel_id, time.time()),
+    ).fetchall()
+    assert [h["agent_id"] for h in holders] == ["agent-solo"]
+
+
 def test_build_graph_tolerates_a_symbol_on_disk_with_no_parcel_row(tmp_path):
     """The class-level fix, stated directly: the parcel map is only ever as fresh as
     the last POST /index (there is no incremental indexing), so a symbol on disk with

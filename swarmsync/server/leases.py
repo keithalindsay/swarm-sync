@@ -15,6 +15,17 @@ acquire(conn, parcel_id, agent_id, mode, ttl) -> LeaseResult
 
         (existing.mode IN ('write', 'exclusive') OR incoming.mode IN ('write', 'exclusive'))
 
+    ...EXCEPT the incoming request's OWN same-mode active lease is not a conflict with
+    itself (`NOT (l.agent_id = :agent_id AND l.mode = :mode)`). Claude Code batches
+    parallel Edit tool calls from ONE agent: two prechecks both see no lease and both
+    POST /lease. Without this exemption the second CAS matches the first's just-granted
+    write lease and DENIES the agent a parcel it already holds -- self-defeating for the
+    batched-edit pattern the lock exists to support. With it, a repeat same-(parcel,
+    agent,mode) request is granted (idempotent), while a DIFFERENT agent -- or the same
+    agent in a conflicting mode -- is still denied, so real mutual exclusion is intact.
+    The exemption is same-statement (inside the atomic CAS itself), so it identifies the
+    self-holder atomically and introduces no TOCTOU window.
+
     `cursor.rowcount == 1` -> granted (row inserted); `== 0` -> denied (NOT EXISTS
     failed, i.e. a conflicting lease is already active). An expired lease
     (`ttl_expires_at <= now`) is treated as not-active by the same WHERE clause, so
@@ -162,6 +173,7 @@ def acquire(
               AND l.status = 'active'
               AND l.ttl_expires_at > :now
               AND (l.mode IN ('write', 'exclusive') OR :mode IN ('write', 'exclusive'))
+              AND NOT (l.agent_id = :agent_id AND l.mode = :mode)
         )
         RETURNING id
         """,
