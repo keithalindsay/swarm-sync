@@ -798,6 +798,10 @@ def create_app(
                 base_commit=body.base_commit,
                 into=body.into,
                 agent_id=body.agent_id,
+                # WP4.6 (A1): forward the caller's plan-time read-dependency
+                # snapshot so the integrator's optimistic re-check (DESIGN §5.5,
+                # the `needs_rebase` verdict) is reachable over the wire at all.
+                expected_read_deps=body.expected_read_deps,
             )
         return dataclasses.asdict(result)
 

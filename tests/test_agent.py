@@ -871,3 +871,188 @@ def test_cleanup_worktree_logs_swallowed_git_failures_and_does_not_raise(
     messages = [r.getMessage() for r in caplog.records]
     assert any("park_branch failed" in m and "agent-x" in m for m in messages), messages
     assert any("remove_worktree failed" in m and "agent-x" in m for m in messages), messages
+
+
+# --- WP4.6 (A1): needs_rebase wired end-to-end over real HTTP ---------------------
+
+
+def _edit_after_foreign_dep_update(worktree, path, symbol, new_body, client, dep_parcel):
+    """Test-only mutator: BEFORE applying this agent's own edit, simulate ANOTHER
+    agent updating the read-dependency parcel's content_hash on the blackboard --
+    i.e. the dep shifted between this agent's plan-time snapshot and its submit.
+    The rival takes its own write lease (post_parcel_update's C5 ownership gate
+    requires one) on a parcel this agent only READS, so the grant cannot conflict
+    with this agent's own target lease."""
+    held = client.lease("rival-agent", dep_parcel, mode="write", intent="foreign edit")
+    assert held["granted"] is True
+    updated = client.parcel_update(
+        "rival-agent", dep_parcel, "hash-moved-under-us", "rival edit"
+    )
+    assert updated["ok"] is True
+    client.release("rival-agent", held["lease_id"])
+    mutators.edit_function_body(worktree, path, symbol, new_body)
+
+
+def test_integrate_bounces_needs_rebase_when_read_dep_shifts_mid_work(client, repo):
+    """A1 end-to-end (DESIGN §5.5), over REAL HTTP (TestClient): the agent plans
+    against `mod_a.py::helper`'s current content_hash (a read-dependency it never
+    leases), a rival agent updates that hash mid-work, and the agent's own
+    `POST /integrate` submit must come back `needs_rebase` -- no merge, trunk
+    untouched, branch preserved (parked). Before WP4.6 wired
+    `IntegrateBody.expected_read_deps` through, this submission silently MERGED."""
+    r, base = repo
+    plan_hash = {p["id"]: p["content_hash"] for p in client.parcels()}["mod_a.py::helper"]
+    trunk_before = git_ops.current_commit(r, ref="integration")
+
+    result = run_agent(
+        agent_id="agent-rebase",
+        client=client,
+        repo=r,
+        task="edit other while helper shifts underneath",
+        target_parcels=["mod_a.py::other"],
+        mutator=_edit_after_foreign_dep_update,
+        mutator_kwargs={
+            "path": "mod_a.py",
+            "symbol": "other",
+            "new_body": "return z * 3",
+            "client": client,
+            "dep_parcel": "mod_a.py::helper",
+        },
+        base_commit=base,
+        heartbeat_interval=0.05,
+        read_contracts=["mod_a.py::helper"],
+    )
+
+    assert result.status == "done"  # the runner completed its protocol...
+    assert result.integrate_result is not None
+    # ...but the integrator bounced the branch instead of merging it.
+    assert result.integrate_result["status"] == "needs_rebase", (
+        "expected needs_rebase; the wire dropped expected_read_deps and the "
+        f"stale submission silently merged: {result.integrate_result}"
+    )
+    assert result.integrate_result["stale_deps"] == ["mod_a.py::helper"]
+
+    # No merge happened: trunk never moved, and the agent's edit is not on it.
+    assert git_ops.current_commit(r, ref="integration") == trunk_before
+    assert "z * 3" not in (r / "mod_a.py").read_text()
+
+    # A `needs_rebase` event names the stale dep; no `merged` event exists for
+    # this branch.
+    events = client.events(since=0)
+    rebase_events = [e for e in events if e["type"] == "needs_rebase"]
+    assert len(rebase_events) == 1
+    payload = json.loads(rebase_events[0]["payload"])
+    assert payload["branch"] == "agent-rebase"
+    assert payload["stale_deps"] == ["mod_a.py::helper"]
+    merged_for_branch = [
+        e
+        for e in events
+        if e["type"] == "merged"
+        and json.loads(e["payload"] or "{}").get("branch") == "agent-rebase"
+    ]
+    assert merged_for_branch == []
+
+    # WP3.5: the un-landed commits stay reachable -- the branch was parked.
+    parked = subprocess.run(
+        ["git", "branch", "--list", "rejected/agent-rebase-*"],
+        cwd=r,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert parked, "the bounced branch was not parked under rejected/*"
+
+    # The plan-time hash really was the parcels.content_hash the integrator
+    # compared against (shape reconciliation is content_hash-first, not
+    # contracts.type_hash, for an id that has a parcels row).
+    assert plan_hash != "hash-moved-under-us"
+
+
+def test_integrate_merges_when_read_deps_are_unchanged(client, repo):
+    """The happy-path control for A1: wiring expected_read_deps must not make the
+    check ALWAYS fire. An agent that declares the same read-dependency whose hash
+    does NOT shift mid-work still merges normally."""
+    r, base = repo
+    result = run_agent(
+        agent_id="agent-clean",
+        client=client,
+        repo=r,
+        task="edit other; helper stays put",
+        target_parcels=["mod_a.py::other"],
+        mutator=mutators.edit_function_body,
+        mutator_kwargs={"path": "mod_a.py", "symbol": "other", "new_body": "return z * 4"},
+        base_commit=base,
+        heartbeat_interval=0.05,
+        read_contracts=["mod_a.py::helper"],
+    )
+
+    assert result.status == "done"
+    assert result.integrate_result is not None
+    assert result.integrate_result["status"] == "merged", result.integrate_result
+    assert "z * 4" in (r / "mod_a.py").read_text()
+    assert not any(e["type"] == "needs_rebase" for e in client.events(since=0))
+
+
+# --- WP4.6 (C17): the runner's world-read fetches the NEWEST events ---------------
+
+
+class _EventsRecordingClient:
+    """Pass-through wrapper capturing every `.events()` result the runner reads."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.events_reads: list[list[dict]] = []
+
+    def events(self, *args, **kwargs):
+        result = self._inner.events(*args, **kwargs)
+        self.events_reads.append(result)
+        return result
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def test_runner_world_read_sees_the_newest_events(tmp_path, repo):
+    """C17: seed more events than one page holds, then prove the runner's
+    read-the-world step (its very first `.events()` call) contains the NEWEST
+    seeded event. The old `events(since=0)` read returned the OLDEST page, so
+    past 1000 rows the newest activity was invisible to it."""
+    from swarmsync.blackboard import events as events_mod
+    from swarmsync.server.app import create_app as _create_app
+
+    r, base = repo
+    app = _create_app(tmp_path / "c17-blackboard.db", reaper_interval=None)
+    with TestClient(app) as c:
+        assert c.post("/index", json={"root": str(r)}).status_code == 200
+        conn = app.state.conn
+        for i in range(1100):  # > the 1000-row page the old since=0 read got
+            events_mod.emit(conn, "planned", "seeder", {"i": i})
+        newest_seq = conn.execute("SELECT MAX(seq) FROM events").fetchone()[0]
+
+        recording = _EventsRecordingClient(BlackboardClient(c))
+        result = run_agent(
+            agent_id="agent-c17",
+            client=recording,
+            repo=r,
+            task="edit helper with a deep event log",
+            target_parcels=["mod_a.py::helper"],
+            mutator=mutators.edit_function_body,
+            mutator_kwargs={
+                "path": "mod_a.py",
+                "symbol": "helper",
+                "new_body": "return x + y + 17",
+            },
+            base_commit=base,
+            heartbeat_interval=0.05,
+        )
+        assert result.status == "done"
+
+        assert recording.events_reads, "the runner never read the event log"
+        world_read = recording.events_reads[0]  # step-1 read-the-world page
+        assert world_read, "the world-read returned no events"
+        seqs = {e["seq"] for e in world_read}
+        assert newest_seq in seqs, (
+            "the runner's awareness read missed the newest event "
+            f"(max seen {max(seqs)} < newest {newest_seq}) -- it is still "
+            "paging from the OLDEST end of the log"
+        )

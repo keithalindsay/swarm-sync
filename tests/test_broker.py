@@ -720,3 +720,91 @@ def test_broker_non_gitops_error_is_not_retried(conn_and_client, repo):
     assert calls["n"] == 1
     assert results["crashing-task"].status == "error"
     assert results["crashing-task"].error_type == "RuntimeError"
+
+
+# --- WP4.6 (A7): per-thread worker connections ------------------------------------
+
+
+def test_broker_workers_get_distinct_per_thread_connections(
+    conn_and_client, repo, tmp_path, monkeypatch
+):
+    """`run(db_path=...)` must open ONE fresh connection per dispatched worker
+    task (each distinct from the caller's own `conn`) and close it when the
+    task finishes -- instead of every worker thread sharing the caller's single
+    SQLite handle. Instrumented at the broker's own `_open_task_conn` seam so
+    the server's per-request `db.connect` calls (same module function) don't
+    pollute the count."""
+    conn, client = conn_and_client
+    r, base = repo
+
+    opened: list = []
+    lock = threading.Lock()
+    real_open = broker._open_task_conn
+
+    def recording_open(db_path):
+        c = real_open(db_path)
+        with lock:
+            opened.append((threading.get_ident(), c))
+        return c
+
+    monkeypatch.setattr(broker, "_open_task_conn", recording_open)
+
+    task_a = broker.Task(
+        task_id="pt-edit-helper",
+        targets=[("mod_a.py", "helper")],
+        mutator=mutators.edit_function_body,
+        mutator_kwargs={"path": "mod_a.py", "symbol": "helper", "new_body": "return x - y - 1"},
+        base_commit=base,
+    )
+    task_b = broker.Task(
+        task_id="pt-edit-compute",
+        targets=[("mod_b.py", "compute")],
+        mutator=mutators.edit_function_body,
+        mutator_kwargs={"path": "mod_b.py", "symbol": "compute", "new_body": "return n * 11"},
+        base_commit=base,
+    )
+
+    results = broker.run(
+        conn, r, [task_a, task_b], client, n_agents=2, db_path=tmp_path / "blackboard.db"
+    )
+
+    assert results["pt-edit-helper"].status == "done"
+    assert results["pt-edit-compute"].status == "done"
+
+    # One fresh connection per dispatched task; all distinct objects, and none
+    # of them is the caller's shared conn.
+    assert len(opened) == 2, opened
+    conns = [c for _tid, c in opened]
+    assert len({id(c) for c in conns}) == 2
+    assert all(c is not conn for c in conns)
+    # ...and each was closed when its task finished (a closed sqlite3
+    # connection raises ProgrammingError on any use).
+    import sqlite3 as _sqlite3
+
+    for c in conns:
+        with pytest.raises(_sqlite3.ProgrammingError):
+            c.execute("SELECT 1")
+
+
+def test_broker_without_db_path_keeps_the_shared_conn_fallback(
+    conn_and_client, repo, monkeypatch
+):
+    """Omitting `db_path` must preserve the pre-WP4.6 behavior for direct-conn
+    callers: no per-task connection is ever opened."""
+    conn, client = conn_and_client
+    r, base = repo
+
+    def forbidden_open(db_path):  # pragma: no cover - the assertion IS the call
+        raise AssertionError("_open_task_conn must not be called without db_path")
+
+    monkeypatch.setattr(broker, "_open_task_conn", forbidden_open)
+
+    task = broker.Task(
+        task_id="fallback-edit-helper",
+        targets=[("mod_a.py", "helper")],
+        mutator=mutators.edit_function_body,
+        mutator_kwargs={"path": "mod_a.py", "symbol": "helper", "new_body": "return x + y + 2"},
+        base_commit=base,
+    )
+    results = broker.run(conn, r, [task], client, n_agents=1)
+    assert results["fallback-edit-helper"].status == "done"

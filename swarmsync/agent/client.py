@@ -119,8 +119,20 @@ class BlackboardClient:
         r.raise_for_status()
         return r.json()
 
-    def events(self, since: int = 0, limit: int = 1000) -> list[dict]:
-        r = self._http.get("/events", params={"since": since, "limit": limit})
+    def events(
+        self, since: int = 0, limit: int = 1000, tail: Optional[int] = None
+    ) -> list[dict]:
+        """`GET /events` -- forward page (`since`/`limit`, the default) or, when
+        `tail` is given, the NEWEST `tail` events in ascending seq order
+        (`?tail=N`, WP4.5/C17 -- the "what happened recently" awareness read).
+        `tail` and `since` are mutually exclusive on the server (422), so a
+        `tail` request sends ONLY `tail` and ignores the `since`/`limit`
+        defaults rather than tripping that guard."""
+        if tail is not None:
+            params: dict[str, int] = {"tail": tail}
+        else:
+            params = {"since": since, "limit": limit}
+        r = self._http.get("/events", params=params)
         r.raise_for_status()
         return r.json()
 
@@ -224,6 +236,7 @@ class BlackboardClient:
         repo: str,
         base_commit: Optional[str] = None,
         into: str = "integration",
+        expected_read_deps: Optional[dict[str, str]] = None,
     ) -> dict:
         """`POST /integrate` -> the integrator's response dict (U10:
         `coordinator.integrator.IntegrateResult`, serialized as JSON --
@@ -231,10 +244,15 @@ class BlackboardClient:
 
         `repo` is the filesystem path to the git repo `branch` lives in --
         required since U10's integrator needs it to actually run `git merge`
-        + pytest. Deliberately does NOT `raise_for_status()`: the integrator's
-        rejection/needs-rebase outcomes are ordinary 200 responses (only a
-        real plumbing error is a non-2xx), so callers (see `runner.run_agent`)
-        should inspect `result["status"]` rather than the HTTP status alone.
+        + pytest. `expected_read_deps` (WP4.6/A1, DESIGN §5.5) is the caller's
+        plan-time `{parcel_or_contract_id: expected_hash}` snapshot of its
+        read-dependencies; when given, the integrator re-checks each against
+        the blackboard's current hash BEFORE merging and answers
+        `needs_rebase` (no merge) on any mismatch. Deliberately does NOT
+        `raise_for_status()`: the integrator's rejection/needs-rebase outcomes
+        are ordinary 200 responses (only a real plumbing error is a non-2xx),
+        so callers (see `runner.run_agent`) should inspect `result["status"]`
+        rather than the HTTP status alone.
         """
         body: dict[str, Any] = {
             "agent_id": agent_id,
@@ -244,6 +262,8 @@ class BlackboardClient:
         }
         if base_commit is not None:
             body["base_commit"] = base_commit
+        if expected_read_deps is not None:
+            body["expected_read_deps"] = dict(expected_read_deps)
         # This one request must outlive the server's pytest gate. Timing out here does
         # NOT cancel the merge -- the server keeps going and lands it -- so a client
         # that gives up early doesn't abort the work, it just stops being told the
