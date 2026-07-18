@@ -278,6 +278,57 @@ def test_parcel_held_by_same_agent_allows_no_self_deny(monkeypatch, repo, indexe
     assert leases[0]["id"] == held["lease_id"]
 
 
+# --- C8 (P2): the batched-Edit race must not make an agent deny ITSELF -----------
+
+
+class _StaleThenRealLeases:
+    """Wraps a real `BlackboardClient`, but the FIRST `.leases()` read reports an
+    empty board -- the exact stale view precheck B holds in Claude Code's batched
+    parallel-Edit race: agent A's write lease has already landed on the server, but
+    B's `GET /leases` predates it, so B sees nothing and takes the acquire path.
+    `lease()`/`heartbeat()` and every later `leases()` hit the REAL backend, so the
+    CAS (and the deny-path re-read) see A's real lease."""
+
+    def __init__(self, real):
+        self._real = real
+        self._reads = 0
+
+    def leases(self):
+        self._reads += 1
+        return [] if self._reads == 1 else self._real.leases()
+
+    def lease(self, *a, **kw):
+        return self._real.lease(*a, **kw)
+
+    def heartbeat(self, *a, **kw):
+        return self._real.heartbeat(*a, **kw)
+
+
+def test_precheck_batched_edit_race_does_not_self_deny(monkeypatch, repo, indexed_client):
+    """Two parallel Edits from ONE agent: both prechecks see no lease and both POST
+    /lease. The second, losing the CAS pre-fix, re-read the holder and named it in the
+    deny WITHOUT checking it was ITSELF -- blocking the agent from a file it just
+    locked, blaming itself. With acquire made idempotent for the same
+    (parcel, agent, mode), the second precheck's acquire is GRANTED and precheck
+    returns ALLOW (None); the self-naming deny path is never reached."""
+    from swarmsync.agent.client import BlackboardClient
+
+    monkeypatch.setenv("SWARMSYNC_ACTIVE", "1")
+    real = BlackboardClient(indexed_client)
+    parcel_id = f"mod_a.py::{MODULE_SYMBOL}"
+
+    # precheck A already landed agent-A's write lease on the server.
+    assert real.lease("agent-A", parcel_id, mode="write", ensure_parcel=True)["granted"]
+
+    # precheck B runs with a stale (pre-A) read -> acquire path. Must ALLOW, and must
+    # NEVER emit a deny that names agent-A (itself) as the blocker.
+    client = _StaleThenRealLeases(real)
+    result = adapter.cmd_precheck(
+        "Edit", {"file_path": str(repo / "mod_a.py")}, client, repo, "agent-A"
+    )
+    assert result is None, f"batched-edit race self-denied: {result}"
+
+
 # --- agent_id fallback chain: agent_id -> session_id -> "main" -------------------
 
 
