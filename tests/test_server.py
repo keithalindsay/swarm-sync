@@ -877,3 +877,151 @@ def test_events_endpoint_serves_compaction_marker_rows(client):
     assert r.status_code == 200
     types = [e["type"] for e in r.json()]
     assert types == [events_mod.EVENTS_COMPACTED]
+
+
+# --- WP4.5 (A6): typed responses on the raw-row endpoints --------------------------
+# GET /parcels and /leases used to return raw `dict(row)` -- the wire shape was
+# whatever schema.sql said, unvalidated and invisible in OpenAPI, and the hook
+# adapter duck-typed against it. The response models DECLARE that shape; these
+# tests pin the exact JSON keys so declaring can never silently become changing.
+
+# The exact wire keys of one GET /leases row == the `leases` schema columns.
+LEASE_WIRE_KEYS = {
+    "id", "parcel_id", "agent_id", "mode",
+    "acquired_at", "ttl_expires_at", "heartbeat_at", "intent", "status",
+}
+
+# The exact wire keys of one GET /parcels row == parcel columns + the lease join.
+PARCEL_WIRE_KEYS = {
+    "id", "path", "symbol", "kind", "territory", "blast_radius",
+    "contract_hash", "content_hash", "byte_start", "byte_end",
+    "state_summary", "updated_at", "active_leases",
+}
+
+# The embedded per-lease projection inside a parcel row's `active_leases`.
+ACTIVE_LEASE_WIRE_KEYS = {"lease_id", "agent_id", "mode"}
+
+
+def test_get_leases_wire_shape_is_the_exact_lease_row(client, fixture_repo):
+    _index(client, fixture_repo)
+    granted = client.post(
+        "/lease",
+        json={"agent_id": "agent-1", "parcel_id": "mod_a.py::helper", "mode": "write"},
+    ).json()
+    assert granted["granted"] is True
+
+    rows = client.get("/leases").json()
+    assert len(rows) == 1
+    row = rows[0]
+    assert set(row) == LEASE_WIRE_KEYS
+    assert row["id"] == granted["lease_id"]
+    assert row["parcel_id"] == "mod_a.py::helper"
+    assert row["agent_id"] == "agent-1"
+    assert row["mode"] == "write"
+    assert row["status"] == "active"
+    assert row["intent"] is None  # nullable column serialized, not dropped
+
+
+def test_get_parcels_wire_shape_is_parcel_columns_plus_lease_join(client, fixture_repo):
+    _index(client, fixture_repo)
+    granted = client.post(
+        "/lease",
+        json={"agent_id": "agent-1", "parcel_id": "mod_a.py::helper", "mode": "write"},
+    ).json()
+
+    rows = client.get("/parcels").json()
+    by_id = {p["id"]: p for p in rows}
+    leased = by_id["mod_a.py::helper"]
+    for row in rows:
+        assert set(row) == PARCEL_WIRE_KEYS
+    assert leased["active_leases"] == [
+        {"lease_id": granted["lease_id"], "agent_id": "agent-1", "mode": "write"}
+    ]
+    assert set(leased["active_leases"][0]) == ACTIVE_LEASE_WIRE_KEYS
+    # An unleased parcel still carries the key, as an empty list.
+    assert by_id["mod_b.py::use_b"]["active_leases"] == []
+
+
+def _resolve_ref(spec: dict, schema: dict) -> dict:
+    """Follow a `$ref` into the spec's components (one level -- all we need)."""
+    if "$ref" in schema:
+        name = schema["$ref"].rsplit("/", 1)[-1]
+        return spec["components"]["schemas"][name]
+    return schema
+
+
+def _response_array_item_schema(spec: dict, path: str) -> dict:
+    """The resolved item schema of `path`'s 200 application/json array response."""
+    schema = spec["paths"][path]["get"]["responses"]["200"]["content"][
+        "application/json"
+    ]["schema"]
+    assert schema["type"] == "array", f"{path} 200 response is not an array"
+    return _resolve_ref(spec, schema["items"])
+
+
+def test_openapi_declares_leases_and_parcels_response_schemas(client):
+    """WP4.5 (A6) schema snapshot: the OpenAPI document must now DECLARE the
+    /leases and /parcels response shapes (they were undocumented raw rows).
+    Focused property assertions, deliberately not a full-JSON golden."""
+    spec = client.app.openapi()
+
+    lease_item = _response_array_item_schema(spec, "/leases")
+    assert set(lease_item["properties"]) == LEASE_WIRE_KEYS
+
+    parcel_item = _response_array_item_schema(spec, "/parcels")
+    assert set(parcel_item["properties"]) == PARCEL_WIRE_KEYS
+    lease_info = _resolve_ref(
+        spec, parcel_item["properties"]["active_leases"]["items"]
+    )
+    assert set(lease_info["properties"]) == ACTIVE_LEASE_WIRE_KEYS
+    # The identity triple of the embedded projection is required on the wire.
+    assert set(lease_info["required"]) == ACTIVE_LEASE_WIRE_KEYS
+
+
+# --- WP4.5 (prep C17): GET /events?tail= newest-events mode ------------------------
+
+
+def test_events_tail_returns_newest_n_in_ascending_order(client, fixture_repo):
+    _index(client, fixture_repo)
+    client.post("/lease", json={"agent_id": "a1", "parcel_id": "mod_a.py::helper"})
+    client.post("/lease", json={"agent_id": "a2", "parcel_id": "mod_b.py::use_b"})
+    client.post("/lease", json={"agent_id": "a3", "parcel_id": "mod_c.py::use_c"})
+
+    everything = client.get("/events").json()
+    assert len(everything) >= 3
+
+    r = client.get("/events", params={"tail": 2})
+    assert r.status_code == 200
+    newest_two = r.json()
+    assert newest_two == everything[-2:]  # the newest 2, still ascending by seq
+    seqs = [e["seq"] for e in newest_two]
+    assert seqs == sorted(seqs)
+
+
+def test_events_tail_larger_than_log_returns_all(client, fixture_repo):
+    _index(client, fixture_repo)
+    client.post("/lease", json={"agent_id": "a1", "parcel_id": "mod_a.py::helper"})
+
+    everything = client.get("/events").json()
+    r = client.get("/events", params={"tail": 500})
+    assert r.status_code == 200
+    assert r.json() == everything
+
+
+def test_events_tail_and_since_are_mutually_exclusive_422(client):
+    # Even an explicit since=0 counts: the caller named both anchors.
+    assert client.get("/events", params={"since": 0, "tail": 5}).status_code == 422
+    assert client.get("/events", params={"since": 7, "tail": 5}).status_code == 422
+
+
+def test_events_tail_clamped_to_the_events_cap(client):
+    from swarmsync.server.app import MAX_EVENTS_LIMIT
+
+    assert client.get("/events", params={"tail": 0}).status_code == 422
+    assert client.get("/events", params={"tail": -1}).status_code == 422
+    assert client.get(
+        "/events", params={"tail": MAX_EVENTS_LIMIT + 1}
+    ).status_code == 422
+    assert client.get(
+        "/events", params={"tail": MAX_EVENTS_LIMIT}
+    ).status_code == 200

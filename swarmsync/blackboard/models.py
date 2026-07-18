@@ -4,6 +4,8 @@ Pydantic models mirroring the schema:
   Parcel, Lease, Contract, Pheromone, Intent, Event
 Plus the request/response bodies used by the FastAPI endpoints (§4.2):
   LeaseRequest, LeaseResult, IntentBody, HeartbeatBody, ParcelUpdateBody, IntegrateBody
+  ParcelLeaseInfo, ParcelWithLeases (the `GET /parcels` row: parcel columns +
+  the active-lease join -- WP4.5's declaration of the previously implicit shape)
 
 These are the wire contract between agent/client.py and server/app.py — keep them
 in sync with schema.sql. Row models use `model_config = ConfigDict(from_attributes=True)`
@@ -118,6 +120,28 @@ class Lease(BaseModel):
     heartbeat_at: float
     intent: Optional[str] = None
     status: LeaseStatus
+
+
+class ParcelLeaseInfo(BaseModel):
+    """One active lease as embedded in a `GET /parcels` row's `active_leases`
+    (WP4.5, A6). NOT a full `Lease`: the endpoint deliberately projects just the
+    identity triple a reader needs to see who holds a parcel -- and the lease's
+    row id is exposed under the key `lease_id` (not `id`), matching the wire
+    shape the hook adapter already duck-types against. Field names here ARE the
+    wire contract; renaming one is a breaking API change."""
+
+    lease_id: int
+    agent_id: str
+    mode: LeaseMode
+
+
+class ParcelWithLeases(Parcel):
+    """`GET /parcels` response row (WP4.5, A6): every `parcels` column exactly
+    as in `Parcel`, plus the endpoint's `active_leases` join -- the currently
+    active, unexpired leases on this parcel. Declares the shape the endpoint has
+    always returned; the JSON is unchanged."""
+
+    active_leases: list[ParcelLeaseInfo] = Field(default_factory=list)
 
 
 class Contract(BaseModel):

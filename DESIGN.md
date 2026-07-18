@@ -214,8 +214,24 @@ acting.
 | `POST /release` | Release a lease. |
 | `GET /contract/{symbol}` | Current frozen signature + version. |
 | `POST /parcel/update` | Agent posts new `content_hash` + `state_summary` on done. |
-| `GET /events?since={seq}` | Tail the ordered event log (polling; default 1s). |
+| `GET /events?since={seq}` | Tail the ordered event log (polling; default 1s). Or `?tail={n}`: the newest `n` events, still ascending by seq — "what happened recently" without paging the whole log (mutually exclusive with `since`; same 1000-row cap as `limit`). |
 | `POST /integrate` | Submit an agent branch for the serial merge gate (§5.4). |
+
+The response shapes of `GET /parcels` (parcel columns + an `active_leases` join of
+`{lease_id, agent_id, mode}`) and `GET /leases` (the `leases` row verbatim) are declared as
+response models (`blackboard.models.ParcelWithLeases` / `Lease`) and visible in the OpenAPI
+schema — they are the wire contract the hook adapter duck-types against; field names are frozen.
+
+**Error-shape convention.** Three distinct failure classes get three distinct wire shapes —
+the split is *absent entity* vs. *policy refusal* vs. *malformed/forbidden request*:
+
+| Shape | Where | Rationale |
+|---|---|---|
+| `404` | `GET /contract/{symbol}` unknown symbol; `POST /parcel/update` unknown parcel. | The named entity does not exist — retrying can't help until the world changes; kept distinct from "you don't hold the lease" so the two failure modes never collapse. |
+| `200` + refusal body | `POST /lease` deny → `{granted: false, reason, holder?, holder_ttl_expires_at?}`; `POST /parcel/update` without the write lease → `{ok: false, reason}`; `POST /heartbeat` / `POST /release` on a missing or foreign lease → `{ok: false}`. | Policy refusals are *normal coordination outcomes*, not errors: the request was well-formed and understood, the blackboard's answer is simply "no" — callers branch on the body (back off, name the holder), never on catching an HTTP error. Heartbeat/release carry no `reason` (a bare boolean suffices: the only cause is "not your active lease"); documented as-is, not reconciled — adding one would be additive, not a fix. |
+| `422` | Any malformed body/param (pydantic bounds: `ttl ≤ 0`, out-of-range `limit`/`tail`, `since`+`tail` together). | The request itself is wrong — loud, before any state is touched, so a caller never mistakes a clamped/ignored parameter for an answered question. |
+| `401` / `403` | `401`: missing/bad bearer token on mutating routes when `SWARMSYNC_TOKEN` is set. `403`: `POST /index` / `POST /integrate` path outside the managed roots. | Access control, not coordination: who may talk to the blackboard at all, and which filesystem paths it may touch. |
+| `413` | Body over the `SWARMSYNC_MAX_BODY_BYTES` cap; `POST /index` over the index limits. | Resource protection — rejected before buffering/indexing, with the env knob named in the detail. |
 
 ### 4.3 Sync protocol (per agent)
 

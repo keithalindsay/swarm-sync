@@ -26,6 +26,11 @@ tail(conn, since_seq=0, limit=1000) -> list[Event]
     schema column) -- callers that want the structured payload call
     `json.loads(ev.payload)` themselves.
 
+tail_newest(conn, n) -> list[Event]
+    The NEWEST `n` events, still in ascending seq order (WP4.5, prep for C17):
+    the "read the world" step wants recent activity without paging the whole
+    log forward from seq 0. Same row decoding as `tail`.
+
 compact_events(conn, heartbeat_max_age=None, max_age=None, now=None) -> int
     Retention/compaction for the `events` table (WP3.1, finding S2): prune
     heartbeat-class events older than a short window and ANY event older than a
@@ -50,6 +55,9 @@ decay_pheromone(conn, half_life, ts=None) -> int
     can't mathematically go negative, but the floor is explicit per the
     BUILD_PLAN done-when: "never below 0"). Returns the number of rows
     touched; a no-op on an empty table returns 0 without error.
+    C15 (WP4.5): implemented as ONE UPDATE statement so every row decays from
+    its CURRENT committed strength -- see the function's docstring for the race
+    the old read-modify-write shape had.
 """
 from __future__ import annotations
 
@@ -143,16 +151,8 @@ def emit(
     return cur.fetchone()["seq"]
 
 
-def tail(
-    conn: sqlite3.Connection,
-    since_seq: int = 0,
-    limit: int = 1000,
-) -> list[Event]:
-    """Ordered events with seq > since_seq, oldest first, capped at `limit`."""
-    rows = conn.execute(
-        "SELECT * FROM events WHERE seq > ? ORDER BY seq ASC LIMIT ?",
-        (since_seq, limit),
-    ).fetchall()
+def _rows_to_events(rows: list[sqlite3.Row]) -> list[Event]:
+    """Decode `events` rows into Event models (shared by `tail`/`tail_newest`)."""
     out: list[Event] = []
     for row in rows:
         data = dict(row)
@@ -166,6 +166,39 @@ def tail(
             # the compaction audit trail from every tailer.
             out.append(Event.model_construct(**data))
     return out
+
+
+def tail(
+    conn: sqlite3.Connection,
+    since_seq: int = 0,
+    limit: int = 1000,
+) -> list[Event]:
+    """Ordered events with seq > since_seq, oldest first, capped at `limit`."""
+    rows = conn.execute(
+        "SELECT * FROM events WHERE seq > ? ORDER BY seq ASC LIMIT ?",
+        (since_seq, limit),
+    ).fetchall()
+    return _rows_to_events(rows)
+
+
+def tail_newest(conn: sqlite3.Connection, n: int) -> list[Event]:
+    """The newest `n` events, returned in ASCENDING seq order (WP4.5, prep C17).
+
+    `tail` pages forward from a known seq; a caller that instead wants "the most
+    recent activity" (the agent runner's read-the-world step) previously had no
+    way to get it short of paging the entire log. The inner subquery grabs the
+    top-`n` by seq descending; the outer SELECT re-sorts ascending so callers
+    consume events in the same oldest-first order `tail` returns. Fewer than `n`
+    rows in the table returns them all; the bound must be positive.
+    """
+    if n <= 0:
+        raise ValueError(f"n must be positive, got {n!r}")
+    rows = conn.execute(
+        "SELECT * FROM (SELECT * FROM events ORDER BY seq DESC LIMIT ?) "
+        "ORDER BY seq ASC",
+        (n,),
+    ).fetchall()
+    return _rows_to_events(rows)
 
 
 def compact_events(
@@ -302,28 +335,35 @@ def decay_pheromone(
     repeated call (e.g. a periodic decay loop) measures elapsed time from the
     *last* decay, not the original drop. Returns the count of rows updated;
     a no-op (empty table) returns 0 and never raises.
+
+    C15 (WP4.5): ONE UPDATE statement, deliberately -- no Python-side
+    read-modify-write. The old shape SELECTed every row, computed decayed
+    strengths in Python, then executemany-UPDATEd by PK: a `drop_pheromone`
+    landing between the read and the write (the reaper decays every 1s on its
+    OWN connection while request handlers drop on theirs; autocommit statements
+    interleave freely under WAL) was silently overwritten with a stale decayed
+    value computed from the pre-drop row. Decaying in SQL means each row's new
+    strength is derived from its CURRENT committed value inside the UPDATE's own
+    atomic step, so a concurrent drop either lands before (and is decayed
+    correctly) or after (and wins outright) -- never lost. Emission behavior is
+    unchanged: decay is silent by design (see the module honesty note).
+
+    `pow()` may not be compiled into SQLite (SQLITE_ENABLE_MATH_FUNCTIONS);
+    `blackboard.db._configure` registers a deterministic Python fallback on
+    every blackboard connection when the build lacks it.
     """
     if half_life <= 0:
         raise ValueError(f"half_life must be positive, got {half_life!r}")
 
     now = ts if ts is not None else time.time()
-    rows = conn.execute(
-        "SELECT parcel_id, agent_id, kind, strength, updated_at FROM pheromone"
-    ).fetchall()
-    if not rows:
-        return 0
-
-    updates = []
-    for row in rows:
-        elapsed = max(0.0, now - row["updated_at"])  # clock-skew guard
-        decayed = max(0.0, row["strength"] * (0.5 ** (elapsed / half_life)))
-        updates.append((decayed, now, row["parcel_id"], row["agent_id"], row["kind"]))
-
-    conn.executemany(
+    # max(0.0, now - updated_at): clock-skew guard, same as the old Python-side
+    # `elapsed`; the outer max(0.0, ...) keeps the explicit "never below 0" floor.
+    cur = conn.execute(
         """
-        UPDATE pheromone SET strength = ?, updated_at = ?
-        WHERE parcel_id = ? AND agent_id = ? AND kind = ?
+        UPDATE pheromone
+        SET strength = max(0.0, strength * pow(0.5, max(0.0, :now - updated_at) / :half_life)),
+            updated_at = :now
         """,
-        updates,
+        {"now": now, "half_life": half_life},
     )
-    return len(updates)
+    return cur.rowcount
