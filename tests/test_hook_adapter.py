@@ -12,7 +12,7 @@ Coverage (see this unit's brief):
   - free parcel -> acquire + ALLOW
   - parcel held by another agent -> DENY with the exact reason string
   - parcel held by the SAME agent -> ALLOW (no self-deny, no duplicate acquire)
-  - agent_id fallback: agent_id -> session_id -> "main"
+  - agent_id fallback: agent_id -> session_id -> per-invocation unique id (degraded)
   - blackboard unreachable / raises -> fail-open ALLOW
   - malformed stdin -> fail-open ALLOW
   - postupdate re-hashes the edited file and posts content_hash/state_summary

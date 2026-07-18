@@ -17,6 +17,9 @@ blackboard.db-shm
 *.db-wal
 *.db-shm
 .worktrees/
+# hook runtime markers (per-repo opt-in + last-contact stamp)
+.swarmsync-active
+.swarmsync-last-contact
 worktrees/
 run/
 *.log
