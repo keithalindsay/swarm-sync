@@ -863,7 +863,7 @@ def test_events_endpoint_serves_compaction_marker_rows(client):
     import time as time_mod
 
     from swarmsync.blackboard import db as db_mod
-    from swarmsync.server import events as events_mod
+    from swarmsync.blackboard import events as events_mod
 
     conn = db_mod.connect(client.app.state.db_path)
     try:

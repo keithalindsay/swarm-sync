@@ -39,7 +39,7 @@ from starlette.testclient import TestClient
 from swarmsync.blackboard import db
 from swarmsync.blackboard.models import LeaseResult
 from swarmsync.server import app as app_mod
-from swarmsync.server import leases as leases_mod
+from swarmsync.blackboard import leases as leases_mod
 from swarmsync.server.app import create_app
 
 

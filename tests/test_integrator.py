@@ -20,7 +20,7 @@ import pytest
 from swarmsync.blackboard import db
 from swarmsync.classifier.store import run_index
 from swarmsync.coordinator import integrator
-from swarmsync.server import events as events_mod
+from swarmsync.blackboard import events as events_mod
 from swarmsync.worktree import git_ops
 
 

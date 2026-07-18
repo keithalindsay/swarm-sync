@@ -92,8 +92,8 @@ from swarmsync.classifier.indexer import IndexLimitError
 from swarmsync.classifier.store import run_index
 from swarmsync.coordinator import integrator
 from swarmsync.coordinator import reaper as reaper_mod
-from swarmsync.server import events as events_mod
-from swarmsync.server import leases as leases_mod
+from swarmsync.blackboard import events as events_mod
+from swarmsync.blackboard import leases as leases_mod
 
 StrPath = Union[str, Path]
 
