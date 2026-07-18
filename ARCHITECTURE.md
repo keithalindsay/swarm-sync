@@ -132,7 +132,7 @@ branch.
 | **Blackboard** (shared memory) | [`blackboard/db.py`](swarmsync/blackboard/db.py), [`schema.sql`](swarmsync/blackboard/schema.sql) | The single SQLite-WAL database and its schema: `parcels`, `leases`, `contracts`, `pheromone`, `intents`, `events`. |
 | ↳ typed rows | [`blackboard/models.py`](swarmsync/blackboard/models.py) | Pydantic models every reader validates through (`Parcel`, `LeaseMode`, `LeaseResult`, …). |
 | **Lease** (the lock) | [`server/leases.py`](swarmsync/server/leases.py) | `acquire` (atomic CAS), `heartbeat`, `release`, `_ensure_parcel`. The mutual-exclusion primitive. |
-| **Pheromone trail / event log** | [`server/events.py`](swarmsync/server/events.py) | `emit` — the single write path into the append-only `events` table, which doubles as the audit log and the recovery source of truth. |
+| **Pheromone trail / event log** | [`server/events.py`](swarmsync/server/events.py) | `emit` — the single write path into the append-only `events` table: the audit/observability log. The SQLite tables are the state of record; crash recovery reads the `open_integrations` projection (WP3.2), not this log. |
 | **HTTP API** | [`server/app.py`](swarmsync/server/app.py) | FastAPI wiring every endpoint; `check_single_root` enforces the one-managed-root rule. |
 | ↳ launcher | [`server/serve.py`](swarmsync/server/serve.py) | `swarmsync-serve` — starts the blackboard server. |
 | **Broker** (scheduler) | [`coordinator/broker.py`](swarmsync/coordinator/broker.py) | Matches tasks to parcels, spawns agents in file-disjoint waves, reassigns on reap (`resolve_task`, `_run_task_once`). |
