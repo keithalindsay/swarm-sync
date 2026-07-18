@@ -50,6 +50,13 @@ StrPath = Union[str, Path]
 
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 5.0
 
+# WP4.6 (C17): how many of the NEWEST events the read-the-world step fetches
+# (`GET /events?tail=N`, WP4.5). Matches the client's default page size and the
+# server's MAX_EVENTS_LIMIT cap -- the same volume the old `since=0` read got,
+# but anchored at the newest end of the log instead of the oldest, so the
+# awareness signal stays recent activity even once the log outgrows one page.
+EVENTS_READ_TAIL = 1000
+
 logger = logging.getLogger(__name__)
 
 
@@ -276,8 +283,16 @@ def run_agent(
     repo = Path(repo)
 
     # 1. read current state (advisory -- the CAS lease is the real safety net).
-    client.parcels()
-    client.events(since=0)
+    # The parcel listing doubles as the PLAN-TIME hash snapshot (WP4.6/A1): the
+    # content_hash each id carries HERE is what this agent plans against, and
+    # what step 6 submits as `expected_read_deps` for the integrator's
+    # optimistic re-check (DESIGN §5.5). The events read is the newest page
+    # (`tail=`, WP4.5/C17), not the oldest -- `since=0` returned the log's
+    # FIRST 1000 rows, which past one page is pure noise, not awareness.
+    plan_parcel_hashes: dict[str, Optional[str]] = {
+        p["id"]: p.get("content_hash") for p in client.parcels()
+    }
+    client.events(tail=EVENTS_READ_TAIL)
 
     # 2. declare intent -> drops a 'planned' pheromone + event per target parcel.
     client.intent(agent_id, task, target_parcels)
@@ -337,12 +352,41 @@ def run_agent(
     commit_sha: Optional[str] = None  # set once commit_all succeeds -- the outer
     # finally parks the branch only when there IS a commit to preserve (WP3.5).
     try:
-        # 4. read-dependency contracts (drift detection vs. a plan-time snapshot
-        # is the broker's/U12's job; this unit fetches the current state). Inside
+        # 4. read-dependency contracts (fetched for the caller to diff), plus the
+        # plan-time hash snapshot this run will SUBMIT as `expected_read_deps`
+        # (WP4.6/A1 -- the integrator's optimistic re-check, DESIGN §5.5). Inside
         # containment because the leases are already held here: a failing GET must
         # release them like any other work-phase failure.
+        #
+        # SHAPE RECONCILIATION (the "wired but always/never fires" trap):
+        # `integrator._check_read_deps` looks each id up in `parcels` FIRST and
+        # compares against `parcels.content_hash`; only an id with NO parcels row
+        # falls back to `contracts.type_hash`. Contract symbols share the parcel
+        # id namespace (`<path>::<symbol>` -- a frozen contract's symbol IS its
+        # function/class parcel's id), so for any read-dep the classifier indexed,
+        # the parcels row shadows the contract and content_hash is what gets
+        # compared. Submitting the contract fetch's `type_hash` for such an id
+        # would therefore mismatch on EVERY submit (hash of the type signature vs.
+        # hash of the source span) -- needs_rebase always. So: snapshot the
+        # parcel's content_hash when a parcels row exists (from the step-1
+        # plan-time listing), and only fall back to the contract's type_hash for
+        # an id the parcel map doesn't know. Ids that are ALSO write-targets are
+        # excluded -- this agent changes those itself (its own step-6
+        # /parcel/update would trip the check on every submit); they are guarded
+        # by its write lease, not by the optimistic re-check. An id with neither
+        # a parcel hash nor a contract is skipped (nothing existed at plan time
+        # to go stale).
+        expected_read_deps: dict[str, str] = {}
         for symbol in read_contracts or []:
-            contract_snapshot[symbol] = client.contract(symbol)
+            snapshot = client.contract(symbol)
+            contract_snapshot[symbol] = snapshot
+            if symbol in target_parcels:
+                continue
+            parcel_hash = plan_parcel_hashes.get(symbol)
+            if parcel_hash is not None:
+                expected_read_deps[symbol] = parcel_hash
+            elif snapshot is not None:
+                expected_read_deps[symbol] = snapshot["type_hash"]
 
         # 5. isolated worktree + the scripted (or real) edit.
         #
@@ -381,7 +425,14 @@ def run_agent(
             updated_parcels[parcel_id] = match.content_hash
 
         integrate_result = client.integrate(
-            agent_id, branch=agent_id, repo=str(repo), base_commit=base_commit
+            agent_id,
+            branch=agent_id,
+            repo=str(repo),
+            base_commit=base_commit,
+            # WP4.6 (A1): the plan-time read-dependency snapshot built in step 4.
+            # None when this task declared no (foreign) read-deps -- the
+            # integrator's re-check stays opt-in and skipped, exactly as before.
+            expected_read_deps=expected_read_deps or None,
         )
         # Only a LANDED merge makes this agent's branch redundant; see
         # `_cleanup_worktree`. On merge_rejected/needs_rebase the integrator has
