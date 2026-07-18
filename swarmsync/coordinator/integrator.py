@@ -69,7 +69,6 @@ thin shell around this function, not a separate implementation.
 """
 from __future__ import annotations
 
-import json
 import os
 import signal
 import sqlite3
@@ -81,6 +80,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Union
 
+from swarmsync.blackboard import db
 from swarmsync.blackboard.models import Parcel
 from swarmsync.classifier.graph import DepGraph, build_graph
 from swarmsync.classifier.indexer import index_repo
@@ -414,6 +414,10 @@ def integrate(
     if expected_read_deps:
         stale = _check_read_deps(conn, expected_read_deps)
         if stale:
+            # Emitted BEFORE `integrate_started`: no start exists yet, so this
+            # verdict carries no `started_seq` and there is no projection row to
+            # clear. Any needs_rebase added AFTER the start emit must pair its emit
+            # with the projection DELETE (one transaction), like the other verdicts.
             events_mod.emit(
                 conn,
                 "needs_rebase",
@@ -484,16 +488,32 @@ def integrate(
                 run_index(conn, repo)
             except Exception as iexc:  # noqa: BLE001 - see above
                 rollback_error = f"blackboard re-index after rollback failed: {iexc!r}"
-        # `repo` closes this branch's `integrate_started` -- see the note on the
-        # `merged` emit. A rejection is a verdict: trunk is in a state we chose, so
-        # startup reconciliation must not treat it as an orphan and reset it again.
-        payload = {"branch": branch, "into": into, "repo": str(repo), "reason": reason_code}
+        # `started_seq` names the exact `integrate_started` this verdict closes
+        # (adversarial-review P3: matching on repo/branch/into lets a reused branch
+        # name attribute a verdict to an unrelated older start). A rejection is a
+        # verdict: trunk is in a state we chose, so startup reconciliation must not
+        # treat it as an orphan and reset it again -- which is why the
+        # `open_integrations` row is DELETEd here, in the SAME transaction as the
+        # terminal emit: a crash between them could otherwise leave a verdict with a
+        # lingering row (next restart "reconciles" a completed integrate -- the C1
+        # data loss, via the projection) or a deleted row with no verdict (audit gap).
+        payload = {
+            "branch": branch,
+            "into": into,
+            "repo": str(repo),
+            "reason": reason_code,
+            "started_seq": started_seq,
+        }
         payload.update(payload_extra)
         full_reason = reason
         if rollback_error is not None:
             payload["rollback_error"] = rollback_error
             full_reason = f"{reason} (WARNING: trunk rollback also failed: {rollback_error})"
-        events_mod.emit(conn, "merge_rejected", agent_id, payload, ts=now)
+        with db.transaction(conn):
+            events_mod.emit(conn, "merge_rejected", agent_id, payload, ts=now)
+            conn.execute(
+                "DELETE FROM open_integrations WHERE started_seq = ?", (started_seq,)
+            )
         return IntegrateResult(
             status="merge_rejected",
             branch=branch,
@@ -510,22 +530,36 @@ def integrate(
     # BaseException (Ctrl-C, uvicorn shutdown) inside it, left the un-gated merge on
     # trunk with no event, no rollback, and nothing on restart that could even tell it
     # had happened -- silently falsifying "trunk is always test-green" from then on,
-    # permanently. This row is what makes the window a durable fact: it carries the sha
-    # to roll back to, and a start with no terminal event is an orphan that
+    # permanently. This record is what makes the window a durable fact: it carries the
+    # sha to roll back to, and a start with no terminal event is an orphan that
     # `reconcile_orphaned_integrations` resets out at startup.
-    events_mod.emit(
-        conn,
-        "integrate_started",
-        agent_id,
-        {
-            "branch": branch,
-            "into": into,
-            "base_commit": base_commit,
-            "trunk_sha_before": pre_merge_sha,
-            "repo": str(repo),
-        },
-        ts=now,
-    )
+    #
+    # WP3.2 (finding C3): the durable record is BOTH the `integrate_started` event
+    # (audit trail) and an `open_integrations` projection row (what recovery actually
+    # reads, in O(open) instead of an unbounded log replay). They land in ONE
+    # transaction: a crash between them could otherwise commit a start whose orphan
+    # the projection-reading reconciliation can never see (event without row), or a
+    # row naming a start that never happened (row without event).
+    with db.transaction(conn):
+        started_seq = events_mod.emit(
+            conn,
+            "integrate_started",
+            agent_id,
+            {
+                "branch": branch,
+                "into": into,
+                "base_commit": base_commit,
+                "trunk_sha_before": pre_merge_sha,
+                "repo": str(repo),
+            },
+            ts=now,
+        )
+        conn.execute(
+            "INSERT INTO open_integrations "
+            "(started_seq, repo, branch, into_branch, trunk_sha_before, ts) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (started_seq, str(repo), branch, into, pre_merge_sha, now),
+        )
 
     try:
         ok, conflicts = git_ops.merge_branch(repo, branch, into=into)
@@ -663,23 +697,30 @@ def integrate(
         raise
 
     # --- success: the whole atomic block landed. Emit the trail now. --------
-    events_mod.emit(
-        conn,
-        "merged",
-        agent_id,
-        {
-            "branch": branch,
-            "into": into,
-            # `repo` identifies WHICH integrate_started this closes. Without it
-            # reconciliation cannot match a verdict to its start and would treat a
-            # landed merge as an orphan -- resetting real work off trunk, which is the
-            # exact data loss it exists to prevent.
-            "repo": str(repo),
-            "merged_commit": merged_commit,
-            "changed_files": changed,
-        },
-        ts=now,
-    )
+    # The `merged` verdict and the DELETE of the `open_integrations` row are ONE
+    # transaction: a crash between them would either leave a landed merge that the
+    # next restart "reconciles" back off trunk (row without verdict -- the exact
+    # data loss recovery exists to prevent) or a closed projection with no verdict
+    # in the log. `started_seq` names the exact start this closes (P3: never match
+    # verdicts to starts by reused branch names).
+    with db.transaction(conn):
+        events_mod.emit(
+            conn,
+            "merged",
+            agent_id,
+            {
+                "branch": branch,
+                "into": into,
+                "repo": str(repo),
+                "merged_commit": merged_commit,
+                "changed_files": changed,
+                "started_seq": started_seq,
+            },
+            ts=now,
+        )
+        conn.execute(
+            "DELETE FROM open_integrations WHERE started_seq = ?", (started_seq,)
+        )
     for payload in contract_change_payloads:
         events_mod.emit(conn, "contract_change", agent_id, payload, ts=now)
     events_mod.emit(
@@ -702,20 +743,7 @@ def integrate(
     )
 
 
-# --- startup reconciliation (R5) ---------------------------------------------------
-
-# A terminal event for an `integrate_started` -- i.e. the integrate reached a verdict
-# and trunk is in a state it chose. Anything else means we died mid-flight.
-#
-# `integrate_orphaned` is terminal too, and this is finding C1: it is the event
-# reconciliation itself emits once it has rolled an orphan back. If it is NOT counted
-# as terminal, the orphaned `integrate_started` stays "open" forever, so every later
-# restart re-reconciles the SAME orphan -- sees trunk has moved on under legitimately
-# gated merges, and `git reset --hard`s them off trunk. Being terminal makes the
-# rollback idempotent: an orphan is reconciled exactly once.
-_INTEGRATE_TERMINAL_TYPES = frozenset(
-    {"merged", "merge_rejected", "needs_rebase", "integrate_orphaned"}
-)
+# --- startup reconciliation (R5; WP3.2 O(open) projection, finding C3) -------------
 
 
 def reconcile_orphaned_integrations(conn: sqlite3.Connection) -> list[dict]:
@@ -730,9 +758,25 @@ def reconcile_orphaned_integrations(conn: sqlite3.Connection) -> list[dict]:
     restart that could even detect it: "trunk is always test-green" -- the product's
     headline guarantee -- silently false from then on.
 
-    Called at server startup. For each `integrate_started` with no terminal event, this
-    resets `into` back to the `trunk_sha_before` that event recorded and emits
-    `integrate_orphaned`. Returns one dict per orphan reconciled, for the caller to log.
+    Called at server startup, before serving. Reads the `open_integrations`
+    projection -- O(open rows), NOT a replay of the event log. The previous
+    implementation replayed the full log through a fixed 1M-row window (finding C3):
+    heartbeats emit events, so real deployments blow past any fixed window in weeks,
+    at which point recent orphans (at the log's TAIL) were invisible -- a genuinely
+    poisoned trunk was never rolled back -- and, worse, a start whose verdict lay
+    beyond the window looked orphaned, so a legitimately landed merge got reset back
+    to an ancient sha. The projection is maintained transactionally at every emit
+    site in `integrate` (row INSERTed with the start emit, DELETEd with the terminal
+    emit), so at startup -- integrate is serialized in-process, and this runs before
+    any new integrate can begin -- every row present IS an orphan. Idempotency
+    (finding C1) holds structurally: rolling an orphan back DELETEs its row in the
+    same transaction as the `integrate_orphaned` emit, so a second restart finds no
+    row and does nothing.
+
+    NOTE (coupling): there is deliberately NO fallback scan of the event log for
+    DBs created before `open_integrations` existed -- a pre-projection DB could hold
+    open starts only the log knows about. Schema versioning (parallel work package)
+    refuses such old DBs cleanly at startup instead of this module guessing.
 
     Deliberately conservative:
       - Only rolls back when trunk's CURRENT sha differs from `trunk_sha_before` (if it
@@ -741,50 +785,23 @@ def reconcile_orphaned_integrations(conn: sqlite3.Connection) -> list[dict]:
         this process must not stop the server from booting. Each failure is reported in
         the returned record instead.
     """
-    # Open starts are keyed by the start event's OWN `seq`, not (repo, branch, into):
-    # a reused branch name must not let one integrate's verdict close an unrelated
-    # older orphan. A terminal event that carries `started_seq` closes exactly that
-    # start; older events without it fall back to the most recent start sharing their
-    # (repo, branch, into). `integrate_orphaned` (which reconciliation emits below)
-    # always carries `started_seq`, so it closes precisely the orphan it rolled back.
-    started: dict[int, dict] = {}
-    latest_seq_by_key: dict[tuple[str, str, str], int] = {}
-    for event in events_mod.tail(conn, since_seq=0, limit=1_000_000):
-        if event.type not in _INTEGRATE_TERMINAL_TYPES and event.type != "integrate_started":
-            continue
-        try:
-            payload = json.loads(event.payload) if event.payload else {}
-        except (ValueError, TypeError):  # pragma: no cover - defensive
-            continue
-        key = (
-            str(payload.get("repo") or ""),
-            str(payload.get("branch") or ""),
-            str(payload.get("into") or ""),
-        )
-        if event.type == "integrate_started":
-            if event.seq is not None:
-                started[event.seq] = payload
-                latest_seq_by_key[key] = event.seq
-        else:
-            # A verdict (including the `integrate_orphaned` reconciliation emits for an
-            # orphan it already rolled back) closes its start. Match on the start's
-            # `seq` when the event carries it; otherwise close the most recent start
-            # with the same (repo, branch, into).
-            start_seq = payload.get("started_seq")
-            if not isinstance(start_seq, int):
-                start_seq = latest_seq_by_key.get(key)
-            if start_seq is not None:
-                started.pop(start_seq, None)
+    rows = conn.execute(
+        "SELECT started_seq, repo, branch, into_branch, trunk_sha_before, ts "
+        "FROM open_integrations ORDER BY started_seq"
+    ).fetchall()
 
     reconciled: list[dict] = []
-    for start_seq, payload in started.items():
-        repo = str(payload.get("repo") or "")
-        branch = str(payload.get("branch") or "")
-        into = str(payload.get("into") or "")
+    for row in rows:
+        start_seq = row["started_seq"]
+        repo = str(row["repo"] or "")
+        branch = str(row["branch"] or "")
+        into = str(row["into_branch"] or "")
+        sha_before = row["trunk_sha_before"]
         record = {"repo": repo, "branch": branch, "into": into, "action": None, "error": None}
-        sha_before = payload.get("trunk_sha_before")
         if not repo or not into or not sha_before:
-            record["action"] = "skipped: incomplete integrate_started payload"
+            # Defensive only (the schema is NOT NULL and `integrate` always fills
+            # these); mirrors the old behavior: report, emit no verdict, keep the row.
+            record["action"] = "skipped: incomplete open_integrations row"
             reconciled.append(record)
             continue
         try:
@@ -798,16 +815,28 @@ def reconcile_orphaned_integrations(conn: sqlite3.Connection) -> list[dict]:
         except Exception as exc:  # noqa: BLE001 -- must never block startup
             record["error"] = repr(exc)
             record["action"] = "FAILED"
-        events_mod.emit(
-            conn,
-            "integrate_orphaned",
-            None,
-            {
-                **payload,
-                "started_seq": start_seq,
-                "reconciliation": record["action"],
-                "error": record["error"],
-            },
-        )
+        # The orphan verdict and the projection DELETE are ONE transaction (same
+        # invariant as every terminal emit in `integrate`): a crash between them
+        # would either re-reconcile this orphan on the next restart (row without
+        # verdict -- resetting trunk out from under merges landed in between, the
+        # C1 data loss) or silently close it with no audit trail.
+        with db.transaction(conn):
+            events_mod.emit(
+                conn,
+                "integrate_orphaned",
+                None,
+                {
+                    "repo": repo,
+                    "branch": branch,
+                    "into": into,
+                    "trunk_sha_before": sha_before,
+                    "started_seq": start_seq,
+                    "reconciliation": record["action"],
+                    "error": record["error"],
+                },
+            )
+            conn.execute(
+                "DELETE FROM open_integrations WHERE started_seq = ?", (start_seq,)
+            )
         reconciled.append(record)
     return reconciled

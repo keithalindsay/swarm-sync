@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import textwrap
@@ -861,26 +862,14 @@ def test_reconcile_rolls_trunk_back_out_of_an_orphaned_integrate(conn, repo):
     run_index(conn, r)
     pre = git_ops.current_commit(r, ref="integration")
 
-    # Hand-build the orphan: intent recorded, merge landed, process died.
+    # Hand-build the orphan: intent recorded (event + projection row, exactly what
+    # integrate() writes atomically before merging), merge landed, process died.
     worktree = git_ops.add_worktree(r, "agent-dead", base)
     (worktree / "mod_a.py").write_text(
         "def helper(x):\n    return 'never gated'\n", encoding="utf-8"
     )
     git_ops.commit_all(worktree, "agent-dead: un-gated edit")
-    events_mod.emit(
-        conn,
-        "integrate_started",
-        "agent-dead",
-        {
-            "branch": "agent-dead",
-            "into": "integration",
-            "base_commit": base,
-            "trunk_sha_before": pre,
-            "repo": str(r),
-        },
-    )
-    ok, _conflicts = git_ops.merge_branch(r, "agent-dead", into="integration")
-    assert ok
+    _leave_orphan_behind(conn, r, "agent-dead", "integration", base, pre)
     assert git_ops.current_commit(r, ref="integration") != pre
     assert "never gated" in (r / "mod_a.py").read_text(encoding="utf-8")
 
@@ -909,27 +898,15 @@ def test_reconcile_does_not_destroy_landed_merges_on_a_second_restart(conn, repo
     run_index(conn, r)
     pre = git_ops.current_commit(r, ref="integration")
 
-    # --- step 1: an integrate is SIGKILLed mid-gate: intent recorded, merge landed,
-    # no terminal event.
+    # --- step 1: an integrate is SIGKILLed mid-gate: intent recorded (event +
+    # projection row, as integrate() writes atomically), merge landed, no terminal
+    # event.
     worktree = git_ops.add_worktree(r, "agent-dead", base)
     (worktree / "mod_a.py").write_text(
         "def helper(x):\n    return 'never gated'\n", encoding="utf-8"
     )
     git_ops.commit_all(worktree, "agent-dead: un-gated edit")
-    events_mod.emit(
-        conn,
-        "integrate_started",
-        "agent-dead",
-        {
-            "branch": "agent-dead",
-            "into": "integration",
-            "base_commit": base,
-            "trunk_sha_before": pre,
-            "repo": str(r),
-        },
-    )
-    ok, _conflicts = git_ops.merge_branch(r, "agent-dead", into="integration")
-    assert ok
+    _leave_orphan_behind(conn, r, "agent-dead", "integration", base, pre)
     assert git_ops.current_commit(r, ref="integration") != pre
 
     # --- step 2: first restart. Reconciliation correctly rolls trunk back to `pre`.
@@ -1004,18 +981,7 @@ def test_reconcile_is_a_noop_when_the_crash_beat_the_merge(conn, repo):
     run_index(conn, r)
     pre = git_ops.current_commit(r, ref="integration")
 
-    events_mod.emit(
-        conn,
-        "integrate_started",
-        "agent-early",
-        {
-            "branch": "agent-early",
-            "into": "integration",
-            "base_commit": base,
-            "trunk_sha_before": pre,
-            "repo": str(r),
-        },
-    )
+    _record_start(conn, r, "agent-early", "integration", base, pre)
 
     reconciled = integrator.reconcile_orphaned_integrations(conn)
 
@@ -1026,16 +992,8 @@ def test_reconcile_is_a_noop_when_the_crash_beat_the_merge(conn, repo):
 
 def test_reconcile_never_raises_on_a_repo_that_is_gone(conn, tmp_path):
     """A vanished/moved repo must not stop the server booting."""
-    events_mod.emit(
-        conn,
-        "integrate_started",
-        "agent-x",
-        {
-            "branch": "b",
-            "into": "integration",
-            "trunk_sha_before": "0" * 40,
-            "repo": str(tmp_path / "does-not-exist"),
-        },
+    _record_start(
+        conn, tmp_path / "does-not-exist", "b", "integration", None, "0" * 40
     )
     reconciled = integrator.reconcile_orphaned_integrations(conn)
     assert len(reconciled) == 1
@@ -1163,3 +1121,281 @@ def test_keyboard_interrupt_mid_gate_rolls_trunk_back_and_reraises(conn, repo, m
         "trunk still carries the un-gated merge after the interrupt was raised mid-gate"
     )
     assert "un-gated, interrupted" not in (r / "mod_a.py").read_text(encoding="utf-8")
+
+
+# --- WP3.2: O(open) crash-recovery projection (finding C3) -------------------------
+
+
+def _open_rows(conn):
+    return conn.execute(
+        "SELECT * FROM open_integrations ORDER BY started_seq"
+    ).fetchall()
+
+
+def _record_start(conn, repo, branch, into, base, pre):
+    """Write the durable start record exactly as `integrate()` does: the
+    `integrate_started` event AND its `open_integrations` projection row, in one
+    transaction."""
+    with db.transaction(conn):
+        seq = events_mod.emit(
+            conn,
+            "integrate_started",
+            branch,
+            {
+                "branch": branch,
+                "into": into,
+                "base_commit": base,
+                "trunk_sha_before": pre,
+                "repo": str(repo),
+            },
+        )
+        conn.execute(
+            "INSERT INTO open_integrations "
+            "(started_seq, repo, branch, into_branch, trunk_sha_before, ts) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (seq, str(repo), branch, into, pre, time.time()),
+        )
+    return seq
+
+
+def _leave_orphan_behind(conn, repo, branch, into, base, pre):
+    """Simulate exactly what SIGKILL/OOM leaves behind mid-integrate: the durable
+    start record (`_record_start`) plus the un-gated merge on trunk, and NO
+    terminal event."""
+    seq = _record_start(conn, repo, branch, into, base, pre)
+    ok, _conflicts = git_ops.merge_branch(repo, branch, into=into)
+    assert ok
+    return seq
+
+
+def test_reconcile_is_not_blinded_by_a_bounded_event_scan(conn, repo, monkeypatch):
+    """Finding C3 (P1): recovery must not depend on a bounded replay of the FULL
+    event log.
+
+    The pre-projection implementation replayed the log oldest-first through a fixed
+    window (`tail(conn, since_seq=0, limit=1_000_000)`). Heartbeats emit events, so
+    real deployments blow past any fixed window in weeks -- and then a completed
+    integrate whose VERDICT lies beyond the window looks orphaned: reconciliation
+    sees the `integrate_started`, never sees the `merged`, and `git reset --hard`s
+    trunk back to the pre-merge sha, destroying a legitimately landed, gated merge.
+
+    Reproduced here without synthesizing a million rows: land a real gated merge,
+    then clamp the scan window so it ends exactly AT the start event -- the verdict
+    is beyond it, exactly as if weeks of heartbeats had pushed it there. The
+    projection implementation never replays the log at all, so the clamp is inert
+    and reconciliation correctly finds nothing open.
+    """
+    r, base = repo
+    run_index(conn, r)
+
+    wt = git_ops.add_worktree(r, "agent-hist", base)
+    (wt / "mod_a.py").write_text(
+        "def helper(x):\n    return x + 7\n", encoding="utf-8"
+    )
+    git_ops.commit_all(wt, "agent-hist: edit")
+    result = integrator.integrate(
+        conn, r, "agent-hist", base_commit=base, agent_id="agent-hist"
+    )
+    assert result.status == "merged"
+    landed = git_ops.current_commit(r, ref="integration")
+
+    start_seq = next(
+        e.seq
+        for e in events_mod.tail(conn, since_seq=0)
+        if e.type == "integrate_started"
+    )
+    real_tail = events_mod.tail
+
+    def clamped_tail(conn_, since_seq=0, limit=1000):
+        return real_tail(conn_, since_seq=since_seq, limit=min(limit, start_seq))
+
+    monkeypatch.setattr(integrator.events_mod, "tail", clamped_tail)
+
+    reconciled = integrator.reconcile_orphaned_integrations(conn)
+
+    assert reconciled == [], (
+        "a COMPLETED merge whose verdict lay beyond the event-scan window was "
+        "treated as an orphan"
+    )
+    assert git_ops.current_commit(r, ref="integration") == landed, (
+        "reconciliation reset trunk back out from under a landed, gated merge "
+        "because its verdict event lay beyond the scan window"
+    )
+    assert "x + 7" in (r / "mod_a.py").read_text(encoding="utf-8")
+
+
+def test_reconcile_reads_the_projection_not_the_event_log(conn, repo, monkeypatch):
+    """O(open): reconciliation must work off the `open_integrations` projection and
+    never replay the event log -- the log grows without bound (heartbeats), and any
+    fixed replay window is the blindness `test_reconcile_is_not_blinded_by_a_bounded_
+    event_scan` pins. A real orphan must still be found and rolled back with the log
+    entirely unavailable."""
+    r, base = repo
+    run_index(conn, r)
+    pre = git_ops.current_commit(r, ref="integration")
+
+    worktree = git_ops.add_worktree(r, "agent-dead", base)
+    (worktree / "mod_a.py").write_text(
+        "def helper(x):\n    return 'never gated'\n", encoding="utf-8"
+    )
+    git_ops.commit_all(worktree, "agent-dead: un-gated edit")
+    _leave_orphan_behind(conn, r, "agent-dead", "integration", base, pre)
+    assert git_ops.current_commit(r, ref="integration") != pre
+
+    def no_tail(*_a, **_kw):
+        raise AssertionError(
+            "reconciliation replayed the event log instead of reading the projection"
+        )
+
+    monkeypatch.setattr(integrator.events_mod, "tail", no_tail)
+
+    reconciled = integrator.reconcile_orphaned_integrations(conn)
+
+    assert len(reconciled) == 1
+    assert git_ops.current_commit(r, ref="integration") == pre
+    assert "never gated" not in (r / "mod_a.py").read_text(encoding="utf-8")
+
+
+def test_open_integration_row_lives_exactly_as_long_as_the_ungated_window(conn, repo):
+    """The projection row must exist during the gate (it IS the durable crash
+    record) and be gone after every verdict -- merged and rejected alike. A row
+    that survives a verdict would make the next restart 'reconcile' a completed
+    integrate: the C1 data loss, reintroduced through the projection."""
+    r, base = repo
+    run_index(conn, r)
+
+    seen_mid_gate: list = []
+    real_gate = integrator.run_impact_tests
+
+    def spying_gate(*a, **kw):
+        seen_mid_gate.extend(_open_rows(conn))
+        return real_gate(*a, **kw)
+
+    # --- merged verdict ---
+    wt = git_ops.add_worktree(r, "agent-ok", base)
+    (wt / "mod_a.py").write_text(
+        "def helper(x):\n    return x + 3\n", encoding="utf-8"
+    )
+    git_ops.commit_all(wt, "agent-ok: edit")
+    try:
+        integrator.run_impact_tests = spying_gate
+        result = integrator.integrate(
+            conn, r, "agent-ok", base_commit=base, agent_id="agent-ok"
+        )
+    finally:
+        integrator.run_impact_tests = real_gate
+    assert result.status == "merged"
+    assert len(seen_mid_gate) == 1, (
+        "no open_integrations row existed during the un-gated window -- a SIGKILL "
+        "there would be invisible to O(open) reconciliation"
+    )
+    assert _open_rows(conn) == [], (
+        "the projection row survived a `merged` verdict"
+    )
+
+    # --- rejected verdict (red gate) ---
+    wt_c = git_ops.add_worktree(r, "agent-red", base)
+    (wt_c / "mod_c.py").write_text(
+        "def broken():\n    raise RuntimeError('boom')\n", encoding="utf-8"
+    )
+    git_ops.commit_all(wt_c, "agent-red: break the test")
+    result = integrator.integrate(
+        conn, r, "agent-red", base_commit=base, agent_id="agent-red"
+    )
+    assert result.status == "merge_rejected"
+    assert _open_rows(conn) == [], (
+        "the projection row survived a `merge_rejected` verdict"
+    )
+
+
+def test_verdict_events_carry_the_started_seq_that_they_close(conn, repo):
+    """Adversarial-review P3: verdicts must name the exact start they close by its
+    `seq`, not leave consumers to match on (repo, branch, into) -- a reused branch
+    name would let one integrate's verdict be attributed to an unrelated older
+    start by any future event consumer."""
+    r, base = repo
+    run_index(conn, r)
+
+    wt = git_ops.add_worktree(r, "agent-a", base)
+    (wt / "mod_a.py").write_text(
+        "def helper(x):\n    return x + 4\n", encoding="utf-8"
+    )
+    git_ops.commit_all(wt, "agent-a: edit")
+    assert integrator.integrate(
+        conn, r, "agent-a", base_commit=base, agent_id="agent-a"
+    ).status == "merged"
+
+    wt_c = git_ops.add_worktree(r, "agent-red", base)
+    (wt_c / "mod_c.py").write_text(
+        "def broken():\n    raise RuntimeError('boom')\n", encoding="utf-8"
+    )
+    git_ops.commit_all(wt_c, "agent-red: break the test")
+    assert integrator.integrate(
+        conn, r, "agent-red", base_commit=base, agent_id="agent-red"
+    ).status == "merge_rejected"
+
+    events = events_mod.tail(conn, since_seq=0)
+    starts = {
+        json.loads(e.payload)["branch"]: e.seq
+        for e in events
+        if e.type == "integrate_started"
+    }
+    merged = next(e for e in events if e.type == "merged")
+    rejected = next(e for e in events if e.type == "merge_rejected")
+    assert json.loads(merged.payload)["started_seq"] == starts["agent-a"]
+    assert json.loads(rejected.payload)["started_seq"] == starts["agent-red"]
+
+
+def test_start_emit_and_projection_row_are_atomic(conn, repo):
+    """A crash BETWEEN the `integrate_started` emit and the projection INSERT must
+    be impossible: both land in one transaction or neither does. If the pairing
+    were not atomic, a death in that gap would leave a start event whose orphan the
+    O(open) reconciliation (which reads only the projection) can never see -- the
+    exact silent-poisoned-trunk failure recovery exists to prevent."""
+    r, base = repo
+    run_index(conn, r)
+    pre = git_ops.current_commit(r, ref="integration")
+
+    wt = git_ops.add_worktree(r, "agent-a", base)
+    (wt / "mod_a.py").write_text(
+        "def helper(x):\n    return x + 9\n", encoding="utf-8"
+    )
+    git_ops.commit_all(wt, "agent-a: edit")
+
+    class _FailsProjectionInsert:
+        """Proxy conn that dies exactly between the emit and the projection write."""
+
+        def __init__(self, real):
+            self._real = real
+
+        def execute(self, sql, *args):
+            if "INSERT INTO open_integrations" in sql:
+                raise sqlite3.OperationalError(
+                    "simulated crash between emit and projection write"
+                )
+            return self._real.execute(sql, *args)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    with pytest.raises(sqlite3.OperationalError):
+        integrator.integrate(
+            conn=_FailsProjectionInsert(conn),
+            repo=r,
+            branch="agent-a",
+            base_commit=base,
+            agent_id="agent-a",
+        )
+
+    # Atomicity: the start emit must have been rolled back WITH the failed
+    # projection write -- an event with no row is a start no restart can see.
+    starts = [
+        e for e in events_mod.tail(conn, since_seq=0) if e.type == "integrate_started"
+    ]
+    assert starts == [], (
+        "integrate_started was committed without its projection row: the emit and "
+        "the INSERT are not atomic, and a crash between them orphans trunk invisibly"
+    )
+    assert _open_rows(conn) == []
+    # The failure happened before the merge -- trunk must be untouched.
+    assert git_ops.current_commit(r, ref="integration") == pre
