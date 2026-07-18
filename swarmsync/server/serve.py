@@ -12,10 +12,52 @@ from __future__ import annotations
 
 import argparse
 import os
+import sqlite3
+import time
 
 import uvicorn
 
 from swarmsync.server.app import MultiRootError, check_single_root, create_app
+from swarmsync.server.leases import _NOW_SQL
+
+# C13: how far SQLite's clock and Python's clock may drift before we refuse to serve.
+# A couple of seconds is generous for any real host; the failure mode we are guarding
+# is a badly wrong clock (VM resumed, unsynced container, TZ-as-offset misconfig), not
+# sub-second jitter.
+CLOCK_SKEW_TOLERANCE_SECONDS = 2.0
+
+
+def assert_clock_agreement() -> None:
+    """Refuse to start if SQLite's clock disagrees with Python's (C13).
+
+    The heartbeat liveness predicate (`server.leases.heartbeat`) is evaluated on
+    SQLite's OWN clock -- `julianday('now')`, via `_NOW_SQL` -- atomically with the
+    SET, precisely so a slow/preempted statement can't revive a lapsed lease. But
+    `acquire` and the reaper stamp/compare `ttl_expires_at` using Python's
+    `time.time()`. Those two clocks are an UNSTATED invariant: if they disagree, a
+    lease can look alive to one path and expired to the other, reopening the exact
+    double-lease this system exists to prevent -- and nothing else checks it. So
+    check it once, loudly, at startup, and name the problem if it fails.
+    """
+    conn = sqlite3.connect(":memory:")
+    try:
+        py_before = time.time()
+        sqlite_now = conn.execute(f"SELECT {_NOW_SQL}").fetchone()[0]
+        py_after = time.time()
+    finally:
+        conn.close()
+
+    py_mid = (py_before + py_after) / 2.0
+    skew = abs(float(sqlite_now) - py_mid)
+    if skew > CLOCK_SKEW_TOLERANCE_SECONDS:
+        raise SystemExit(
+            "swarm-sync: refusing to start -- SQLite's clock and Python's clock "
+            f"disagree by {skew:.1f}s (tolerance {CLOCK_SKEW_TOLERANCE_SECONDS}s). "
+            "Lease liveness is checked on SQLite's julianday('now') while leases are "
+            "stamped from Python time.time(); a mismatch this large can make a lease "
+            "look alive to one path and expired to the other (the C13 double-lease). "
+            "Fix the host/SQLite clock before serving."
+        )
 
 
 def main() -> None:
@@ -32,6 +74,11 @@ def main() -> None:
         "roots would collide on the same ids). Run a second server for a second repo.",
     )
     args = parser.parse_args()
+
+    # C13: verify the cross-clock invariant before doing anything else. A wrong host
+    # clock silently corrupts lease liveness, so fail here with a readable message
+    # rather than serving and letting a double-lease slip through later.
+    assert_clock_agreement()
 
     if args.root:
         os.environ["SWARMSYNC_ROOTS"] = args.root
