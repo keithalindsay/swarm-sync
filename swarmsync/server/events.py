@@ -1,4 +1,10 @@
-"""Append-only event log = pheromone trail + recovery source of truth. DESIGN.md §4.1, §4.3.
+"""Append-only event log = pheromone trail + audit trail. DESIGN.md §4.1, §4.3.
+
+Honesty note (C7/WP3.4): the events table is an AUDIT log, not a replay source of
+truth. State writes and their event emits are separate autocommit statements (a
+crash can separate them), several mutations legitimately emit nothing (run_index,
+_ensure_parcel, pheromone decay), and crash recovery reads the `open_integrations`
+projection (WP3.2), never this log. The SQLite tables are the state of record.
 
 Built in Unit U6.
 
@@ -9,9 +15,9 @@ emit(conn, type_, agent_id=None, payload=None, ts=None) -> seq
     inline note). Payload is JSON-serialized. `type_` must be one of `blackboard.models.EventType`'s
     literal values -- catches typos the same way `leases.acquire` rejects an
     unrecognized lease mode. This is the single write path every other module
-    (leases, agent runner, coordinator) should funnel through so `events` really
-    is the one source of truth for replay (DESIGN §4.1): `server/leases.py`'s
-    own private `_emit` has been swapped to call this.
+    (leases, agent runner, coordinator) should funnel through so the audit log
+    stays complete and uniformly typed: `server/leases.py`'s own private `_emit`
+    has been swapped to call this.
 
 tail(conn, since_seq=0, limit=1000) -> list[Event]
     Ordered (`seq` ascending) events with seq > since_seq, capped at `limit`.

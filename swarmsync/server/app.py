@@ -256,8 +256,10 @@ def check_single_root() -> str:
     Multi-root is therefore not a supported mode -- it is data corruption with a
     plural-looking config. `SWARMSYNC_ROOTS` is an allow-list bounding which paths the
     one coordinated repo may touch, not a way to coordinate several. Fixing it properly
-    means putting the root in the parcel identity (a schema change, and there is no
-    migration system), so until someone wants that, refusing to start is the honest
+    means putting the root in the parcel identity -- a schema change, and the migration
+    policy is refuse+rotate (`db.SCHEMA_VERSION`, WP3.4: a version-bumped DB refuses to
+    open with `--fresh` named as the remedy; there is deliberately no in-place migration
+    framework) -- so until someone wants that, refusing to start is the honest
     behaviour: a config that cannot work should not appear to.
 
     Returns the single managed root. Raises MultiRootError otherwise.
@@ -329,7 +331,25 @@ def create_app(
         # so it is evaluated when the server actually starts, against the environment
         # it will actually run under -- and so tests/tools that build an app object
         # without serving it are unaffected. See `check_single_root`.
-        check_single_root()
+        managed_root = check_single_root()
+
+        # U8/WP3.4: bind this DB to its repo. Parcel ids are root-relative, so
+        # reusing a DB file against a DIFFERENT root silently mixes two repos'
+        # parcel maps (rows overwrite, leases conflate). First boot stores the
+        # root in `meta`; a later boot with another root refuses to start --
+        # `ManagedRootMismatchError` names both roots and the remedies
+        # (`swarmsync-serve --fresh`, or point the server back at the original).
+        # Same loud-refusal posture as MultiRootError above. Runs on its OWN
+        # short-lived connection, not `app.state.conn`: the bind gates the DB
+        # FILE, and pre-existing tests legitimately re-enter one app object
+        # whose previous lifespan teardown already closed the shared handle
+        # (reconciliation below tolerates that; a startup gate must too --
+        # loudly for a wrong root, never for a recycled app object).
+        bind_conn = db.connect(db_path)
+        try:
+            db.bind_managed_root(bind_conn, managed_root)
+        finally:
+            bind_conn.close()
 
         # BEFORE serving anything: roll trunk back out of any integrate that died
         # mid-flight. `integrate` merges to trunk before it knows the verdict, and a

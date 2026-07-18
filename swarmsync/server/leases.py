@@ -63,8 +63,9 @@ release(conn, lease_id, agent_id) -> bool
 
 Event emission: this module emits `lease_granted` / `lease_denied` / `heartbeat` /
 `released` events via `server.events.emit` (U6) -- the shared, single write path
-into the `events` table so it really is the one source of truth for replay
-(DESIGN §4.1).
+into the `events` table so the audit log stays complete and uniformly typed. (The
+log is audit/observability, not a replay source of truth -- the lease TABLE is the
+state of record; see events.py's honesty note.)
 
 CORRECTNESS TEST (U5 done-when): two acquire() calls for the same parcel in write
 mode must yield exactly one granted and one denied; a read+read pair must both

@@ -73,6 +73,11 @@ EventType = Literal[
     # that would otherwise never change again.
     "parcel_retired",
     "contract_retired",
+    # WP3.1 (S2): one marker per non-empty compaction pass, carrying the pruned
+    # count + seq range (`server.events.compact_events`). Registered here so the
+    # maintenance row is a first-class citizen of the log; `GET /events` keeps its
+    # widened `EventOut` anyway as defense against future registry-external rows.
+    "events_compacted",
 ]
 
 
@@ -151,7 +156,10 @@ class Intent(BaseModel):
 
 
 class Event(BaseModel):
-    """One row of the append-only pheromone/audit log. Source of truth for replay."""
+    """One row of the append-only pheromone/audit log. Audit and observability --
+    NOT a replay source of truth: the SQLite tables are the state of record, and
+    crash recovery reads the `open_integrations` projection (see events.py's
+    honesty note and DESIGN §4.1)."""
 
     model_config = ConfigDict(from_attributes=True)
 
