@@ -254,3 +254,13 @@ class IntegrateBody(BaseModel):
     repo: str  # filesystem path to the git repo `branch` lives in (U10 needs it to merge)
     base_commit: Optional[str] = None
     into: str = "integration"
+    # WP4.6 (A1): the submitting agent's plan-time read-dependency snapshot,
+    # `{parcel_or_contract_id: expected_hash}`, forwarded verbatim to
+    # `coordinator.integrator.integrate(expected_read_deps=...)` (DESIGN §5.5).
+    # The integrator compares each id against the blackboard's CURRENT
+    # `parcels.content_hash` (parcels are checked first) or, for an id with no
+    # parcels row, `contracts.type_hash`; any mismatch means a read-dependency
+    # shifted between plan and submit -> the verdict is `needs_rebase` and NO
+    # merge is attempted. Optional and opt-in: omitted/None skips the check
+    # entirely (every pre-WP4.6 caller's wire behavior, unchanged).
+    expected_read_deps: Optional[dict[str, str]] = None

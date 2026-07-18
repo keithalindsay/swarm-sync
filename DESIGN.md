@@ -322,8 +322,9 @@ exactly the "lying blackboard" case §6 rejects.
 
 **The weaker guarantee this implies:** there is no proactive "mark dependent parcels `stale`" step —
 dependents are not pushed a notice at the moment the change is decided. A dependent only learns of the
-break by observing the `contract_change` event on its own (polling `GET /events`, or by opting into the
-integrator's `expected_read_deps` optimistic re-check at its *own* integrate time, §5.5). Between the
+break by observing the `contract_change` event on its own (polling `GET /events`, or via the
+integrator's `expected_read_deps` optimistic re-check at its *own* integrate time, §5.5 — the agent
+runner submits its plan-time snapshot automatically since WP4.6). Between the
 change landing on trunk and a dependent noticing it, that dependent's in-flight work is silently
 building against a stale signature; the test gate (§5.4) is the backstop that eventually catches a
 resulting break, not this mechanism. Test case #3 demonstrates the happy path (a dependent that does
@@ -340,8 +341,15 @@ Merges are serialized through one integrator (`coordinator/integrator.py`). For 
    `merge_rejected` with logs, leave trunk untouched, bounce the branch back to its agent.
 
 ### 5.5 Optimistic re-check
-At integrate time the integrator re-verifies the `content_hash`/`contract_hash` of the branch's declared
-read-dependencies. A mismatch means a dependency shifted mid-work → forced rebase before merge.
+At integrate time the integrator re-verifies the branch's declared read-dependencies against the
+blackboard's *current* state. Wired end-to-end since WP4.6 (A1): the agent runner snapshots each
+read-dependency's hash at plan time (`parcels.content_hash` when the id has a parcel row — contract
+symbols share the parcel id namespace, and the parcel row wins the lookup — else the contract's
+`type_hash`) and submits it as `IntegrateBody.expected_read_deps` on `POST /integrate`;
+`integrate()` compares each id against the same columns before touching trunk. Any mismatch means a
+dependency shifted mid-work → the verdict is `needs_rebase` (event emitted, no merge attempted,
+branch preserved/parked) and the work bounces back to the agent. The check is opt-in per submit:
+a body without `expected_read_deps` (or a task with no foreign read-deps) skips it entirely.
 
 ## 6. Failure handling / graceful degradation
 

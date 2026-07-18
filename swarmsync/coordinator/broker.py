@@ -40,7 +40,8 @@ group_schedulable(conn, tasks, ...) -> list[list[Task]]
   each wave is a maximal set of mutually co-schedulable tasks. This is what
   turns the pairwise relation into an actual schedule.
 
-run(conn, repo, tasks, client, n_agents=4, mode="file") -> dict[task_id, AgentResult]
+run(conn, repo, tasks, client, n_agents=4, mode="file", db_path=None)
+    -> dict[task_id, AgentResult]
   Dispatch every task to completion: partition into waves, run each wave's
   tasks concurrently (bounded by `n_agents`), retry a task that comes back
   `lease_denied` (contention with a still-active holder, OR the task's
@@ -89,15 +90,16 @@ Design notes (this unit's own decisions):
   genuinely parallel across a wave -- each agent's worktree is its own
   isolated directory (DESIGN §5.1) -- only the shared-trunk merge step
   serializes, which is exactly the invariant DESIGN §5.4 needs.
-- **`blackboard/db.py` gained `PRAGMA busy_timeout=5000`** as part of this
-  unit (a one-line addition, same shape as U7's `check_same_thread=False`
-  fix): U12 is the first unit to genuinely dispatch concurrent writers
-  against the one shared connection, and `sqlite3.threadsafety == 3`
-  (SQLite compiled "serialized") on this host makes that safe in principle,
-  but a losing writer's default behavior on a lock conflict is to raise
-  immediately rather than wait -- a real risk once tasks truly run in
-  parallel threads. `busy_timeout` makes a loser wait instead of erroring;
-  harmless to every earlier unit's (single-threaded) tests.
+- **Per-thread connections (WP4.6, finding A7):** `run(db_path=...)` gives
+  every worker task its OWN `db.connect(db_path)` connection, opened when the
+  task starts and closed when it finishes -- the same per-actor connection
+  discipline the server itself adopted in S4 (per-request `get_conn`, a
+  dedicated reaper connection). When `db_path` is omitted, every worker
+  shares the single caller-supplied `conn` -- the documented FALLBACK for
+  direct-conn callers (SQLite's serialized mode plus `db.py`'s
+  `busy_timeout=5000` keep that safe, as it always was), not the preferred
+  mode. `run` itself (wave planning, `load_scheduling_graph`) always uses the
+  caller's `conn` on the calling thread either way.
 - **Read-dependencies are fetched, not leased.** DESIGN's prose for
   `resolve_task` says "read-deps -> read-leases," but `agent.runner.
   run_agent` (U9, already built+tested) only ever takes `read_contracts` as
@@ -127,6 +129,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Union
 
 from swarmsync.agent.runner import AgentResult, run_agent
+from swarmsync.blackboard import db
 from swarmsync.blackboard.models import Parcel
 from swarmsync.blackboard.parcel_id import module_id as _module_id
 from swarmsync.classifier.graph import (
@@ -478,6 +481,16 @@ def _run_task_contained(
     return result
 
 
+def _open_task_conn(db_path: StrPath) -> sqlite3.Connection:
+    """One fresh blackboard connection for ONE worker task (WP4.6, A7).
+
+    A seam rather than an inline `db.connect` call so tests can instrument it
+    (count/collect the per-worker connections) without also intercepting every
+    other `db.connect` in the process (the server's per-request `get_conn`
+    uses the same module function)."""
+    return db.connect(db_path)
+
+
 def run(
     conn: sqlite3.Connection,
     repo: StrPath,
@@ -487,6 +500,7 @@ def run(
     mode: str = "file",
     contract_aware: bool = True,
     retry_backoff: float = DEFAULT_RETRY_BACKOFF,
+    db_path: Optional[StrPath] = None,
 ) -> dict[str, AgentResult]:
     """Drive every task in `tasks` to completion (DESIGN §5, §6).
 
@@ -496,6 +510,15 @@ def run(
        before the next one starts.
     3. Merges are serialized regardless of wave concurrency -- see
        `_SerializingIntegrateClient`.
+
+    `db_path` (WP4.6, A7): when given, each worker task runs on its OWN
+    `db.connect(db_path)` connection (opened at task start, closed in a
+    `finally` when the task's attempts finish) instead of every thread sharing
+    `conn` -- the same per-actor connection model the server uses per request.
+    `conn` is still required and still used for everything on the CALLING
+    thread (wave partitioning, the scheduling graph). Omitting `db_path` keeps
+    the pre-WP4.6 single-shared-connection behavior as the documented fallback
+    for callers that only hold a Connection.
 
     Returns `{task_id: AgentResult}` for every task in `tasks`, keyed by
     `task.task_id` (its LAST attempt's result if it needed retries). A task
@@ -518,23 +541,28 @@ def run(
     waves = group_schedulable(conn, tasks, mode=mode, graph=graph, frozen_ids=frozen_ids)
     serial_client = _SerializingIntegrateClient(client, threading.Lock())
 
+    def _dispatch(task: Task) -> AgentResult:
+        """Run one task on a worker thread. In `db_path` mode the whole retry
+        loop for this task runs on its own fresh connection, closed here no
+        matter how the attempts end (A7); without `db_path`, the caller's
+        shared `conn` is used -- the documented direct-conn fallback."""
+        if db_path is None:
+            return _run_task_contained(
+                conn, repo, serial_client, task, mode, retry_backoff, frozen_ids
+            )
+        task_conn = _open_task_conn(db_path)
+        try:
+            return _run_task_contained(
+                task_conn, repo, serial_client, task, mode, retry_backoff, frozen_ids
+            )
+        finally:
+            task_conn.close()
+
     results: dict[str, AgentResult] = {}
     for wave in waves:
         workers = max(1, min(n_agents, len(wave)))
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {
-                pool.submit(
-                    _run_task_contained,
-                    conn,
-                    repo,
-                    serial_client,
-                    task,
-                    mode,
-                    retry_backoff,
-                    frozen_ids,
-                ): task
-                for task in wave
-            }
+            futures = {pool.submit(_dispatch, task): task for task in wave}
             for future, task in futures.items():
                 # C11/WP3.6: a per-task failure must never abort the run --
                 # `_run_task_contained` absorbs Exceptions, and this catch is the
