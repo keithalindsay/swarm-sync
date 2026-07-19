@@ -8,6 +8,8 @@ tested separately for its parser and its unreachable-server path.
 from __future__ import annotations
 
 import io
+import json
+import subprocess
 
 import pytest
 from fastapi.testclient import TestClient
@@ -160,3 +162,130 @@ def test_main_reports_an_unreachable_server_without_a_traceback(capsys):
     err = capsys.readouterr().err
     assert "cannot reach the blackboard" in err
     assert "http://127.0.0.1:9" in err
+
+
+# --- WP5.2: init-hooks + doctor ----------------------------------------------------
+
+
+def _dead_client():
+    """A client pointed at a refusing port -- for fs-only commands and for
+    exercising doctor's server-unreachable branch."""
+    return BlackboardClient("http://127.0.0.1:9", timeout=1)
+
+
+@pytest.fixture()
+def git_repo(tmp_path, monkeypatch):
+    """A fresh git repo as cwd, with HOME pointed at a clean dir (so the global
+    settings.json probe can't see the developer's real ~/.claude), and no
+    activation env leaking in."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("SWARMSYNC_ACTIVE", raising=False)
+    monkeypatch.chdir(repo)
+    return repo
+
+
+def _cli(argv, client=None, cwd_out=None):
+    args = cli._build_parser().parse_args(argv)
+    out = io.StringIO()
+    code = cli.run(args, client or _dead_client(), out)
+    return code, out.getvalue()
+
+
+def _check(text, label):
+    """The '[ok  ]'/'[FAIL]' status doctor printed for `label`, or None."""
+    for line in text.splitlines():
+        if f"] {label}:" in line:
+            return "ok" if line.lstrip().startswith("[ok") else "FAIL"
+    return None
+
+
+def test_init_hooks_writes_all_four_events_and_the_marker(git_repo):
+    code, _ = _cli(["init-hooks"])
+    assert code == 0
+
+    settings = json.loads((git_repo / ".claude" / "settings.json").read_text())
+    hooks = settings["hooks"]
+    assert set(hooks) == {"PreToolUse", "PostToolUse", "SubagentStop", "SessionStart"}
+    # exactly one swarm-sync entry per event, and the adapter subcommands are wired
+    for event in hooks:
+        assert sum(cli._is_swarmsync_entry(e) for e in hooks[event]) == 1
+    commands = [h["command"] for e in hooks["PreToolUse"] for h in e["hooks"]]
+    assert any(c.endswith("precheck") for c in commands)
+    assert (git_repo / ".swarmsync-active").exists()  # coordination turned on
+
+
+def test_init_hooks_is_idempotent(git_repo):
+    _cli(["init-hooks"])
+    _cli(["init-hooks"])  # a second run must not duplicate
+
+    hooks = json.loads((git_repo / ".claude" / "settings.json").read_text())["hooks"]
+    for event in hooks:
+        assert sum(cli._is_swarmsync_entry(e) for e in hooks[event]) == 1
+
+
+def test_init_hooks_preserves_foreign_hooks_and_other_settings(git_repo):
+    claude = git_repo / ".claude"
+    claude.mkdir()
+    (claude / "settings.json").write_text(
+        json.dumps(
+            {
+                "model": "claude-opus-4-8",
+                "hooks": {
+                    "PreToolUse": [
+                        {
+                            "matcher": "Bash",
+                            "hooks": [{"type": "command", "command": "/usr/bin/my-linter"}],
+                        }
+                    ]
+                },
+            }
+        )
+    )
+
+    _cli(["init-hooks"])
+
+    settings = json.loads((claude / "settings.json").read_text())
+    assert settings["model"] == "claude-opus-4-8"  # untouched
+    pre = settings["hooks"]["PreToolUse"]
+    assert any("my-linter" in h["command"] for e in pre for h in e["hooks"])  # foreign kept
+    assert sum(cli._is_swarmsync_entry(e) for e in pre) == 1  # ours added
+
+
+def test_init_hooks_dry_run_touches_nothing(git_repo):
+    code, text = _cli(["init-hooks", "--dry-run"])
+    assert code == 0
+    assert "dry-run" in text
+    assert not (git_repo / ".claude" / "settings.json").exists()
+    assert not (git_repo / ".swarmsync-active").exists()
+
+
+def test_doctor_flags_unreachable_off_and_unwired(git_repo):
+    code, text = _cli(["--url", "http://127.0.0.1:9", "--timeout", "1", "doctor"])
+    assert code != 0
+    assert _check(text, "server reachable") == "FAIL"
+    assert _check(text, "coordination active") == "FAIL"  # no marker/env
+    assert _check(text, "hooks wired") == "FAIL"  # nothing in settings.json
+
+
+def test_doctor_hooks_and_marker_pass_after_init(git_repo):
+    _cli(["init-hooks"])  # writes hooks + drops marker
+
+    _, text = _cli(["--url", "http://127.0.0.1:9", "--timeout", "1", "doctor"])
+    assert _check(text, "hooks wired") == "ok"
+    assert _check(text, "coordination active") == "ok"
+    assert _check(text, "in a git repo") == "ok"
+
+
+def test_doctor_flags_a_non_git_cwd(tmp_path, monkeypatch):
+    plain = tmp_path / "not-a-repo"
+    plain.mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.chdir(plain)
+
+    _, text = _cli(["--url", "http://127.0.0.1:9", "--timeout", "1", "doctor"])
+    assert _check(text, "in a git repo") == "FAIL"
