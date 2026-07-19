@@ -106,7 +106,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser = argparse.ArgumentParser(prog="swarmsync-serve", description=__doc__)
     parser.add_argument(
         "--db",
-        default=config.db_path(),
+        default=None,
         help="blackboard SQLite path (default: $SWARMSYNC_DB or swarmsync.db; "
         "the deprecated $SWARM_SYNC_DB alias is still honored, with a warning)",
     )
@@ -128,6 +128,14 @@ def main(argv: Optional[list[str]] = None) -> None:
         "the schema is created. Without this flag an existing DB is reused as-is.",
     )
     args = parser.parse_args(argv)
+
+    # Resolve the DB path AFTER parsing so `config.db_path()` -- and its deprecated
+    # `SWARM_SYNC_DB` warning -- only runs when no explicit `--db` was given. A flag
+    # value must win silently (db_path()'s own documented precedence); reading it via
+    # argparse's `default=` fired the warning eagerly at parser-build time even when
+    # the flag overrode it.
+    if args.db is None:
+        args.db = config.db_path()
 
     # C13: verify the cross-clock invariant before doing anything else. A wrong host
     # clock silently corrupts lease liveness, so fail here with a readable message
