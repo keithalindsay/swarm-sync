@@ -352,9 +352,11 @@ def _deny_response(
     stops renewing and its TTL does expire, so retrying after the remaining TTL is a
     legitimate strategy. Wording also avoids claiming the blocking lease's mode (the
     tie-broken blocker can be a reader; the acquire response does not carry its mode).
-    The actionable pointer (`GET <url>/leases`) lets the agent inspect the live holder
-    set instead. All fields come from the acquire response already in hand -- no second
-    round-trip (WP2.4 consumes `LeaseResult.holder{,_ttl_expires_at}`)."""
+    The actionable pointer lets the agent inspect the live holder set instead: the
+    `swarmsync holds` CLI (WP5.1 -- Bash-callable from the same shell the hook runs
+    in), with `GET <url>/leases` named as the fallback for when the CLI isn't on PATH.
+    All fields come from the acquire response already in hand -- no second round-trip
+    (WP2.4 consumes `LeaseResult.holder{,_ttl_expires_at}`)."""
     url = config.url()
     if holder_ttl_expires_at is not None:
         remaining = max(0.0, holder_ttl_expires_at - time.time())
@@ -364,7 +366,7 @@ def _deny_response(
     reason = (
         f"swarm-sync: {relpath} is leased by {owner} "
         f"({ttl_note}the hold renews while its holder stays active). Pick different "
-        f"work; inspect current holders with GET {url}/leases."
+        f"work -- run `swarmsync holds` to see who holds what (or GET {url}/leases)."
     )
     return {
         "hookSpecificOutput": {

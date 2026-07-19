@@ -245,7 +245,8 @@ def test_parcel_held_by_another_agent_denies_with_reason(monkeypatch, repo, inde
     assert "mod_a.py" in reason
     assert "agent-0" in reason
     assert "renews while its holder stays active" in reason
-    assert "/leases" in reason
+    assert "swarmsync holds" in reason  # WP5.1: the CLI work-discovery pointer
+    assert "/leases" in reason  # with the raw endpoint named as the fallback
     assert "retry shortly" not in reason
 
     # agent-1 never actually acquired anything -- only agent-0's lease exists.

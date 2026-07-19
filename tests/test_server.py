@@ -921,6 +921,56 @@ def _response_array_item_schema(spec: dict, path: str) -> dict:
     return _resolve_ref(spec, schema["items"])
 
 
+def test_health_reports_an_operational_snapshot(client, fixture_repo):
+    """WP5.1: GET /health is the unauthenticated operational surface -- version,
+    the single managed root, db path, active-lease count, last event seq -- so
+    `swarmsync status`/`doctor` can see the server is up and what it is bound to,
+    even when coordination is silently failing open."""
+    from swarmsync import __version__
+
+    _index(client, fixture_repo)
+    r = client.post("/lease", json={"agent_id": "a1", "parcel_id": "mod_a.py::helper"})
+    assert r.status_code == 200
+
+    resp = client.get("/health")
+    assert resp.status_code == 200
+    h = resp.json()
+    assert h["version"] == __version__
+    assert h["active_leases"] == 1
+    assert h["last_event_seq"] >= 1  # at least the index/lease events happened
+    assert h["db_path"].endswith("blackboard.db")
+    assert h["root"]  # the single managed root, resolved like every other endpoint
+
+
+def test_health_needs_no_token_even_when_auth_is_on(monkeypatch, tmp_path):
+    """`/health` must answer without a bearer token: it is what an operator hits
+    to discover the server is even reachable, so gating it behind the token an
+    operator may be debugging would defeat its purpose. Mirrors the other GETs."""
+    monkeypatch.setenv("SWARMSYNC_TOKEN", "s3cret")
+    app = create_app(tmp_path / "blackboard.db")
+    with TestClient(app) as c:
+        resp = c.get("/health")  # no Authorization header
+        assert resp.status_code == 200
+        assert resp.json()["active_leases"] == 0
+
+
+def test_openapi_declares_the_health_schema(client):
+    """WP5.1 acceptance: `/health` is a declared, snapshot-visible part of the wire
+    contract (its shape is what `swarmsync status`/`doctor` depend on)."""
+    spec = client.app.openapi()
+    schema = spec["paths"]["/health"]["get"]["responses"]["200"]["content"][
+        "application/json"
+    ]["schema"]
+    health = _resolve_ref(spec, schema)
+    assert set(health["properties"]) == {
+        "version",
+        "root",
+        "db_path",
+        "active_leases",
+        "last_event_seq",
+    }
+
+
 def test_openapi_declares_leases_and_parcels_response_schemas(client):
     """WP4.5 (A6) schema snapshot: the OpenAPI document must now DECLARE the
     /leases and /parcels response shapes (they were undocumented raw rows).

@@ -113,6 +113,14 @@ class BlackboardClient:
         r.raise_for_status()
         return r.json()
 
+    def health(self) -> dict:
+        """`GET /health` -- the operational snapshot (WP5.1): `version`, `root`,
+        `db_path`, `active_leases`, `last_event_seq`. Unauthenticated server-side;
+        the one read that answers "is the blackboard up, and bound to which repo?"."""
+        r = self._http.get("/health")
+        r.raise_for_status()
+        return r.json()
+
     def events(
         self, since: int = 0, limit: int = 1000, tail: Optional[int] = None
     ) -> list[dict]:
