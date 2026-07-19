@@ -292,9 +292,15 @@ path across the seam).
 **Files:** `server/app.py`, `blackboard/models.py`, `hooks/adapter.py`
 - `response_model=list[Lease]` / `ParcelWithLeases` on `GET /leases` / `GET /parcels` (models
   exist; adapter switches from duck-typed dicts to the declared shape).
-- Unify unknown-entity handling on the soft-fail `{"ok": false, "reason": …}` idiom (matches the
-  fail-open philosophy); `/parcel/update`'s 404 becomes soft-fail. Document the convention in
-  DESIGN's endpoint table.
+- Document the error-shape convention in DESIGN's endpoint table so the three failure classes are
+  declared, not implied.
+  **DECISION (shipped, differs from the original bullet):** the original plan folded `/parcel/update`'s
+  404 into the soft-fail body too. During implementation we kept them distinct instead — `404` for an
+  *absent* entity (unknown parcel / unknown contract symbol: retrying can't help until the world
+  changes) vs. `200 + {"ok": false, "reason": …}` only for *policy refusals* (lease deny, foreign-lease
+  heartbeat/release, `/parcel/update` without the write lease). Collapsing "the parcel doesn't exist"
+  into "you don't hold its lease" would erase a real distinction a caller must act on differently. See
+  DESIGN §4.2's error-shape table for the shipped contract.
 **Acceptance:** OpenAPI schema snapshot test (the wire contract is now asserted, not implied);
 adapter tests against the typed shapes. Depends on: WP2.4 (LeaseResult fields).
 

@@ -90,7 +90,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Union
 
-from swarmsync.blackboard import db
+from swarmsync.blackboard import db, parcel_id
 from swarmsync.blackboard.models import Parcel
 from swarmsync.classifier.graph import DepGraph
 from swarmsync.classifier.store import retire_rows, run_index
@@ -179,7 +179,7 @@ def _snapshot_touched_contracts(
         for row in conn.execute(
             "SELECT symbol, signature, type_hash, version FROM contracts"
         ).fetchall()
-        if row["symbol"].split("::", 1)[0] in changed_set
+        if parcel_id.split(row["symbol"])[0] in changed_set
     }
 
 
@@ -546,7 +546,7 @@ def integrate(
         retired_contract_symbols = [
             row["symbol"]
             for row in conn.execute("SELECT symbol FROM contracts").fetchall()
-            if row["symbol"].split("::", 1)[0] in changed_set
+            if parcel_id.split(row["symbol"])[0] in changed_set
             and row["symbol"] not in fresh_ids
         ]
     except Exception as exc:  # noqa: BLE001 -- deliberate: any post-merge failure

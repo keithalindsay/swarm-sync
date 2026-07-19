@@ -51,6 +51,27 @@ def test_serve_main_host_and_port_are_overridable(monkeypatch, tmp_path):
     assert captured == {"host": "0.0.0.0", "port": 9191}
 
 
+def test_explicit_db_flag_suppresses_the_deprecated_alias_warning(monkeypatch, tmp_path, capsys):
+    """WP4.2 review: `--db` beats $SWARM_SYNC_DB (db_path()'s own documented
+    precedence), so passing the flag must use its value AND never consult the
+    legacy alias -- i.e. no deprecation warning. Regression: the arg default was
+    `config.db_path()`, which argparse evaluates eagerly at parser-build time, so
+    the warning fired unconditionally even when the flag won.
+    """
+    monkeypatch.setattr("uvicorn.run", lambda app, host, port: None)
+    monkeypatch.delenv("SWARMSYNC_DB", raising=False)
+    monkeypatch.delenv("SWARMSYNC_ROOTS", raising=False)
+    monkeypatch.setenv("SWARM_SYNC_DB", str(tmp_path / "legacy.db"))
+    explicit = tmp_path / "explicit.db"
+    monkeypatch.setattr(sys, "argv", ["swarmsync-serve", "--db", str(explicit)])
+
+    serve.main()
+
+    err = capsys.readouterr().err
+    assert "deprecated" not in err  # the flag won; the legacy alias was never read
+    assert explicit.exists()  # and it is the DB that got built
+
+
 def test_serve_main_help_exits_zero(monkeypatch, capsys):
     monkeypatch.setattr(sys, "argv", ["swarmsync-serve", "--help"])
     with pytest.raises(SystemExit) as exc:
