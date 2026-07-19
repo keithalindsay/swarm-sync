@@ -1,5 +1,5 @@
 """Covers formats.py -- a dependent of calc.add/calc.mul/calc.div, and (via
-total_with_tax) the call site money-shot #3 exercises when calc.add's frozen
+total_with_tax) the call site test case #3 exercises when calc.add's frozen
 signature changes."""
 from __future__ import annotations
 

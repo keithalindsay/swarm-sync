@@ -188,13 +188,16 @@ CREATE TABLE events (
 );
 ```
 
-The **`events` table is the pheromone trail and the source of truth for recovery of leases and
-pheromone**: `leases` and `pheromone` are pure projections of the event log (grants, releases, reaps,
-heartbeats, decay) and can be rebuilt by replaying it. **`parcels` and `contracts` are NOT
-event-replayable** — they hold derived facts about the *current source on disk* (byte spans,
-`content_hash`, `blast_radius`, signatures) that the event log never carries; recovering them means
-re-running the classifier (`POST /index` / `classifier.store.run_index`) against the live worktree, not
-replaying history. See §6's failure-handling table for the full recovery story. The load-bearing
+The **`events` table is the pheromone trail — an append-only audit/observability log. The SQLite
+tables themselves are the state of record**; events are NOT a recovery source. Three concrete reasons
+(finding C7): state writes and event emits are separate autocommit statements (a crash can land one
+without the other), several mutations emit no event at all (`run_index`, `_ensure_parcel`, pheromone
+decay), and nothing in the system replays the log — crash recovery reads the `open_integrations`
+projection (WP3.2), which is maintained transactionally alongside its events. `parcels` and
+`contracts` hold derived facts about the *current source on disk* (byte spans, `content_hash`,
+`blast_radius`, signatures); recovering them means re-running the classifier (`POST /index` /
+`classifier.store.run_index`) against the live worktree, not consulting history. See §6's
+failure-handling table for the full recovery story. The load-bearing
 stigmergic signal is `parcels.state_summary` — the live semantic reality every agent reads before
 acting.
 
@@ -211,8 +214,24 @@ acting.
 | `POST /release` | Release a lease. |
 | `GET /contract/{symbol}` | Current frozen signature + version. |
 | `POST /parcel/update` | Agent posts new `content_hash` + `state_summary` on done. |
-| `GET /events?since={seq}` | Tail the ordered event log (polling; default 1s). |
+| `GET /events?since={seq}` | Tail the ordered event log (polling; default 1s). Or `?tail={n}`: the newest `n` events, still ascending by seq — "what happened recently" without paging the whole log (mutually exclusive with `since`; same 1000-row cap as `limit`). |
 | `POST /integrate` | Submit an agent branch for the serial merge gate (§5.4). |
+
+The response shapes of `GET /parcels` (parcel columns + an `active_leases` join of
+`{lease_id, agent_id, mode}`) and `GET /leases` (the `leases` row verbatim) are declared as
+response models (`blackboard.models.ParcelWithLeases` / `Lease`) and visible in the OpenAPI
+schema — they are the wire contract the hook adapter duck-types against; field names are frozen.
+
+**Error-shape convention.** Three distinct failure classes get three distinct wire shapes —
+the split is *absent entity* vs. *policy refusal* vs. *malformed/forbidden request*:
+
+| Shape | Where | Rationale |
+|---|---|---|
+| `404` | `GET /contract/{symbol}` unknown symbol; `POST /parcel/update` unknown parcel. | The named entity does not exist — retrying can't help until the world changes; kept distinct from "you don't hold the lease" so the two failure modes never collapse. |
+| `200` + refusal body | `POST /lease` deny → `{granted: false, reason, holder?, holder_ttl_expires_at?}`; `POST /parcel/update` without the write lease → `{ok: false, reason}`; `POST /heartbeat` / `POST /release` on a missing or foreign lease → `{ok: false}`. | Policy refusals are *normal coordination outcomes*, not errors: the request was well-formed and understood, the blackboard's answer is simply "no" — callers branch on the body (back off, name the holder), never on catching an HTTP error. Heartbeat/release carry no `reason` (a bare boolean suffices: the only cause is "not your active lease"); documented as-is, not reconciled — adding one would be additive, not a fix. |
+| `422` | Any malformed body/param (pydantic bounds: `ttl ≤ 0`, out-of-range `limit`/`tail`, `since`+`tail` together). | The request itself is wrong — loud, before any state is touched, so a caller never mistakes a clamped/ignored parameter for an answered question. |
+| `401` / `403` | `401`: missing/bad bearer token on mutating routes when `SWARMSYNC_TOKEN` is set. `403`: `POST /index` / `POST /integrate` path outside the managed roots. | Access control, not coordination: who may talk to the blackboard at all, and which filesystem paths it may touch. |
+| `413` | Body over the `SWARMSYNC_MAX_BODY_BYTES` cap; `POST /index` over the index limits. | Resource protection — rejected before buffering/indexing, with the env knob named in the detail. |
 
 ### 4.3 Sync protocol (per agent)
 
@@ -242,7 +261,7 @@ one file" is **structurally impossible**, and each agent gets an independent bui
 > have bitten:
 > - any file the lease layer fails to cover on that path is *completely* ungated (a hook lease
 >   on an unindexed file therefore auto-creates a coarse whole-file parcel rather than failing
->   open — `server/leases.py::_ensure_parcel`);
+>   open — `blackboard/leases.py::_ensure_parcel`);
 > - the lease is only consulted for `Edit`/`Write`-family tools, so a `Bash` write (`sed -i`,
 >   `cat >`) bypasses it entirely. The hook path is a cooperative protocol among well-behaved
 >   agents, not a sandbox.
@@ -268,7 +287,7 @@ WHERE NOT EXISTS (
 is the safety net that makes trusting the planner's predicted touch-sets acceptable: a misprediction
 that double-targets a parcel simply loses the race and serializes.
 
-**The conflict rule is `l.parcel_id = :parcel_id` — a string match** (`server/leases.py::acquire`).
+**The conflict rule is `l.parcel_id = :parcel_id` — a string match** (`blackboard/leases.py::acquire`).
 The lease store has no notion of one parcel *containing* another. That is sound here only because
 §2's file granularity means every id it ever sees is `<file>::<module>`: same-shaped ids, so string
 equality is exactly containment. It is also why symbol granularity is parked rather than optional —
@@ -303,11 +322,12 @@ exactly the "lying blackboard" case §6 rejects.
 
 **The weaker guarantee this implies:** there is no proactive "mark dependent parcels `stale`" step —
 dependents are not pushed a notice at the moment the change is decided. A dependent only learns of the
-break by observing the `contract_change` event on its own (polling `GET /events`, or by opting into the
-integrator's `expected_read_deps` optimistic re-check at its *own* integrate time, §5.5). Between the
+break by observing the `contract_change` event on its own (polling `GET /events`, or via the
+integrator's `expected_read_deps` optimistic re-check at its *own* integrate time, §5.5 — the agent
+runner submits its plan-time snapshot automatically since WP4.6). Between the
 change landing on trunk and a dependent noticing it, that dependent's in-flight work is silently
 building against a stale signature; the test gate (§5.4) is the backstop that eventually catches a
-resulting break, not this mechanism. Money-shot #3 demonstrates the happy path (a dependent that does
+resulting break, not this mechanism. Test case #3 demonstrates the happy path (a dependent that does
 poll and re-plans in time), not a guarantee that every dependent will.
 
 ### 5.4 Serial test-gated integrator (detection + resolution)
@@ -321,8 +341,15 @@ Merges are serialized through one integrator (`coordinator/integrator.py`). For 
    `merge_rejected` with logs, leave trunk untouched, bounce the branch back to its agent.
 
 ### 5.5 Optimistic re-check
-At integrate time the integrator re-verifies the `content_hash`/`contract_hash` of the branch's declared
-read-dependencies. A mismatch means a dependency shifted mid-work → forced rebase before merge.
+At integrate time the integrator re-verifies the branch's declared read-dependencies against the
+blackboard's *current* state. Wired end-to-end since WP4.6 (A1): the agent runner snapshots each
+read-dependency's hash at plan time (`parcels.content_hash` when the id has a parcel row — contract
+symbols share the parcel id namespace, and the parcel row wins the lookup — else the contract's
+`type_hash`) and submits it as `IntegrateBody.expected_read_deps` on `POST /integrate`;
+`integrate()` compares each id against the same columns before touching trunk. Any mismatch means a
+dependency shifted mid-work → the verdict is `needs_rebase` (event emitted, no merge attempted,
+branch preserved/parked) and the work bounces back to the agent. The check is opt-in per submit:
+a body without `expected_read_deps` (or a task with no foreign read-deps) skips it entirely.
 
 ## 6. Failure handling / graceful degradation
 
@@ -333,19 +360,19 @@ read-dependencies. A mismatch means a dependency shifted mid-work → forced reb
 | **Hot-parcel starvation** | A high-blast-radius parcel everyone needs serializes work. Frozen contracts let *readers* proceed without a write-lease; writers queue. Parallelism degrades toward serial but stays **correct**. |
 | **Classifier miss** (dynamic dispatch, reflection, string imports defeat the static graph) | Conservative fallback: when the AST is uncertain about a symbol's boundaries or references, the parcel falls back to **file** granularity, and the test gate is the backstop. |
 | **Lying blackboard** (agent writes a stale/wrong summary) | The integrator **regenerates** `state_summary` deterministically on merge; agent-written summaries are advisory only. |
-| **Blackboard SPOF / corruption** | SQLite WAL durability + the append-only `events` log allow recovery, but the recovery path is **not** a uniform "replay everything": **leases and pheromone are event-replayable** (both are pure projections of `events` — grants/releases/reaps/heartbeats/decay — and rebuild by replaying it); **parcels and contracts are NOT** — they hold derived facts about the current on-disk source (spans, `content_hash`, `blast_radius`, signatures) that the event log doesn't carry, so recovering them means **re-running the classifier** (`POST /index`) against the live worktree, not replaying history. Single-writer server avoids write contention. |
-| **Coordinator/server crash** | On restart: replay `events` to rebuild the active-lease set and pheromone (see above), and re-run the classifier over the repo to repopulate `parcels`/`contracts`; git worktree state on disk is authoritative for the rest, so nothing here trusts staleness in the DB. |
+| **Blackboard SPOF / corruption** | SQLite WAL durability protects the tables, and **the tables are the state of record** — the append-only `events` log is audit/observability only, **not** a rebuild source (state writes and event emits are separate statements, and several mutations emit no event; finding C7). If the DB file itself is lost or corrupt: rotate it aside (`swarmsync-serve --fresh`) and **re-run the classifier** (`POST /index`) against the live worktree to repopulate `parcels`/`contracts`; leases and pheromone are ephemeral coordination state and restart empty. Single-writer server avoids write contention. |
+| **Coordinator/server crash** | On restart: read the `open_integrations` projection (`reconcile_orphaned_integrations`, WP3.2) to roll back any integrate that died without a verdict — **no event-log replay** — and re-run the classifier over the repo to repopulate `parcels`/`contracts`; surviving leases in the tables simply age out via the reaper. Git worktree state on disk is authoritative for the rest, so nothing here trusts staleness in the DB. |
 | **Lease livelock on a hot parcel** | Bounded retries with backoff, then escalate to a FIFO exclusive lease so contenders serialize instead of spinning. |
-| **Multi-host deployment** | Out of scope, not merely undocumented: the blackboard is a **single SQLite file** referenced by filesystem path (`SWARM_SYNC_DB`/`--db`), and every agent's git worktree (`worktree/git_ops.py`) is a plain directory under the repo's `.git`. Both assume one shared filesystem and one host. There is no network-attached DB, no distributed lock, and no cross-host worktree sharing — running agents across multiple machines against the "same" blackboard is unsupported and will not serialize correctly (SQLite's WAL locking guarantees hold only for local-filesystem access, not NFS/network mounts). |
+| **Multi-host deployment** | Out of scope, not merely undocumented: the blackboard is a **single SQLite file** referenced by filesystem path (`SWARMSYNC_DB`/`--db`), and every agent's git worktree (`worktree/git_ops.py`) is a plain directory under the repo's `.git`. Both assume one shared filesystem and one host. There is no network-attached DB, no distributed lock, and no cross-host worktree sharing — running agents across multiple machines against the "same" blackboard is unsupported and will not serialize correctly (SQLite's WAL locking guarantees hold only for local-filesystem access, not NFS/network mounts). |
 
 ## 7. The end-to-end demo the prototype MUST show
 
 A single script `demo/run_demo.py` boots the server, indexes `sample_repo/`, and runs agents against a
-fixed task list, printing the event stream. It must demonstrate **five money shots**, each an
+fixed task list, printing the event stream. It must demonstrate **five test cases**, each an
 assertion the script checks and prints PASS/FAIL for:
 
 1. **Concurrent disjoint edits land clean.** Three agents lease and edit **different files** at the
-   same time (file-granularity leasing, §2 — two agents in *one* file is what money-shot #2 shows
+   same time (file-granularity leasing, §2 — two agents in *one* file is what test case #2 shows
    instead: it serializes); all three branches merge green with **zero conflicts**.
    *Proof:* three `merged` events with overlapping work windows, integration branch tests green, git
    log shows all three commits.
@@ -365,8 +392,8 @@ assertion the script checks and prints PASS/FAIL for:
 
 **Overall success criterion:** across a run with ≥3 concurrent agents on the sample repo, **zero
 textual collisions reach the integration branch** (no two agents ever hold the same file at once —
-§2's file granularity is what makes that true, and money-shot #2 is the case where it bites), every
-landed commit leaves the sample repo's test suite green, and all five money-shot assertions print
+§2's file granularity is what makes that true, and test case #2 is the case where it bites), every
+landed commit leaves the sample repo's test suite green, and all five test case assertions print
 PASS.
 
 ## 7a. Operational surface (env + launchers)
@@ -380,7 +407,7 @@ has the operator-facing version; this is the contract.
 | `SWARMSYNC_TOKEN` | Bearer token required on every mutating route. **Unset = no auth** (the dev/demo default). |
 | `SWARMSYNC_GATE_TIMEOUT` | Wall-clock ceiling on the integrator's pytest gate (default 600s). The gate runs just-merged, agent-authored code while holding the global integrate lock, so this is what stops one non-terminating test wedging integration permanently. |
 | `SWARMSYNC_URL`, `SWARMSYNC_ACTIVE` | Hook adapter: blackboard base URL, and the per-repo activation switch (see README). |
-| `swarmsync-serve --db/--host/--port/--root` | The launcher README tells hook users to run (defaults to port **8787**, matching the adapter's default `SWARMSYNC_URL`). `swarm-sync` is the other entry point and defaults to port **8000** — mixing them up is a silent fail-open. |
+| `swarmsync-serve --db/--host/--port/--root/--fresh` | The ONE launcher (WP4.2): defaults to port **8787**, matching the adapter's default `SWARMSYNC_URL`, DB from `SWARMSYNC_DB` (default `swarmsync.db`). The `swarm-sync` console script is an alias of the same `serve:main` — the old second entry point on port 8000 was a silent fail-open and is gone. Every env knob is read through `swarmsync/config.py` (the only module that touches the environment — enforced by `tests/test_architecture.py`); README has the full name/default/meaning table. |
 
 **Crash recovery.** `integrate` mutates trunk before it knows the verdict, so it emits
 `integrate_started` (carrying the sha to roll back to) before merging and a terminal

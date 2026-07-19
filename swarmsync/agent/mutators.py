@@ -18,7 +18,7 @@ to locate the target `def` by symbol -- a bare name (`"helper"`) for a
 top-level function, or `"Class.method"` for a method -- and then a line-range
 replace via `ast.FunctionDef.lineno`/`end_lineno`. They deliberately do NOT
 touch anything outside the named symbol's own span, so two mutators targeting
-two different symbols in the same file (money-shot #1) produce non-overlapping
+two different symbols in the same file (test case #1) produce non-overlapping
 textual hunks by construction.
 """
 from __future__ import annotations
@@ -66,7 +66,7 @@ def edit_function_body(worktree: StrPath, path: str, symbol: str, new_body: str)
     the signature untouched) with `new_body` (a flush-left Python snippet,
     `textwrap.dedent`-ed and re-indented to match the original body's indent).
 
-    This is the money-shot #1 mutator: two agents calling this on two
+    This is the test case #1 mutator: two agents calling this on two
     different `symbol`s in the same file touch disjoint line ranges.
     """
     file_path, text = _read(worktree, path)
@@ -92,7 +92,7 @@ def change_signature(worktree: StrPath, path: str, symbol: str, new_sig: str) ->
     """Rewrite `symbol`'s header line to `new_sig` (e.g. `"def helper(x, y=1, z=0)"`),
     leaving its body and any decorators untouched.
 
-    Money-shot #3's mutator: an agent deliberately breaks a frozen contract's
+    Test case #3's mutator: an agent deliberately breaks a frozen contract's
     signature under an exclusive lease so a dependent can observe the
     `contract_change` event and re-plan.
 
@@ -121,7 +121,7 @@ def fix_call_site(worktree: StrPath, path: str, symbol: str, old: str, new: str)
     body only (never outside it, so an unrelated call to the same name
     elsewhere in the file is untouched).
 
-    Money-shot #3's follow-up mutator: the dependent agent that observed a
+    Test case #3's follow-up mutator: the dependent agent that observed a
     `contract_change` event uses this to fix its own call site after
     re-reading the new signature.
     """
@@ -146,11 +146,11 @@ def break_a_test(
     worktree: StrPath,
     path: str,
     symbol: str,
-    message: str = "mutator: intentionally broken for test-gate rejection (money-shot #5)",
+    message: str = "mutator: intentionally broken for test-gate rejection (test case #5)",
 ) -> None:
     """Rewrite `symbol` to unconditionally raise -- guaranteed to fail any test
     that exercises it, for the integrator's pytest gate to catch and reject
-    (money-shot #5). Built on `edit_function_body` so it produces the same
+    (test case #5). Built on `edit_function_body` so it produces the same
     kind of disjoint, symbol-scoped hunk as any other edit."""
     edit_function_body(worktree, path, symbol, f"raise RuntimeError({message!r})")
 
@@ -166,7 +166,7 @@ def slow_edit(
     """Apply `new_body` via `edit_function_body`, then either hang forever
     (`hang=True`, the default) or sleep `delay` seconds before returning.
 
-    Money-shot #4's mutator: the edit lands on disk first (so if the agent
+    Test case #4's mutator: the edit lands on disk first (so if the agent
     process is SIGKILLed while this call is hanging, there is real
     uncommitted work sitting in the worktree -- proving the crash truly
     happened *mid-edit*, not before it started), then the call blocks so an

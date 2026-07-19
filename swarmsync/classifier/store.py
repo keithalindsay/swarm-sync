@@ -35,14 +35,15 @@ Design notes (this unit's own decisions):
   flow in DESIGN §5.3 — that's the lease manager's/broker's job (U5/U12) when an agent
   deliberately changes a frozen signature under a lease. This unit only keeps the
   `contracts` table's `version` column honest under repeated `POST /index` calls.
-- **No stale-row pruning.** If a file/symbol disappears from the repo between two
-  `run_index` calls, its old `parcels`/`contracts` rows are left in place rather than
-  deleted. Deleting a parcel row is unsafe to do unconditionally once other units exist
-  (`leases`/`pheromone` reference `parcels.id`, and `foreign_keys=ON` per `blackboard/db.py`
-  would raise on a referenced row); reconciling that is left to a future unit (the
-  integrator already owns "re-index the touched files" on land per DESIGN §5.4, which is
-  the natural place to also retire genuinely-deleted parcels). Not exercised by, or
-  required by, this unit's done-when.
+- **No stale-row pruning in `run_index` itself.** If a file/symbol disappears from the
+  repo between two `run_index` calls, `run_index` leaves the old `parcels`/`contracts`
+  rows in place rather than deleting them. Deleting a parcel row is unsafe to do
+  unconditionally (`leases`/`pheromone` reference `parcels.id`, and `foreign_keys=ON`
+  per `blackboard/db.py` would raise on a referenced row). WP3.5 (C14): the integrator's
+  post-land re-index -- the "natural place" this note always nominated -- now retires
+  those ghosts via `retire_rows` below, scoped to exactly the paths the landed merge
+  touched (see `coordinator.integrator.integrate` step 4). `run_index` on its own (e.g.
+  a bare `POST /index`) still prunes nothing.
 - **Full rebuild every call**, matching the U3 handoff note: there is no incremental
   parcel-graph diffing here, only `indexer.index_repo`'s file walk is incremental in
   spirit. `run_index` always re-parses every `.py` file under `root`.
@@ -167,6 +168,49 @@ def upsert_contracts(conn: sqlite3.Connection, contracts: list[Contract]) -> Non
                 for c in contracts
             ],
         )
+
+
+def retire_rows(
+    conn: sqlite3.Connection,
+    parcel_ids: list[str],
+    contract_symbols: list[str],
+) -> list[sqlite3.Row]:
+    """Delete retired parcels' and contracts' rows, FK dependents FIRST (WP3.5, C14).
+
+    FK graph (schema.sql): `leases.parcel_id` and `pheromone.parcel_id` both
+    REFERENCE `parcels.id` with `foreign_keys=ON`, and the FK holds on row
+    EXISTENCE (a `released`/`reaped` lease row still blocks the parent delete) --
+    so dependents are deleted, not just status-flipped, before the parcel rows.
+    History is not lost: the append-only `events` log (the source of truth the
+    projections replay from) keeps every lease_granted/released/reaped record,
+    and the caller emits `parcel_retired`/`contract_retired` naming what closed.
+    `contracts` has no FK dependents, so its delete needs no ordering.
+
+    Returns the ACTIVE lease rows (id, agent_id, parcel_id) that this retirement
+    closed, so the caller can name the affected holders in its retirement events.
+
+    Deliberately does NOT open its own transaction: the caller (the integrator)
+    wraps these deletes and its retirement-event emits in ONE `db.transaction`,
+    so ghosts never vanish without their events (or vice versa). One transaction
+    per connection, no nesting -- see `blackboard.db.transaction`.
+    """
+    closed_leases: list[sqlite3.Row] = []
+    if parcel_ids:
+        ph = ",".join("?" for _ in parcel_ids)
+        closed_leases = conn.execute(
+            f"SELECT id, agent_id, parcel_id FROM leases "
+            f"WHERE parcel_id IN ({ph}) AND status = 'active'",
+            parcel_ids,
+        ).fetchall()
+        conn.execute(f"DELETE FROM leases WHERE parcel_id IN ({ph})", parcel_ids)
+        conn.execute(f"DELETE FROM pheromone WHERE parcel_id IN ({ph})", parcel_ids)
+        conn.execute(f"DELETE FROM parcels WHERE id IN ({ph})", parcel_ids)
+    if contract_symbols:
+        ph = ",".join("?" for _ in contract_symbols)
+        conn.execute(
+            f"DELETE FROM contracts WHERE symbol IN ({ph})", contract_symbols
+        )
+    return closed_leases
 
 
 def run_index(

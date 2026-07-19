@@ -29,7 +29,10 @@ dev = [
 ]
 
 [project.scripts]
-swarm-sync = "swarmsync.server.app:main"
+# WP4.2: `swarm-sync` is an ALIAS of `swarmsync-serve` -- ONE launcher, one set
+# of defaults (port 8787, swarmsync.db, --root/--fresh, banner, clock check).
+swarm-sync = "swarmsync.server.serve:main"
+swarmsync = "swarmsync.cli:main"  # WP5.1: operator/agent CLI (status/holds/free/events)
 swarmsync-hook = "swarmsync.hooks.adapter:main"
 swarmsync-serve = "swarmsync.server.serve:main"
 

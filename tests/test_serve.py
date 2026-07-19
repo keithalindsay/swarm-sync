@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 
 import pytest
 from fastapi import FastAPI
@@ -48,6 +49,27 @@ def test_serve_main_host_and_port_are_overridable(monkeypatch, tmp_path):
     serve.main()
 
     assert captured == {"host": "0.0.0.0", "port": 9191}
+
+
+def test_explicit_db_flag_suppresses_the_deprecated_alias_warning(monkeypatch, tmp_path, capsys):
+    """WP4.2 review: `--db` beats $SWARM_SYNC_DB (db_path()'s own documented
+    precedence), so passing the flag must use its value AND never consult the
+    legacy alias -- i.e. no deprecation warning. Regression: the arg default was
+    `config.db_path()`, which argparse evaluates eagerly at parser-build time, so
+    the warning fired unconditionally even when the flag won.
+    """
+    monkeypatch.setattr("uvicorn.run", lambda app, host, port: None)
+    monkeypatch.delenv("SWARMSYNC_DB", raising=False)
+    monkeypatch.delenv("SWARMSYNC_ROOTS", raising=False)
+    monkeypatch.setenv("SWARM_SYNC_DB", str(tmp_path / "legacy.db"))
+    explicit = tmp_path / "explicit.db"
+    monkeypatch.setattr(sys, "argv", ["swarmsync-serve", "--db", str(explicit)])
+
+    serve.main()
+
+    err = capsys.readouterr().err
+    assert "deprecated" not in err  # the flag won; the legacy alias was never read
+    assert explicit.exists()  # and it is the DB that got built
 
 
 def test_serve_main_help_exits_zero(monkeypatch, capsys):
@@ -142,3 +164,192 @@ def test_serve_announces_its_root_even_when_defaulted(monkeypatch, tmp_path, cap
     out = capsys.readouterr().out
     assert "managed root" in out
     assert "403" in out, "the 403 consequence is not surfaced at boot"
+
+
+# --- C13: startup refuses to serve on a bad host clock -----------------------------
+
+
+def test_serve_starts_when_clocks_agree(monkeypatch, tmp_path):
+    """The clock-agreement assertion must be a no-op under normal conditions: SQLite's
+    julianday('now') and Python's time.time() agree to well under a second, so `main`
+    proceeds to build the app and call uvicorn.run."""
+    ran = []
+    monkeypatch.setattr("uvicorn.run", lambda app, host, port: ran.append(True))
+    monkeypatch.setattr(sys, "argv", ["swarmsync-serve", "--db", str(tmp_path / "bb.db")])
+
+    serve.main()
+
+    assert ran == [True]
+
+
+def test_serve_refuses_to_start_when_clocks_disagree(monkeypatch, tmp_path):
+    """C13: lease liveness is checked on SQLite's clock while leases are stamped from
+    Python's, an unstated cross-clock invariant. If the two disagree, a lease can look
+    alive to one path and expired to the other (double-lease). Simulate a wrong host
+    clock by pushing Python's time an hour off SQLite's; startup must refuse rather
+    than serve a config that silently corrupts lease liveness."""
+    ran = []
+    monkeypatch.setattr("uvicorn.run", lambda app, host, port: ran.append(True))
+    real_time = time.time
+    monkeypatch.setattr(serve.time, "time", lambda: real_time() + 3600.0)
+    monkeypatch.setattr(sys, "argv", ["swarmsync-serve", "--db", str(tmp_path / "bb.db")])
+
+    with pytest.raises(SystemExit) as excinfo:
+        serve.main()
+
+    assert ran == [], "the server started anyway on a skewed clock"
+    assert "clock" in str(excinfo.value).lower()
+
+
+def test_assert_clock_agreement_passes_in_this_environment():
+    """Direct call: the real host's SQLite and Python clocks must agree (this is the
+    invariant every other test implicitly relies on)."""
+    serve.assert_clock_agreement()  # must not raise
+
+
+# --- WP3.6: --fresh moves a stale DB aside (never deletes) and boots empty ----------
+
+
+def _seed_db_with_one_event(db_path):
+    """A real blackboard DB with one recognizable row in it."""
+    from swarmsync.blackboard import db as db_mod
+
+    conn = db_mod.init_db(db_path)
+    conn.execute(
+        "INSERT INTO events(agent_id, type, payload, ts) VALUES('old-agent','planned','{}',1.0)"
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_serve_fresh_moves_existing_db_aside_and_boots_an_empty_schema(
+    monkeypatch, tmp_path, capsys
+):
+    """`--fresh` on an existing DB: the old file is MOVED (bytes intact) to a
+    timestamped `<db>.stale-<YYYYmmdd-HHMMSS>` backup -- never deleted -- the
+    backup path is printed, and the server boots on a fresh, empty schema."""
+    import sqlite3 as sqlite3_mod
+
+    db_path = tmp_path / "bb.db"
+    _seed_db_with_one_event(db_path)
+    original_bytes = db_path.read_bytes()
+
+    monkeypatch.setattr("uvicorn.run", lambda app, host, port: None)
+    monkeypatch.setattr(
+        sys, "argv", ["swarmsync-serve", "--db", str(db_path), "--fresh"]
+    )
+
+    serve.main()
+
+    # exactly one timestamped backup, holding the OLD bytes.
+    backups = sorted(tmp_path.glob("bb.db.stale-*"))
+    assert len(backups) == 1, f"expected one backup, found {backups!r}"
+    backup = backups[0]
+    assert backup.read_bytes() == original_bytes, "the backup is not the old DB's bytes"
+
+    # one boot line names the backup path.
+    out = capsys.readouterr().out
+    assert str(backup) in out
+
+    # the live DB is a fresh schema with none of the old rows.
+    conn = sqlite3_mod.connect(db_path)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM leases").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_serve_without_fresh_reuses_the_existing_db_unchanged(monkeypatch, tmp_path):
+    """No `--fresh`: behavior unchanged -- the existing DB (and its rows) is reused,
+    and nothing is moved aside."""
+    import sqlite3 as sqlite3_mod
+
+    db_path = tmp_path / "bb.db"
+    _seed_db_with_one_event(db_path)
+
+    monkeypatch.setattr("uvicorn.run", lambda app, host, port: None)
+    monkeypatch.setattr(sys, "argv", ["swarmsync-serve", "--db", str(db_path)])
+
+    serve.main()
+
+    assert list(tmp_path.glob("bb.db.stale-*")) == []
+    conn = sqlite3_mod.connect(db_path)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_serve_fresh_with_no_existing_db_just_boots(monkeypatch, tmp_path, capsys):
+    """`--fresh` when there is nothing to move: no backup, no backup line, normal boot."""
+    ran = []
+    db_path = tmp_path / "bb.db"
+    monkeypatch.setattr("uvicorn.run", lambda app, host, port: ran.append(True))
+    monkeypatch.setattr(
+        sys, "argv", ["swarmsync-serve", "--db", str(db_path), "--fresh"]
+    )
+
+    serve.main()
+
+    assert ran == [True]
+    assert list(tmp_path.glob("bb.db.stale-*")) == []
+    assert ".stale-" not in capsys.readouterr().out
+
+
+# --- WP4.2: ONE launcher -- `swarm-sync` is an alias of `swarmsync-serve` -----------
+
+
+def test_both_console_scripts_point_at_serve_main():
+    """The launcher split (port 8000 vs 8787, blackboard.db vs swarmsync.db, one
+    launcher with --root/--fresh/banner/clock-check and one without) was a
+    silent fail-open trap: the hook's default URL only ever matched
+    `swarmsync-serve`. Both `[project.scripts]` entries must target `serve:main`.
+    Asserted at the pyproject level (the environment's editable install predates
+    this change by design -- console-script wiring is declared here)."""
+    import tomllib
+    from pathlib import Path
+
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    scripts = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["scripts"]
+    assert scripts["swarm-sync"] == "swarmsync.server.serve:main"
+    assert scripts["swarmsync-serve"] == "swarmsync.server.serve:main"
+
+
+def test_app_module_no_longer_ships_a_second_launcher():
+    """`app.main` (the second argparse surface) is deleted outright -- an alias
+    that lingered would keep two divergent default sets alive."""
+    from swarmsync.server import app as app_mod
+
+    assert not hasattr(app_mod, "main")
+
+
+def test_serve_db_default_honors_swarmsync_db_env(monkeypatch, tmp_path):
+    """With no --db flag, the launcher's DB comes from `config.db_path()`:
+    SWARMSYNC_DB when set (read at main() call time, not import time)."""
+    captured: dict = {}
+    monkeypatch.setattr(
+        "uvicorn.run", lambda app, host, port: captured.update(app=app)
+    )
+    monkeypatch.setenv("SWARMSYNC_DB", str(tmp_path / "env.db"))
+    monkeypatch.setattr(sys, "argv", ["swarmsync-serve"])
+
+    serve.main()
+
+    assert captured["app"].state.db_path == str(tmp_path / "env.db")
+
+
+def test_serve_db_flag_beats_the_env(monkeypatch, tmp_path):
+    """Precedence: an explicit --db always wins over SWARMSYNC_DB."""
+    captured: dict = {}
+    monkeypatch.setattr(
+        "uvicorn.run", lambda app, host, port: captured.update(app=app)
+    )
+    monkeypatch.setenv("SWARMSYNC_DB", str(tmp_path / "env.db"))
+    monkeypatch.setattr(
+        sys, "argv", ["swarmsync-serve", "--db", str(tmp_path / "flag.db")]
+    )
+
+    serve.main()
+
+    assert captured["app"].state.db_path == str(tmp_path / "flag.db")

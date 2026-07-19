@@ -32,27 +32,35 @@ decay_once(conn, half_life=DEFAULT_HALF_LIFE, ts=None) -> int
     decay pass in isolation without spinning up the async loop, matching this
     module's own pre-existing docstring contract.
 
-run(conn, interval=1.0, half_life=DEFAULT_HALF_LIFE, iterations=None) -> None (async)
+run(conn, interval=1.0, half_life=DEFAULT_HALF_LIFE, iterations=None,
+    stop=None, compact_interval=None) -> None (async)
     The background loop: every `interval` seconds, call `reap_once` then
-    `decay_once`. `iterations`, when given, bounds the loop to exactly that many
-    passes and returns instead of looping forever -- this is what lets a test
-    exercise `run()` itself deterministically without racing a real wall-clock
-    sleep or needing a second task to cancel it. When `iterations` is `None`
-    (the real server's use, wired from `server/app.py`'s lifespan via
-    `asyncio.create_task`), the loop runs until the task is cancelled; the
-    pending `asyncio.sleep` raises `asyncio.CancelledError` at the next
-    scheduling point, which propagates out of `run()` normally -- the caller's
-    `task.cancel()` + awaiting the cancelled task is the intended shutdown path,
-    same shape as any other asyncio background task.
+    `decay_once` (plus, throttled to at most once per `compact_interval`,
+    `events.compact_events` -- WP3.1's events retention). `iterations`, when
+    given, bounds the loop to exactly that many passes and returns instead of
+    looping forever -- this is what lets a test exercise `run()` itself
+    deterministically without racing a real wall-clock sleep or needing a
+    second task to cancel it. When `iterations` is `None` (the real server's
+    use, wired from `server/app.py`'s lifespan via `asyncio.create_task`), the
+    loop runs until `stop` (an `asyncio.Event` the lifespan sets on shutdown)
+    is set -- checked between passes and while sleeping, so an in-flight
+    `to_thread` pass always COMPLETES before `run()` returns and the caller
+    can close the connection only after the task finishes. Plain
+    `task.cancel()` remains a last-resort fallback (see WP3.1 P2 below), not
+    the primary shutdown path.
 """
 from __future__ import annotations
 
 import asyncio
+import logging
 import sqlite3
 import time
 from typing import Optional
 
-from swarmsync.server import events as events_mod
+from swarmsync import config
+from swarmsync.blackboard import events as events_mod
+
+logger = logging.getLogger(__name__)
 
 # Pheromone half-life, in seconds. Not prescribed by DESIGN.md (U6's handoff
 # note explicitly leaves this constant for U11 to pick) -- 60s means a signal
@@ -66,6 +74,17 @@ DEFAULT_HALF_LIFE = 60.0
 # Background loop cadence, in seconds. Matches DESIGN §8's explicit choice to
 # poll `events` every 1s instead of standing up a push-based bus.
 DEFAULT_INTERVAL = 1.0
+
+# WP3.1 (finding S2): events-compaction throttle, in seconds. The reaper loop may
+# tick every second (or faster in tests), but a full-table DELETE scan every tick
+# would be pure waste -- one compaction per minute keeps the heartbeat backlog
+# bounded to ~1 minute of overshoot past the retention window.
+# WP4.2: value + env read live in `swarmsync.config`; aliases kept for importers
+# (tests drive `reaper._compact_interval_from_env` directly).
+DEFAULT_COMPACT_INTERVAL = config.DEFAULT_EVENTS_COMPACT_INTERVAL
+COMPACT_INTERVAL_ENV = config.EVENTS_COMPACT_INTERVAL_ENV
+
+_compact_interval_from_env = config.events_compact_interval
 
 
 def reap_once(conn: sqlite3.Connection, now: Optional[float] = None) -> list[int]:
@@ -147,6 +166,8 @@ async def run(
     interval: float = DEFAULT_INTERVAL,
     half_life: float = DEFAULT_HALF_LIFE,
     iterations: Optional[int] = None,
+    stop: Optional[asyncio.Event] = None,
+    compact_interval: Optional[float] = None,
 ) -> None:
     """The reaper's background loop: wired into `server/app.py`'s lifespan as a
     background `asyncio` task (DESIGN §4.2, §6 "Agent crash mid-edit").
@@ -161,13 +182,84 @@ async def run(
     Each pass runs immediately (reap/decay first, sleep after) so a single-shot
     `iterations=1` call actually reaps/decays before returning, rather than only
     sleeping once and doing nothing.
+
+    Resilience (finding C4):
+
+    * Each pass runs OFF the event-loop thread via `asyncio.to_thread`. `reap_once`
+      and `decay_once` are blocking SQLite calls on a connection whose
+      `busy_timeout` is 5s (`db._configure`); running them inline on the loop
+      thread would freeze the entire ASGI server for up to that long on any
+      contended write, every interval. Offloading keeps the loop responsive. The
+      reaper's dedicated `conn` is used ONLY from these `to_thread` workers and the
+      passes are awaited sequentially, so at most one thread ever touches the
+      connection at a time -- the same "sequential hand-off across threadpool
+      workers" guarantee `server.app.get_conn` relies on, and safe because
+      `db.connect` opens the handle with `check_same_thread=False` under SQLite's
+      serialized threading mode.
+    * Each pass is wrapped in try/except: a transient error (e.g.
+      `sqlite3.OperationalError: database is locked` when a write loses the
+      busy-timeout race) is logged at WARNING with its traceback and the loop
+      CONTINUES. The reaper must never die on a transient error -- previously an
+      unguarded raise killed the task for the rest of the process lifetime (no
+      reaping, no pheromone decay, and nothing observed the dead task).
+      `asyncio.CancelledError` is a `BaseException`, not caught here, so the
+      last-resort `task.cancel()` fallback still propagates cleanly.
+
+    Events compaction (WP3.1, finding S2): each pass may additionally run
+    `events.compact_events` on the same connection (same `to_thread` pattern),
+    THROTTLED to at most one compaction per `compact_interval` seconds (default
+    `SWARMSYNC_EVENTS_COMPACT_INTERVAL` env or 60s) regardless of how fast the
+    reaper ticks. The first pass always compacts (the throttle bounds the rate,
+    not the start), so an `iterations=1` test drive exercises compaction too.
+
+    Deterministic shutdown (WP3.1, adversarial-review P2): `stop`, when given, is
+    checked between passes and preempts the inter-pass sleep. Previously the ONLY
+    shutdown path was `task.cancel()`, and the CancelledError interrupts the
+    AWAIT on `asyncio.to_thread`, not the worker thread inside it -- `run()`
+    propagated immediately while `reap_once`/`decay_once` was still executing on
+    this connection, the lifespan then closed that connection from the loop
+    thread, and the still-running worker hit `sqlite3.ProgrammingError: Cannot
+    operate on a closed database` into a discarded future (worst case, closing a
+    handle mid-`sqlite3_step` is documented SQLite misuse -- observed as a real
+    segfault under the test suite). It also falsified the paragraph above: a
+    second thread (the orphaned worker) could touch the connection after run()
+    had returned. With `stop`, the lifespan sets the event and AWAITS the task;
+    an in-flight pass completes before `run()` returns, so the caller closes the
+    connection only after the last worker is done -- the "at most one thread
+    ever touches the connection at a time" claim holds again.
     """
+    if compact_interval is None:
+        compact_interval = _compact_interval_from_env()
+    last_compact = float("-inf")
     done = 0
     while True:
+        if stop is not None and stop.is_set():
+            return
         now = time.time()
-        reap_once(conn, now)
-        decay_once(conn, half_life, ts=now)
+        try:
+            # Off-thread so a contended 5s busy_timeout write cannot stall the loop.
+            await asyncio.to_thread(reap_once, conn, now)
+            await asyncio.to_thread(decay_once, conn, half_life, now)
+            if now - last_compact >= compact_interval:
+                # Mark BEFORE the pass: a failing compaction must not retry every
+                # tick (it would spam the log at reaper cadence, not compact cadence).
+                last_compact = now
+                await asyncio.to_thread(events_mod.compact_events, conn, None, None, now)
+        except Exception:
+            # Never let a transient error kill the reaper: log + continue. (Does not
+            # catch CancelledError, which is a BaseException -- the last-resort
+            # cancellation fallback still propagates out of run().)
+            logger.warning("reaper pass failed; continuing", exc_info=True)
         done += 1
         if iterations is not None and done >= iterations:
             return
-        await asyncio.sleep(interval)
+        if stop is None:
+            await asyncio.sleep(interval)
+        else:
+            # Sleep, but wake IMMEDIATELY if shutdown is signalled mid-sleep --
+            # `stop.wait()` resolving means "exit now", a timeout means "next pass".
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=interval)
+                return
+            except asyncio.TimeoutError:
+                pass

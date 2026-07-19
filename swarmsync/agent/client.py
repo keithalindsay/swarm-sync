@@ -23,10 +23,11 @@ SDK worker later: the wire protocol/methods below stay identical; only
 """
 from __future__ import annotations
 
-import os
 from typing import Any, Optional, Protocol, cast
 
 import httpx
+
+from swarmsync import config
 
 # Ordinary blackboard calls (lease, heartbeat, parcel_update, ...) are small SQLite
 # writes behind a localhost socket -- milliseconds. 30s is a generous ceiling that
@@ -38,10 +39,12 @@ DEFAULT_TIMEOUT_SECONDS = 30.0
 # `/integrate` is different in kind: it blocks on the integrator's pytest gate, which
 # bounds ITSELF at SWARMSYNC_GATE_TIMEOUT (default 600s). The client must therefore
 # outlive the gate, or it reports a failure the server is about to turn into a
-# successful merge. Mirrors `coordinator.integrator._gate_timeout`'s env contract
-# rather than importing it (the agent client must not depend on the coordinator).
+# successful merge. WP4.2: both this module and the gate now read the SAME
+# accessor, `config.gate_timeout()` (the previous local re-parse of the env var
+# had every opportunity to drift), and `swarmsync.config` sits below every layer
+# so the agent client still does not depend on the coordinator.
 INTEGRATE_TIMEOUT_MARGIN_SECONDS = 60.0
-DEFAULT_GATE_TIMEOUT_SECONDS = 600.0
+DEFAULT_GATE_TIMEOUT_SECONDS = config.DEFAULT_GATE_TIMEOUT_SECONDS
 
 
 def _integrate_timeout() -> float:
@@ -50,21 +53,57 @@ def _integrate_timeout() -> float:
     The margin covers the merge, the whole-repo re-index and the rollback that
     bracket the gate inside `integrate()` -- none of which the gate timeout counts.
     """
-    raw = os.environ.get("SWARMSYNC_GATE_TIMEOUT")
-    gate = DEFAULT_GATE_TIMEOUT_SECONDS
-    if raw:
-        try:
-            parsed = float(raw)
-            if parsed > 0:
-                gate = parsed
-        except ValueError:
-            pass
-    return gate + INTEGRATE_TIMEOUT_MARGIN_SECONDS
+    return config.gate_timeout() + INTEGRATE_TIMEOUT_MARGIN_SECONDS
 
 
 class _HttpLike(Protocol):
     def get(self, url: str, **kwargs: Any) -> Any: ...
     def post(self, url: str, **kwargs: Any) -> Any: ...
+
+
+class BlackboardUnreachable(httpx.HTTPError):
+    """The blackboard could not be reached at all (connection refused / timed out) --
+    distinct from an HTTP error the server actually returned. Subclasses
+    `httpx.HTTPError` so any caller already catching that keeps working (the CLI,
+    `doctor`), while the broker/runner/demo -- which catch nothing -- surface this
+    one actionable line instead of a raw httpx traceback (U6)."""
+
+
+class _UnreachableTranslatingHttp:
+    """Wrap the real `httpx.Client` so a connection failure becomes a
+    `BlackboardUnreachable` naming the URL and the likely fix. Applied ONLY on the
+    URL-string (real-socket) path; an injected TestClient never connects out, so it
+    is passed through untouched."""
+
+    def __init__(self, inner: httpx.Client, base_url: str) -> None:
+        self._inner = inner
+        self._base_url = base_url
+
+    def _translate(self, call: Any) -> Any:
+        try:
+            return call()
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            raise BlackboardUnreachable(
+                f"cannot reach the blackboard at {self._base_url} ({exc}); "
+                f"is `swarmsync-serve` running? Point elsewhere with $SWARMSYNC_URL."
+            ) from exc
+
+    def get(self, url: str, **kwargs: Any) -> Any:
+        return self._translate(lambda: self._inner.get(url, **kwargs))
+
+    def post(self, url: str, **kwargs: Any) -> Any:
+        return self._translate(lambda: self._inner.post(url, **kwargs))
+
+    def close(self) -> None:
+        self._inner.close()
+
+    def __getattr__(self, name: str) -> Any:
+        # Stay transparent for introspection (`.timeout`, `.base_url`, …): anything
+        # this shim doesn't wrap falls through to the real client. Guard `_inner`
+        # so a lookup before __init__ sets it can't recurse.
+        if name == "_inner":
+            raise AttributeError(name)
+        return getattr(self._inner, name)
 
 
 class BlackboardClient:
@@ -87,9 +126,12 @@ class BlackboardClient:
             # `integrate()` additionally overrides this per-request; see below.
             self._http: _HttpLike = cast(
                 _HttpLike,
-                httpx.Client(
-                    base_url=http,
-                    timeout=DEFAULT_TIMEOUT_SECONDS if timeout is None else timeout,
+                _UnreachableTranslatingHttp(
+                    httpx.Client(
+                        base_url=http,
+                        timeout=DEFAULT_TIMEOUT_SECONDS if timeout is None else timeout,
+                    ),
+                    http,
                 ),
             )
             self._owns_http = True
@@ -119,8 +161,28 @@ class BlackboardClient:
         r.raise_for_status()
         return r.json()
 
-    def events(self, since: int = 0, limit: int = 1000) -> list[dict]:
-        r = self._http.get("/events", params={"since": since, "limit": limit})
+    def health(self) -> dict:
+        """`GET /health` -- the operational snapshot (WP5.1): `version`, `root`,
+        `db_path`, `active_leases`, `last_event_seq`. Unauthenticated server-side;
+        the one read that answers "is the blackboard up, and bound to which repo?"."""
+        r = self._http.get("/health")
+        r.raise_for_status()
+        return r.json()
+
+    def events(
+        self, since: int = 0, limit: int = 1000, tail: Optional[int] = None
+    ) -> list[dict]:
+        """`GET /events` -- forward page (`since`/`limit`, the default) or, when
+        `tail` is given, the NEWEST `tail` events in ascending seq order
+        (`?tail=N`, WP4.5/C17 -- the "what happened recently" awareness read).
+        `tail` and `since` are mutually exclusive on the server (422), so a
+        `tail` request sends ONLY `tail` and ignores the `since`/`limit`
+        defaults rather than tripping that guard."""
+        if tail is not None:
+            params: dict[str, int] = {"tail": tail}
+        else:
+            params = {"since": since, "limit": limit}
+        r = self._http.get("/events", params=params)
         r.raise_for_status()
         return r.json()
 
@@ -224,6 +286,7 @@ class BlackboardClient:
         repo: str,
         base_commit: Optional[str] = None,
         into: str = "integration",
+        expected_read_deps: Optional[dict[str, str]] = None,
     ) -> dict:
         """`POST /integrate` -> the integrator's response dict (U10:
         `coordinator.integrator.IntegrateResult`, serialized as JSON --
@@ -231,10 +294,15 @@ class BlackboardClient:
 
         `repo` is the filesystem path to the git repo `branch` lives in --
         required since U10's integrator needs it to actually run `git merge`
-        + pytest. Deliberately does NOT `raise_for_status()`: the integrator's
-        rejection/needs-rebase outcomes are ordinary 200 responses (only a
-        real plumbing error is a non-2xx), so callers (see `runner.run_agent`)
-        should inspect `result["status"]` rather than the HTTP status alone.
+        + pytest. `expected_read_deps` (WP4.6/A1, DESIGN §5.5) is the caller's
+        plan-time `{parcel_or_contract_id: expected_hash}` snapshot of its
+        read-dependencies; when given, the integrator re-checks each against
+        the blackboard's current hash BEFORE merging and answers
+        `needs_rebase` (no merge) on any mismatch. Deliberately does NOT
+        `raise_for_status()`: the integrator's rejection/needs-rebase outcomes
+        are ordinary 200 responses (only a real plumbing error is a non-2xx),
+        so callers (see `runner.run_agent`) should inspect `result["status"]`
+        rather than the HTTP status alone.
         """
         body: dict[str, Any] = {
             "agent_id": agent_id,
@@ -244,6 +312,8 @@ class BlackboardClient:
         }
         if base_commit is not None:
             body["base_commit"] = base_commit
+        if expected_read_deps is not None:
+            body["expected_read_deps"] = dict(expected_read_deps)
         # This one request must outlive the server's pytest gate. Timing out here does
         # NOT cancel the merge -- the server keeps going and lands it -- so a client
         # that gives up early doesn't abort the work, it just stops being told the
@@ -261,5 +331,4 @@ class BlackboardClient:
             result = r.json()
         except ValueError:
             result = {"detail": r.text}
-        result["_status_code"] = r.status_code
         return result

@@ -40,12 +40,13 @@ group_schedulable(conn, tasks, ...) -> list[list[Task]]
   each wave is a maximal set of mutually co-schedulable tasks. This is what
   turns the pairwise relation into an actual schedule.
 
-run(conn, repo, tasks, client, n_agents=4, mode="file") -> dict[task_id, AgentResult]
+run(conn, repo, tasks, client, n_agents=4, mode="file", db_path=None)
+    -> dict[task_id, AgentResult]
   Dispatch every task to completion: partition into waves, run each wave's
   tasks concurrently (bounded by `n_agents`), retry a task that comes back
   `lease_denied` (contention with a still-active holder, OR the task's
   original agent crashed and hasn't aged out yet) under a fresh agent id with
-  backoff -- this is both DESIGN §7 money-shot #2 ("contended parcel
+  backoff -- this is both DESIGN §7 test case #2 ("contended parcel
   serializes... waits, then acquires") and the "task whose agent is reaped
   is reassigned and completes" behavior this unit's done-when asks for, via
   the SAME retry loop: `leases.acquire`'s lazy expiry (U5) means a
@@ -58,7 +59,7 @@ run(conn, repo, tasks, client, n_agents=4, mode="file") -> dict[task_id, AgentRe
 Design notes (this unit's own decisions):
 
 - **Frozen-contract targets are auto-upgraded to an EXCLUSIVE lease** (U15,
-  DESIGN §5.3, money-shot #3): `run` already computes `frozen_ids` for
+  DESIGN §5.3, test case #3): `run` already computes `frozen_ids` for
   `group_schedulable`'s co-schedulability check when `contract_aware=True`
   (the default); `_run_task_once` reuses that SAME set so any task whose
   resolved target parcel is a frozen contract gets `lease_modes=
@@ -89,15 +90,16 @@ Design notes (this unit's own decisions):
   genuinely parallel across a wave -- each agent's worktree is its own
   isolated directory (DESIGN §5.1) -- only the shared-trunk merge step
   serializes, which is exactly the invariant DESIGN §5.4 needs.
-- **`blackboard/db.py` gained `PRAGMA busy_timeout=5000`** as part of this
-  unit (a one-line addition, same shape as U7's `check_same_thread=False`
-  fix): U12 is the first unit to genuinely dispatch concurrent writers
-  against the one shared connection, and `sqlite3.threadsafety == 3`
-  (SQLite compiled "serialized") on this host makes that safe in principle,
-  but a losing writer's default behavior on a lock conflict is to raise
-  immediately rather than wait -- a real risk once tasks truly run in
-  parallel threads. `busy_timeout` makes a loser wait instead of erroring;
-  harmless to every earlier unit's (single-threaded) tests.
+- **Per-thread connections (WP4.6, finding A7):** `run(db_path=...)` gives
+  every worker task its OWN `db.connect(db_path)` connection, opened when the
+  task starts and closed when it finishes -- the same per-actor connection
+  discipline the server itself adopted in S4 (per-request `get_conn`, a
+  dedicated reaper connection). When `db_path` is omitted, every worker
+  shares the single caller-supplied `conn` -- the documented FALLBACK for
+  direct-conn callers (SQLite's serialized mode plus `db.py`'s
+  `busy_timeout=5000` keep that safe, as it always was), not the preferred
+  mode. `run` itself (wave planning, `load_scheduling_graph`) always uses the
+  caller's `conn` on the calling thread either way.
 - **Read-dependencies are fetched, not leased.** DESIGN's prose for
   `resolve_task` says "read-deps -> read-leases," but `agent.runner.
   run_agent` (U9, already built+tested) only ever takes `read_contracts` as
@@ -106,7 +108,7 @@ Design notes (this unit's own decisions):
   read-lease would add ceremony with no safety payoff yet. `task.read_deps`
   is threaded straight through to `run_agent`'s `read_contracts` param
   unchanged; a literal read-lease is left for whichever later unit
-  (money-shot #3, U15) actually needs to gate on one.
+  (test case #3, U15) actually needs to gate on one.
 - **Greedy wave partitioning**, not an optimal graph coloring: `tasks` is
   walked in order, each task joining the first existing wave it is
   co-schedulable with everything already in, else starting a new wave. This
@@ -117,6 +119,7 @@ Design notes (this unit's own decisions):
 """
 from __future__ import annotations
 
+import logging
 import sqlite3
 import threading
 import time
@@ -126,7 +129,9 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Union
 
 from swarmsync.agent.runner import AgentResult, run_agent
+from swarmsync.blackboard import db
 from swarmsync.blackboard.models import Parcel
+from swarmsync.blackboard.parcel_id import module_id as _module_id
 from swarmsync.classifier.graph import (
     DepGraph,
     build_graph,
@@ -134,12 +139,14 @@ from swarmsync.classifier.graph import (
     co_schedulable,
 )
 from swarmsync.coordinator import reaper
+from swarmsync.worktree.git_ops import GitOpsError
 
 StrPath = Union[str, Path]
 
-MODULE_SYMBOL = "<module>"
 DEFAULT_MAX_ATTEMPTS = 5
 DEFAULT_RETRY_BACKOFF = 0.2
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -164,10 +171,6 @@ class Task:
     read_deps: list[str] = field(default_factory=list)
     base_commit: Optional[str] = None
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
-
-
-def _module_id(file: str) -> str:
-    return f"{file}::{MODULE_SYMBOL}"
 
 
 def _load_parcel(conn: sqlite3.Connection, parcel_id: str) -> Optional[Parcel]:
@@ -321,7 +324,7 @@ def _run_task_once(
     frozen_ids: Optional[set[str]] = None,
 ) -> AgentResult:
     target_parcels = resolve_task(conn, task, mode=mode)
-    # DESIGN §5.3 (money-shot #3, U15): any target parcel that is ALREADY a
+    # DESIGN §5.3 (test case #3, U15): any target parcel that is ALREADY a
     # frozen contract (per the SAME `frozen_ids` this call's wave was
     # scheduled against, `load_scheduling_graph`) must be taken under an
     # EXCLUSIVE lease, not whatever `lease_mode` the task/caller happened to
@@ -357,7 +360,7 @@ def _run_task_with_retries(
     frozen_ids: Optional[set[str]] = None,
 ) -> AgentResult:
     """Drive one task to completion, retrying under a fresh agent id on
-    `lease_denied` -- contention with a still-live holder (money-shot #2) or
+    `lease_denied` -- contention with a still-live holder (test case #2) or
     a crashed original holder that hasn't aged out/been reaped yet (this
     unit's "reassigned and completes" case) look identical from here, and
     both resolve the same way: back off, let `reap_once` run (bookkeeping;
@@ -383,6 +386,111 @@ def _run_task_with_retries(
     return result
 
 
+def _error_result(task: Task, exc: Exception) -> AgentResult:
+    """A structured `status="error"` result for a task whose runner RAISED (rather
+    than returning `run_agent`'s own contained error result) -- same shape either
+    way, so `run`'s callers see one uniform error surface."""
+    return AgentResult(
+        agent_id=f"{task.task_id}-broker",
+        task=task.task_id,
+        status="error",
+        error=f"{type(exc).__name__}: {exc}",
+        error_type=type(exc).__name__,
+    )
+
+
+def _contained_attempt(
+    conn: sqlite3.Connection,
+    repo: StrPath,
+    client: Any,
+    task: Task,
+    mode: str,
+    retry_backoff: float,
+    frozen_ids: Optional[set[str]] = None,
+) -> AgentResult:
+    """One full `_run_task_with_retries` pass that can FAIL but never RAISE.
+
+    `run_agent` already contains its own work-phase exceptions (C11), so a raise
+    reaching here means something outside that containment blew up (resolve_task
+    against a mutated blackboard, the reaper pass, or a runner bug). Either way
+    the broker's contract is the same: record an error result for THIS task and
+    let the rest of the run proceed."""
+    try:
+        return _run_task_with_retries(
+            conn, repo, client, task, mode, retry_backoff, frozen_ids=frozen_ids
+        )
+    except Exception as exc:
+        logger.warning(
+            "broker: task %r raised %s: %s -- recording an error result and "
+            "continuing the run",
+            task.task_id,
+            type(exc).__name__,
+            exc,
+        )
+        return _error_result(task, exc)
+
+
+def _is_transient_git_failure(result: AgentResult) -> bool:
+    """True iff this error result came from a `GitOpsError` -- git's own transient
+    ref/index lock contention, the one failure class concurrent `git worktree
+    add`/checkout in a single repo can hit under exactly the concurrency the
+    broker creates, and therefore the one class worth a bounded retry."""
+    return result.status == "error" and result.error_type == GitOpsError.__name__
+
+
+def _run_task_contained(
+    conn: sqlite3.Connection,
+    repo: StrPath,
+    client: Any,
+    task: Task,
+    mode: str,
+    retry_backoff: float,
+    frozen_ids: Optional[set[str]] = None,
+) -> AgentResult:
+    """C11/WP3.6 broker containment: drive one task, absorbing failure.
+
+    A per-task failure -- whether `run_agent`'s contained `status="error"` result
+    or an outright raise -- is recorded as that task's result; it never aborts the
+    run or discards sibling results. One class gets a single bounded retry: a
+    `GitOpsError` (identified via `error_type`, since the exception object itself
+    is contained inside the runner) is transient git lock contention, so the task
+    is re-run ONCE under the same task id (fresh worktree -- `add_worktree` prunes
+    the failed attempt's leftovers). The retry is logged at WARNING so it is
+    inspectable; a second failure of any kind records the error result. Arbitrary
+    non-git errors are NOT presumed transient and are never silently re-run."""
+    result = _contained_attempt(
+        conn, repo, client, task, mode, retry_backoff, frozen_ids=frozen_ids
+    )
+    if _is_transient_git_failure(result):
+        logger.warning(
+            "broker: task %r failed with a GitOpsError (%s) -- transient git "
+            "lock contention; retrying once",
+            task.task_id,
+            result.error,
+        )
+        result = _contained_attempt(
+            conn, repo, client, task, mode, retry_backoff, frozen_ids=frozen_ids
+        )
+        if result.status == "error":
+            logger.warning(
+                "broker: task %r failed again after its one GitOpsError retry "
+                "(%s) -- recording the error result",
+                task.task_id,
+                result.error,
+            )
+    return result
+
+
+def _open_task_conn(db_path: StrPath) -> sqlite3.Connection:
+    """One fresh blackboard connection for ONE worker task (WP4.6, A7).
+
+    A seam rather than an inline `db.connect` call so tests can instrument it
+    (count/collect the per-worker connections) without also intercepting every
+    other `db.connect` in the process (the server's per-request `get_conn`
+    uses the same module function)."""
+    return db.connect(db_path)
+
+
 def run(
     conn: sqlite3.Connection,
     repo: StrPath,
@@ -392,6 +500,7 @@ def run(
     mode: str = "file",
     contract_aware: bool = True,
     retry_backoff: float = DEFAULT_RETRY_BACKOFF,
+    db_path: Optional[StrPath] = None,
 ) -> dict[str, AgentResult]:
     """Drive every task in `tasks` to completion (DESIGN §5, §6).
 
@@ -402,8 +511,21 @@ def run(
     3. Merges are serialized regardless of wave concurrency -- see
        `_SerializingIntegrateClient`.
 
+    `db_path` (WP4.6, A7): when given, each worker task runs on its OWN
+    `db.connect(db_path)` connection (opened at task start, closed in a
+    `finally` when the task's attempts finish) instead of every thread sharing
+    `conn` -- the same per-actor connection model the server uses per request.
+    `conn` is still required and still used for everything on the CALLING
+    thread (wave partitioning, the scheduling graph). Omitting `db_path` keeps
+    the pre-WP4.6 single-shared-connection behavior as the documented fallback
+    for callers that only hold a Connection.
+
     Returns `{task_id: AgentResult}` for every task in `tasks`, keyed by
-    `task.task_id` (its LAST attempt's result if it needed retries).
+    `task.task_id` (its LAST attempt's result if it needed retries). A task
+    that FAILS (C11/WP3.6) comes back as `status="error"` in that same dict --
+    one task's failure never aborts the run or discards sibling results, and a
+    `GitOpsError` failure (transient git lock contention) gets one bounded,
+    logged retry first -- see `_run_task_contained`.
 
     `mode="symbol"` refuses before ANY side effect (parked -- see
     `classifier.graph.check_file_granularity`): guarded on entry rather than
@@ -419,23 +541,42 @@ def run(
     waves = group_schedulable(conn, tasks, mode=mode, graph=graph, frozen_ids=frozen_ids)
     serial_client = _SerializingIntegrateClient(client, threading.Lock())
 
+    def _dispatch(task: Task) -> AgentResult:
+        """Run one task on a worker thread. In `db_path` mode the whole retry
+        loop for this task runs on its own fresh connection, closed here no
+        matter how the attempts end (A7); without `db_path`, the caller's
+        shared `conn` is used -- the documented direct-conn fallback."""
+        if db_path is None:
+            return _run_task_contained(
+                conn, repo, serial_client, task, mode, retry_backoff, frozen_ids
+            )
+        task_conn = _open_task_conn(db_path)
+        try:
+            return _run_task_contained(
+                task_conn, repo, serial_client, task, mode, retry_backoff, frozen_ids
+            )
+        finally:
+            task_conn.close()
+
     results: dict[str, AgentResult] = {}
     for wave in waves:
         workers = max(1, min(n_agents, len(wave)))
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {
-                pool.submit(
-                    _run_task_with_retries,
-                    conn,
-                    repo,
-                    serial_client,
-                    task,
-                    mode,
-                    retry_backoff,
-                    frozen_ids,
-                ): task
-                for task in wave
-            }
+            futures = {pool.submit(_dispatch, task): task for task in wave}
             for future, task in futures.items():
-                results[task.task_id] = future.result()
+                # C11/WP3.6: a per-task failure must never abort the run --
+                # `_run_task_contained` absorbs Exceptions, and this catch is the
+                # last line of defense should one still escape: record it as THIS
+                # task's error result and keep collecting the siblings' results.
+                try:
+                    results[task.task_id] = future.result()
+                except Exception as exc:
+                    logger.warning(
+                        "broker: task %r escaped containment with %s: %s -- "
+                        "recording an error result and continuing the run",
+                        task.task_id,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    results[task.task_id] = _error_result(task, exc)
     return results

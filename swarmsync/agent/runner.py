@@ -13,7 +13,7 @@ Unit U9. Implements the per-agent loop DESIGN §4.3 specifies:
      against; this unit fetches the current contract so that snapshot exists).
   5. `git_ops.add_worktree`; apply the edit via a scripted mutator
      (`agent/mutators.py`); heartbeat on a background daemon thread the whole
-     time so a hard-killed process (SIGKILL, money-shot #4) simply stops
+     time so a hard-killed process (SIGKILL, test case #4) simply stops
      heartbeating with no explicit cleanup needed -- the reaper (U11)
      reclaims the lease once its TTL lapses.
   6. `commit_all`; for each target parcel, re-derive its real `content_hash`
@@ -30,23 +30,34 @@ for the caller (a test, or later the broker/U12) to assert against.
 
 U15 adds `lease_modes`: a per-parcel lease-mode override so a caller (the
 broker) can force `"exclusive"` on exactly the target parcels that are
-frozen contracts (DESIGN §5.3, money-shot #3) while leaving every other
+frozen contracts (DESIGN §5.3, test case #3) while leaving every other
 target parcel on the task's default `lease_mode`.
 """
 from __future__ import annotations
 
+import logging
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
 
 from swarmsync.agent.client import BlackboardClient
+from swarmsync.blackboard.parcel_id import split as _split_parcel_id
 from swarmsync.classifier.indexer import parse_file
 from swarmsync.worktree import git_ops
 
 StrPath = Union[str, Path]
 
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 5.0
+
+# WP4.6 (C17): how many of the NEWEST events the read-the-world step fetches
+# (`GET /events?tail=N`, WP4.5). Matches the client's default page size and the
+# server's MAX_EVENTS_LIMIT cap -- the same volume the old `since=0` read got,
+# but anchored at the newest end of the log instead of the oldest, so the
+# awareness signal stays recent activity even once the log outgrows one page.
+EVENTS_READ_TAIL = 1000
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -55,7 +66,7 @@ class AgentResult:
 
     agent_id: str
     task: str
-    status: str  # "done" | "lease_denied"
+    status: str  # "done" | "lease_denied" | "error"
     branch: Optional[str] = None
     commit_sha: Optional[str] = None
     lease_ids: dict[str, int] = field(default_factory=dict)
@@ -65,15 +76,19 @@ class AgentResult:
     integrate_result: Optional[dict] = None
     lease_modes_used: dict[str, str] = field(default_factory=dict)  # parcel_id -> mode
     # actually granted -- lets a caller/test confirm a frozen-contract target
-    # really was leased `exclusive` (DESIGN §5.3, money-shot #3, U15), not
+    # really was leased `exclusive` (DESIGN §5.3, test case #3, U15), not
     # just whatever `lease_mode` it happened to pass.
+    error: Optional[str] = None  # "ExcType: message" summary when status == "error" (C11)
+    error_type: Optional[str] = None  # exception class name -- the broker's bounded
+    # GitOpsError retry (WP3.6) keys off this, so it must survive the
+    # exception object itself not crossing the thread boundary.
 
 
 class _Heartbeater:
     """Background daemon thread bumping TTL on a set of leases until stopped.
 
     Runs off the main thread (DESIGN §4.3 step 5) so a hard-killed agent
-    process (SIGKILL, money-shot #4) simply stops heartbeating -- there is
+    process (SIGKILL, test case #4) simply stops heartbeating -- there is
     nothing to explicitly clean up in that scenario; the reaper (U11)
     reclaims the lease once `ttl_expires_at` lapses. Under a normal
     (non-crashed) run, `stop()` is called from `run_agent`'s OUTER `finally` --
@@ -110,12 +125,20 @@ class _Heartbeater:
             for lease_id in list(self._lease_ids):
                 try:
                     self._client.heartbeat(self._agent_id, lease_id)
-                except Exception:
+                except Exception as exc:
                     # A heartbeat failure (e.g. the server went away) must never
                     # crash the background thread -- it just means this beat is
                     # lost and the reaper may reclaim the lease, which is a
                     # legitimate outcome the runner's own protocol handles.
-                    pass
+                    # Logged (WP4.4/A8) so a blackboard dying mid-run leaves a
+                    # trace instead of silently losing every beat.
+                    logger.warning(
+                        "heartbeat for lease %s (agent %s) failed: %s -- beat "
+                        "lost; the reaper may reclaim the lease at TTL expiry",
+                        lease_id,
+                        self._agent_id,
+                        exc,
+                    )
 
     def stop(self) -> None:
         self._stop.set()
@@ -123,7 +146,12 @@ class _Heartbeater:
             self._thread.join(timeout=self._interval + 1.0)
 
 
-def _cleanup_worktree(repo: Path, agent_id: str, delete_branch: bool = False) -> None:
+def _cleanup_worktree(
+    repo: Path,
+    agent_id: str,
+    delete_branch: bool = False,
+    park_branch: bool = False,
+) -> None:
     """Best-effort teardown of this agent's worktree + branch (S5).
 
     Called from a `finally` after integrate/release on the done path, and on the
@@ -140,11 +168,48 @@ def _cleanup_worktree(repo: Path, agent_id: str, delete_branch: bool = False) ->
     `pre_merge_sha`, so this branch is the ONLY reference to the agent's commits.
     Deleting it there makes the work unreachable and destroys the rebase-and-
     resubmit path DESIGN §5.5 promises.
+
+    `park_branch` (WP3.5): keeping the branch was NOT enough. Broker attempt ids
+    are deterministic (`{task_id}-attempt-{n}`), and `git_ops.add_worktree` runs
+    `_prune_stale_worktree` -- which `git branch -D`s the same-named branch --
+    at the top of every call, so a re-run of the same task list destroyed the
+    "kept" branch before doing anything else. When `park_branch=True` (the
+    committed-but-not-landed paths), the branch's tip is additionally parked
+    under `rejected/<agent_id>-<UTC ts>` (`git_ops.park_branch`), a namespace
+    pruning never deletes, making the preserved-commits contract survive reruns.
     """
     try:
+        if park_branch and not delete_branch:
+            parked = git_ops.park_branch(repo, agent_id)
+            logger.info(
+                "run_agent(%s): merge did not land; branch parked as %r -- the "
+                "rejected commits stay reachable there even after a re-run of the "
+                "same task id prunes branch %r",
+                agent_id,
+                parked,
+                agent_id,
+            )
+    except git_ops.GitOpsError as exc:
+        # e.g. the branch was never created (the failure predates add_worktree);
+        # nothing to park, and cleanup must never become the reason a run fails.
+        logger.debug(
+            "cleanup for agent %s: park_branch failed (%s) -- usually the "
+            "branch was never created; continuing",
+            agent_id,
+            exc,
+        )
+    try:
         git_ops.remove_worktree(repo, agent_id, delete_branch=delete_branch)
-    except git_ops.GitOpsError:
-        pass
+    except git_ops.GitOpsError as exc:
+        # Best-effort by design (there may be no worktree to remove, e.g. on
+        # the lease_denied path) -- but leave a trace (WP4.4/A8) instead of
+        # discarding the failure entirely.
+        logger.debug(
+            "cleanup for agent %s: remove_worktree failed (%s) -- there may "
+            "have been nothing to remove; continuing",
+            agent_id,
+            exc,
+        )
 
 
 def _state_summary(parcel, task: str) -> str:
@@ -202,13 +267,32 @@ def run_agent(
     ever created for a task that can't get all of its locks (DESIGN §5.2: a
     misprediction just loses the CAS race and serializes, it never partially
     proceeds).
+
+    C11 failure containment (WP3.6): an `Exception` anywhere in the work phase
+    (contract fetch, `add_worktree`, the mutator, `commit_all`, or the HTTP
+    calls after them) does NOT raise out of this function -- every lease this
+    attempt holds is released best-effort, the worktree is torn down as usual,
+    and a `status="error"` result is returned carrying the exception summary
+    (`error`) and class name (`error_type`). `KeyboardInterrupt`/`SystemExit`
+    still propagate. This covers IN-PROCESS exceptions only, and deliberately
+    does not change the crash-recovery story: a SIGKILLed agent process has
+    nothing to run an except path, so its leases still leak until TTL expiry /
+    the reaper reclaims them (DESIGN §6) -- that remains by design.
     """
     mutator_kwargs = mutator_kwargs or {}
     repo = Path(repo)
 
     # 1. read current state (advisory -- the CAS lease is the real safety net).
-    client.parcels()
-    client.events(since=0)
+    # The parcel listing doubles as the PLAN-TIME hash snapshot (WP4.6/A1): the
+    # content_hash each id carries HERE is what this agent plans against, and
+    # what step 6 submits as `expected_read_deps` for the integrator's
+    # optimistic re-check (DESIGN §5.5). The events read is the newest page
+    # (`tail=`, WP4.5/C17), not the oldest -- `since=0` returned the log's
+    # FIRST 1000 rows, which past one page is pure noise, not awareness.
+    plan_parcel_hashes: dict[str, Optional[str]] = {
+        p["id"]: p.get("content_hash") for p in client.parcels()
+    }
+    client.events(tail=EVENTS_READ_TAIL)
 
     # 2. declare intent -> drops a 'planned' pheromone + event per target parcel.
     client.intent(agent_id, task, target_parcels)
@@ -240,23 +324,70 @@ def run_agent(
         lease_ids[parcel_id] = result["lease_id"]
         lease_modes_used[parcel_id] = mode
 
-    # 4. read-dependency contracts (drift detection vs. a plan-time snapshot
-    # is the broker's/U12's job; this unit fetches the current state).
-    contract_snapshot: dict[str, Optional[dict]] = {
-        symbol: client.contract(symbol) for symbol in (read_contracts or [])
-    }
-
     heartbeater = _Heartbeater(client, agent_id, interval=heartbeat_interval)
     for lease_id in lease_ids.values():
         heartbeater.add(lease_id)
     heartbeater.start()
 
-    # Everything from here owns a worktree; the outer `finally` tears it down
-    # after integrate/release -- and on any mid-way failure too -- so nothing
-    # leaks for a rerun to collide with (S5). `landed` stays False unless the
-    # integrator reports `merged`, so a failure anywhere in here keeps the branch.
+    # Everything from here holds leases (and soon a worktree); the outer `finally`
+    # tears the worktree down after integrate/release -- and on any mid-way failure
+    # too -- so nothing leaks for a rerun to collide with (S5). `landed` stays False
+    # unless the integrator reports `merged`, so a failure anywhere in here keeps
+    # the branch.
+    #
+    # C11 failure containment (the `except` below): any `Exception` out of this
+    # work phase -- the contract fetch, `add_worktree`, the mutator, `commit_all`,
+    # or the HTTP calls that follow -- used to propagate to the caller with every
+    # acquired lease still ACTIVE until TTL expiry (leaked), and the broker then
+    # re-raised it out of `future.result()`, aborting the whole run. Now the
+    # except path releases every lease this attempt holds (best-effort) and
+    # returns a structured `status="error"` result instead of raising.
+    # `KeyboardInterrupt`/`SystemExit` are deliberately NOT masked (Exception,
+    # not BaseException). This covers in-process exceptions ONLY and does not
+    # change the crash-recovery story: a SIGKILLed agent process runs no except
+    # path, so its leases still leak until TTL/reaper reclaim (DESIGN §6) -- by
+    # design, and the reaper is exactly the backstop for that case.
+    contract_snapshot: dict[str, Optional[dict]] = {}
     landed = False
+    commit_sha: Optional[str] = None  # set once commit_all succeeds -- the outer
+    # finally parks the branch only when there IS a commit to preserve (WP3.5).
     try:
+        # 4. read-dependency contracts (fetched for the caller to diff), plus the
+        # plan-time hash snapshot this run will SUBMIT as `expected_read_deps`
+        # (WP4.6/A1 -- the integrator's optimistic re-check, DESIGN §5.5). Inside
+        # containment because the leases are already held here: a failing GET must
+        # release them like any other work-phase failure.
+        #
+        # SHAPE RECONCILIATION (the "wired but always/never fires" trap):
+        # `integrator._check_read_deps` looks each id up in `parcels` FIRST and
+        # compares against `parcels.content_hash`; only an id with NO parcels row
+        # falls back to `contracts.type_hash`. Contract symbols share the parcel
+        # id namespace (`<path>::<symbol>` -- a frozen contract's symbol IS its
+        # function/class parcel's id), so for any read-dep the classifier indexed,
+        # the parcels row shadows the contract and content_hash is what gets
+        # compared. Submitting the contract fetch's `type_hash` for such an id
+        # would therefore mismatch on EVERY submit (hash of the type signature vs.
+        # hash of the source span) -- needs_rebase always. So: snapshot the
+        # parcel's content_hash when a parcels row exists (from the step-1
+        # plan-time listing), and only fall back to the contract's type_hash for
+        # an id the parcel map doesn't know. Ids that are ALSO write-targets are
+        # excluded -- this agent changes those itself (its own step-6
+        # /parcel/update would trip the check on every submit); they are guarded
+        # by its write lease, not by the optimistic re-check. An id with neither
+        # a parcel hash nor a contract is skipped (nothing existed at plan time
+        # to go stale).
+        expected_read_deps: dict[str, str] = {}
+        for symbol in read_contracts or []:
+            snapshot = client.contract(symbol)
+            contract_snapshot[symbol] = snapshot
+            if symbol in target_parcels:
+                continue
+            parcel_hash = plan_parcel_hashes.get(symbol)
+            if parcel_hash is not None:
+                expected_read_deps[symbol] = parcel_hash
+            elif snapshot is not None:
+                expected_read_deps[symbol] = snapshot["type_hash"]
+
         # 5. isolated worktree + the scripted (or real) edit.
         #
         # The heartbeat must outlive this block: step 6 posts /parcel/update and
@@ -277,7 +408,7 @@ def run_agent(
         # every lease held.
         updated_parcels: dict[str, str] = {}
         for parcel_id in target_parcels:
-            path, _, _symbol = parcel_id.partition("::")
+            path, _symbol = _split_parcel_id(parcel_id)
             fresh_parcels = parse_file(worktree / path, rel_path=path)
             match = next((p for p in fresh_parcels if p.id == parcel_id), None)
             if match is None:
@@ -294,7 +425,14 @@ def run_agent(
             updated_parcels[parcel_id] = match.content_hash
 
         integrate_result = client.integrate(
-            agent_id, branch=agent_id, repo=str(repo), base_commit=base_commit
+            agent_id,
+            branch=agent_id,
+            repo=str(repo),
+            base_commit=base_commit,
+            # WP4.6 (A1): the plan-time read-dependency snapshot built in step 4.
+            # None when this task declared no (foreign) read-deps -- the
+            # integrator's re-check stays opt-in and skipped, exactly as before.
+            expected_read_deps=expected_read_deps or None,
         )
         # Only a LANDED merge makes this agent's branch redundant; see
         # `_cleanup_worktree`. On merge_rejected/needs_rebase the integrator has
@@ -316,9 +454,56 @@ def run_agent(
             integrate_result=integrate_result,
             lease_modes_used=lease_modes_used,
         )
+    except Exception as exc:
+        # C11: contain the failure -- see the comment above the `try`. Release
+        # every lease this attempt still holds so siblings/retries can proceed
+        # immediately instead of waiting out the TTL. Best-effort: a lease that
+        # was already released on the success path just fails its re-release
+        # harmlessly, and a release the server refuses (or can't receive) is
+        # logged and left to the reaper.
+        for parcel_id, lease_id in lease_ids.items():
+            try:
+                client.release(agent_id, lease_id)
+            except Exception as release_exc:
+                logger.warning(
+                    "run_agent(%s): best-effort release of lease %s (%s) failed "
+                    "during error containment: %s -- leaving it to the TTL/reaper",
+                    agent_id,
+                    lease_id,
+                    parcel_id,
+                    release_exc,
+                )
+        summary = f"{type(exc).__name__}: {exc}"
+        logger.warning(
+            "run_agent(%s): task %r failed in the work phase (%s); leases released, "
+            "returning a structured error result",
+            agent_id,
+            task,
+            summary,
+        )
+        return AgentResult(
+            agent_id=agent_id,
+            task=task,
+            status="error",
+            lease_ids=lease_ids,
+            contract_snapshot=contract_snapshot,
+            lease_modes_used=lease_modes_used,
+            error=summary,
+            error_type=type(exc).__name__,
+        )
     finally:
         # Stopping the beat here (rather than after commit_all) is what keeps this
         # agent's lease alive across /parcel/update and /integrate's unbounded
         # pytest gate -- see the note in the try block above.
         heartbeater.stop()
-        _cleanup_worktree(repo, agent_id, delete_branch=landed)
+        # WP3.5: a run that COMMITTED work the merge did not land (merge_rejected,
+        # needs_rebase, or an error after commit_all) parks the branch under
+        # `rejected/*` so a rerun's deterministic attempt id can't prune away the
+        # only reference to those commits. A landed run deletes as before; a run
+        # that never committed has nothing worth parking.
+        _cleanup_worktree(
+            repo,
+            agent_id,
+            delete_branch=landed,
+            park_branch=commit_sha is not None and not landed,
+        )
