@@ -144,7 +144,16 @@ denied with a message like:
 swarm-sync: payments.py is leased by agent-a (~280s left on the current hold; the hold renews while its holder stays active). Pick different work -- run `swarmsync holds` to see who holds what (or GET http://127.0.0.1:8787/leases).
 ```
 
+> A Claude Code **skill** ships in this repo at [`.claude/skills/swarmsync/`](.claude/skills/swarmsync/SKILL.md):
+> it teaches an agent the lease protocol, how to respond to a deny, and the `swarmsync` CLI. Copy it
+> into your own `~/.claude/skills/` (or a project's `.claude/skills/`) so agents pick it up automatically.
+
 ### Setup
+
+**Quick path:** from your repo, run `swarmsync init-hooks` — it writes the hook block below into
+`<repo>/.claude/settings.json` (idempotently; `--dry-run` to preview, `--global` for `~/.claude`) and
+drops the `.swarmsync-active` marker to turn coordination on. Then `swarmsync doctor` confirms the
+whole setup. The rest of this section is what those two commands do, by hand.
 
 **1 — Wire the hooks.** Add this to `~/.claude/settings.json` (global) or
 `<project>/.claude/settings.json` (project-scoped), pointing the `command` paths at your actual
@@ -198,6 +207,23 @@ no-op and every edit is allowed, so installing the hooks never interferes with o
 
 **4 — Run your agents.** That's it. Edits to free files proceed silently; edits to a file another
 agent holds are denied with the message above until it's released.
+
+### Operating a session — the `swarmsync` CLI
+
+A single read-only command talks to the running blackboard over the same HTTP the hooks use (default
+`$SWARMSYNC_URL`), so you — or a denied agent, from its own shell — can see and steer coordination:
+
+```bash
+swarmsync status              # is the server up, bound to which repo, how busy?
+swarmsync holds               # every active hold: parcel, holder, mode, TTL-remaining
+swarmsync free payments.py    # of these paths, which are free? (exit 1 if any held)
+swarmsync events --follow     # tail the event stream
+swarmsync doctor              # diagnose the setup; each check prints a fix if it fails
+```
+
+`swarmsync free foo.py && …` gates work in one line — the deny message an agent hits points it right
+back here (`swarmsync holds`). For the raw API, the server also serves interactive Swagger docs at
+`GET http://127.0.0.1:8787/docs`.
 
 ### Troubleshooting
 

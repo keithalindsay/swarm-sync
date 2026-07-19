@@ -103,6 +103,7 @@ def rotate_stale_db(db_path: Path) -> Optional[Path]:
 def main(argv: Optional[list[str]] = None) -> None:
     """Entry point for BOTH the `swarmsync-serve` and `swarm-sync` console scripts
     (WP4.2 -- see the module docstring). `argv=None` parses `sys.argv[1:]`."""
+    config.require_python()  # U1: fail fast on an unsupported interpreter
     parser = argparse.ArgumentParser(prog="swarmsync-serve", description=__doc__)
     parser.add_argument(
         "--db",

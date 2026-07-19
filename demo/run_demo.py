@@ -95,6 +95,7 @@ from typing import Any, Optional
 import httpx
 import uvicorn
 
+from swarmsync import config
 from swarmsync.agent import mutators
 from swarmsync.agent.client import BlackboardClient
 from swarmsync.agent.runner import run_agent
@@ -808,6 +809,7 @@ def run_demo(workdir: Optional[Path] = None, keep: bool = False) -> dict[str, An
 
 
 def main() -> int:
+    config.require_python()  # U1: fail fast on an unsupported interpreter
     result = run_demo()
 
     print("\n" + "=" * 72)

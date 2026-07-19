@@ -28,7 +28,7 @@ import httpx
 
 import swarmsync
 from swarmsync import __version__, config
-from swarmsync.agent.client import BlackboardClient
+from swarmsync.agent.client import BlackboardClient, BlackboardUnreachable
 from swarmsync.blackboard import parcel_id
 
 # Poll cadence for `events --follow`. Deliberately not a knob: the loop is a
@@ -473,17 +473,20 @@ def run(args: argparse.Namespace, client: BlackboardClient, out: TextIO) -> int:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    config.require_python()  # U1: fail fast on an unsupported interpreter
     args = _build_parser().parse_args(argv)
     try:
         with BlackboardClient(args.url, timeout=args.timeout) as client:
             return run(args, client, sys.stdout)
+    except BlackboardUnreachable as exc:
+        # The client already built an actionable, URL-named message -- print it as-is
+        # rather than nesting it inside a second wrapper.
+        print(f"swarm-sync: {exc}", file=sys.stderr)
+        return 2
     except httpx.HTTPError as exc:
-        # Server down / unreachable / a 5xx: the whole point of this CLI is to be
-        # usable when coordination is misbehaving, so fail with a readable line
-        # naming the URL, not an httpx traceback.
+        # A 5xx / other HTTP error: still fail readably, not with an httpx traceback.
         print(
-            f"swarm-sync: cannot reach the blackboard at {args.url} ({exc}). "
-            f"Is `swarmsync-serve` running? Set --url or $SWARMSYNC_URL.",
+            f"swarm-sync: the blackboard at {args.url} returned an error ({exc}).",
             file=sys.stderr,
         )
         return 2

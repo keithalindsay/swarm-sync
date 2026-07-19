@@ -61,6 +61,51 @@ class _HttpLike(Protocol):
     def post(self, url: str, **kwargs: Any) -> Any: ...
 
 
+class BlackboardUnreachable(httpx.HTTPError):
+    """The blackboard could not be reached at all (connection refused / timed out) --
+    distinct from an HTTP error the server actually returned. Subclasses
+    `httpx.HTTPError` so any caller already catching that keeps working (the CLI,
+    `doctor`), while the broker/runner/demo -- which catch nothing -- surface this
+    one actionable line instead of a raw httpx traceback (U6)."""
+
+
+class _UnreachableTranslatingHttp:
+    """Wrap the real `httpx.Client` so a connection failure becomes a
+    `BlackboardUnreachable` naming the URL and the likely fix. Applied ONLY on the
+    URL-string (real-socket) path; an injected TestClient never connects out, so it
+    is passed through untouched."""
+
+    def __init__(self, inner: httpx.Client, base_url: str) -> None:
+        self._inner = inner
+        self._base_url = base_url
+
+    def _translate(self, call: Any) -> Any:
+        try:
+            return call()
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            raise BlackboardUnreachable(
+                f"cannot reach the blackboard at {self._base_url} ({exc}); "
+                f"is `swarmsync-serve` running? Point elsewhere with $SWARMSYNC_URL."
+            ) from exc
+
+    def get(self, url: str, **kwargs: Any) -> Any:
+        return self._translate(lambda: self._inner.get(url, **kwargs))
+
+    def post(self, url: str, **kwargs: Any) -> Any:
+        return self._translate(lambda: self._inner.post(url, **kwargs))
+
+    def close(self) -> None:
+        self._inner.close()
+
+    def __getattr__(self, name: str) -> Any:
+        # Stay transparent for introspection (`.timeout`, `.base_url`, …): anything
+        # this shim doesn't wrap falls through to the real client. Guard `_inner`
+        # so a lookup before __init__ sets it can't recurse.
+        if name == "_inner":
+            raise AttributeError(name)
+        return getattr(self._inner, name)
+
+
 class BlackboardClient:
     """HTTP client for every DESIGN §4.2 endpoint, matching `server/app.py` 1:1."""
 
@@ -81,9 +126,12 @@ class BlackboardClient:
             # `integrate()` additionally overrides this per-request; see below.
             self._http: _HttpLike = cast(
                 _HttpLike,
-                httpx.Client(
-                    base_url=http,
-                    timeout=DEFAULT_TIMEOUT_SECONDS if timeout is None else timeout,
+                _UnreachableTranslatingHttp(
+                    httpx.Client(
+                        base_url=http,
+                        timeout=DEFAULT_TIMEOUT_SECONDS if timeout is None else timeout,
+                    ),
+                    http,
                 ),
             )
             self._owns_http = True
