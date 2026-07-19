@@ -31,6 +31,28 @@ import os
 import sys
 from typing import Optional
 
+# --- interpreter preflight (U1) ---------------------------------------------------
+
+# The floor mirrors pyproject's `requires-python`. Anything older hits Python-version
+# footguns downstream (or, at install time, a long silent pip backtrack) rather than a
+# clear message -- the single worst first-run outcome, so every entry point checks.
+MIN_PYTHON = (3, 11)
+
+
+def require_python() -> None:
+    """Fail fast with a readable message on an unsupported interpreter. Called at
+    the top of every entry point (`serve`, the `swarmsync` CLI, the demo) so a
+    wrong Python announces itself instead of erroring confusingly later."""
+    if sys.version_info[:2] < MIN_PYTHON:
+        have = ".".join(map(str, sys.version_info[:3]))
+        want = ".".join(map(str, MIN_PYTHON))
+        raise SystemExit(
+            f"swarm-sync requires Python {want}+, but this interpreter is {have}. "
+            f"Create a {want} venv first: "
+            f"`python{want} -m venv .venv && source .venv/bin/activate`."
+        )
+
+
 # --- env-var names: the single source of truth ------------------------------------
 
 TOKEN_ENV = "SWARMSYNC_TOKEN"

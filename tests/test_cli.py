@@ -11,11 +11,12 @@ import io
 import json
 import subprocess
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from swarmsync import __version__, cli
-from swarmsync.agent.client import BlackboardClient
+from swarmsync import __version__, cli, config
+from swarmsync.agent.client import BlackboardClient, BlackboardUnreachable
 from swarmsync.server.app import create_app
 
 
@@ -289,3 +290,38 @@ def test_doctor_flags_a_non_git_cwd(tmp_path, monkeypatch):
 
     _, text = _cli(["--url", "http://127.0.0.1:9", "--timeout", "1", "doctor"])
     assert _check(text, "in a git repo") == "FAIL"
+
+
+# --- WP5.3: version preflight + friendly unreachable-client error ------------------
+
+
+def test_require_python_fails_fast_on_an_old_interpreter(monkeypatch):
+    monkeypatch.setattr(config.sys, "version_info", (3, 10, 5))
+    with pytest.raises(SystemExit) as exc:
+        config.require_python()
+    assert "requires Python 3.11+" in str(exc.value)
+    assert "3.10.5" in str(exc.value)
+
+
+def test_require_python_passes_on_a_supported_interpreter():
+    config.require_python()  # this interpreter is >= 3.11 -> no raise
+
+
+def test_url_client_raises_a_friendly_unreachable_error():
+    """A URL-backed client against a dead server raises BlackboardUnreachable (an
+    httpx.HTTPError subclass) with an actionable message -- so the broker/runner/demo
+    get one line, not a raw ConnectError traceback (U6)."""
+    with BlackboardClient("http://127.0.0.1:9", timeout=1) as client:
+        with pytest.raises(BlackboardUnreachable) as exc:
+            client.leases()
+    assert "cannot reach the blackboard" in str(exc.value)
+    assert "swarmsync-serve" in str(exc.value)
+    assert isinstance(exc.value, httpx.HTTPError)
+
+
+def test_main_unreachable_message_is_not_double_wrapped(capsys):
+    code = cli.main(["--url", "http://127.0.0.1:9", "--timeout", "1", "holds"])
+    assert code == 2
+    err = capsys.readouterr().err
+    # exactly one "cannot reach" phrase -- the client's message, printed as-is
+    assert err.count("cannot reach the blackboard") == 1
