@@ -122,6 +122,20 @@ class Lease(BaseModel):
     status: LeaseStatus
 
 
+class HealthOut(BaseModel):
+    """`GET /health` -- the operational snapshot (WP5.1, U2). Read-only and
+    unauthenticated: it is the one surface an operator or agent hits to learn the
+    server is up, which single repo root it is bound to, where its blackboard DB
+    lives, and how busy it is (active leases, last event seq). `swarmsync status`
+    and `swarmsync doctor` are built on it. Field names are the wire contract."""
+
+    version: str
+    root: str
+    db_path: str
+    active_leases: int
+    last_event_seq: int
+
+
 class ParcelLeaseInfo(BaseModel):
     """One active lease as embedded in a `GET /parcels` row's `active_leases`
     (WP4.5, A6). NOT a full `Lease`: the endpoint deliberately projects just the

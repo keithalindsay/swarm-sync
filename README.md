@@ -141,7 +141,7 @@ released automatically when the agent stops. When two agents reach for the same 
 denied with a message like:
 
 ```
-swarm-sync: payments.py is leased by agent-a (~280s left on the current hold; the hold renews while its holder stays active). Pick different work; inspect current holders with GET http://127.0.0.1:8787/leases.
+swarm-sync: payments.py is leased by agent-a (~280s left on the current hold; the hold renews while its holder stays active). Pick different work -- run `swarmsync holds` to see who holds what (or GET http://127.0.0.1:8787/leases).
 ```
 
 ### Setup

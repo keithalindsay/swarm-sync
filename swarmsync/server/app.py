@@ -80,9 +80,11 @@ from starlette.concurrency import run_in_threadpool
 
 from swarmsync import config
 from swarmsync.blackboard import db
+from swarmsync import __version__
 from swarmsync.blackboard.models import (
     Contract,
     Event,
+    HealthOut,
     HeartbeatBody,
     IntegrateBody,
     IntentBody,
@@ -502,6 +504,32 @@ def create_app(
     # implicit in this handler's dict-building, duck-typed against by the hook
     # adapter, and absent from the OpenAPI schema. The JSON is byte-identical;
     # only the contract is now written down and response-validated.
+    @app.get("/health", response_model=HealthOut)
+    def get_health(request: Request, conn=Depends(get_conn)):
+        """Operational snapshot for `swarmsync status`/`doctor` (WP5.1, U2).
+
+        Unauthenticated by design -- like the other read-only GETs -- so it can
+        answer "is the server even up, and bound to which repo?" without the
+        bearer token an operator may be debugging. No new server state: every
+        field is derived from the existing DB + the managed-root resolution.
+        """
+        now = time.time()
+        active_leases = conn.execute(
+            "SELECT COUNT(*) AS n FROM leases "
+            "WHERE status = 'active' AND ttl_expires_at > ?",
+            (now,),
+        ).fetchone()["n"]
+        last_event_seq = conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) AS s FROM events"
+        ).fetchone()["s"]
+        return HealthOut(
+            version=__version__,
+            root=check_single_root(),
+            db_path=str(request.app.state.db_path),
+            active_leases=active_leases,
+            last_event_seq=last_event_seq,
+        )
+
     @app.get("/parcels", response_model=list[ParcelWithLeases])
     def get_parcels(conn=Depends(get_conn)):
         now = time.time()
