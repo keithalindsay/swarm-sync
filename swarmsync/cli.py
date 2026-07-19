@@ -15,14 +15,19 @@ agents at: all reads hit unauthenticated GETs, so no token is needed here.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
+import os
+import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import Optional, TextIO
 
 import httpx
 
-from swarmsync import config
+import swarmsync
+from swarmsync import __version__, config
 from swarmsync.agent.client import BlackboardClient
 from swarmsync.blackboard import parcel_id
 
@@ -155,11 +160,236 @@ def cmd_events(client: BlackboardClient, args: argparse.Namespace, out: TextIO) 
         return 0
 
 
+# --- hook wiring (init-hooks / doctor share this) ----------------------------------
+
+# The four Claude Code hook events swarm-sync wires, mirroring README's Setup block:
+# (event, matcher-or-None, adapter subcommand, timeout seconds).
+_HOOK_SPECS = [
+    ("PreToolUse", "Edit|Write|MultiEdit|NotebookEdit", "precheck", 10),
+    ("PostToolUse", "Edit|Write|MultiEdit|NotebookEdit", "postupdate", 10),
+    ("SubagentStop", None, "release", 10),
+    ("SessionStart", None, "session-start", 15),
+]
+
+ACTIVE_MARKER_FILENAME = ".swarmsync-active"
+
+
+def _git_toplevel(cwd: Path) -> Optional[Path]:
+    """`git rev-parse --show-toplevel` for `cwd`, or None if not in a git repo."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    return Path(result.stdout.strip())
+
+
+def _resolve_hook_command() -> str:
+    """The command `init-hooks` wires. Prefer the guard shim shipped in a
+    source/editable checkout (`<repo>/scripts/swarmsync-hook-guard` -- it makes
+    inactive editing pay zero Python startup); fall back to the `swarmsync-hook`
+    console script name for installs that don't ship `scripts/`."""
+    guard = Path(swarmsync.__file__).resolve().parent.parent / "scripts" / "swarmsync-hook-guard"
+    if guard.is_file():
+        return str(guard)
+    return "swarmsync-hook"
+
+
+def _is_swarmsync_entry(entry: dict) -> bool:
+    """Whether a settings.json hook entry is one of ours (guard shim or the
+    console script) -- so we can replace rather than duplicate on re-run, and
+    detect wiring without matching a specific absolute path."""
+    for hook in entry.get("hooks", []):
+        if "swarmsync-hook" in hook.get("command", ""):
+            return True
+    return False
+
+
+def _hook_entry(command_base: str, subcmd: str, matcher: Optional[str], timeout: int) -> dict:
+    entry: dict = {
+        "hooks": [{"type": "command", "command": f"{command_base} {subcmd}", "timeout": timeout}]
+    }
+    if matcher is not None:
+        entry["matcher"] = matcher
+    return entry
+
+
+def _merge_hooks(settings: dict, command_base: str) -> dict:
+    """Return `settings` with swarm-sync's four hook entries present exactly once
+    each -- preserving any non-swarm-sync hooks, replacing any prior swarm-sync
+    ones (idempotent, and upgrades a stale command path)."""
+    hooks = settings.setdefault("hooks", {})
+    for event, matcher, subcmd, timeout in _HOOK_SPECS:
+        entries = hooks.setdefault(event, [])
+        entries[:] = [e for e in entries if not _is_swarmsync_entry(e)]
+        entries.append(_hook_entry(command_base, subcmd, matcher, timeout))
+    return settings
+
+
+def _hooks_wired(toplevel: Path) -> Optional[str]:
+    """Whether swarm-sync hooks are wired in the global or project settings.json;
+    returns a human location string, or None if neither has them."""
+    candidates = [
+        ("global", Path.home() / ".claude" / "settings.json"),
+        ("project", toplevel / ".claude" / "settings.json"),
+    ]
+    for label, path in candidates:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        for entries in data.get("hooks", {}).values():
+            if any(_is_swarmsync_entry(e) for e in entries):
+                return f"{label} ({path})"
+    return None
+
+
+def _db_writable(db_path: str) -> tuple[bool, str]:
+    p = Path(db_path)
+    if p.exists():
+        if os.access(p, os.W_OK):
+            return True, f"{p} (writable)"
+        return False, f"{p} exists but is not writable — fix its permissions"
+    parent = p.parent if str(p.parent) not in ("", ".") else Path.cwd()
+    if os.access(parent, os.W_OK):
+        return True, f"{p} (will be created under a writable dir)"
+    return False, f"{p}: directory {parent} is not writable — pick another --db/$SWARMSYNC_DB"
+
+
+def cmd_init_hooks(client: BlackboardClient, args: argparse.Namespace, out: TextIO) -> int:
+    """Write swarm-sync's hook block into settings.json (idempotent) and drop the
+    `.swarmsync-active` marker so coordination is on for this repo."""
+    settings_path = (
+        Path.home() / ".claude" / "settings.json"
+        if args.use_global
+        else Path.cwd() / ".claude" / "settings.json"
+    )
+    try:
+        existing = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        existing = {}
+
+    command_base = args.command_base or _resolve_hook_command()
+    merged = _merge_hooks(copy.deepcopy(existing), command_base)
+
+    toplevel = _git_toplevel(Path.cwd()) or Path.cwd()
+    marker = toplevel / ACTIVE_MARKER_FILENAME
+
+    if args.dry_run:
+        print(f"# --dry-run: would write {settings_path}", file=out)
+        print(json.dumps(merged, indent=2), file=out)
+        print(f"# --dry-run: would drop marker {marker}", file=out)
+        return 0
+
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
+    marker.touch()
+    print(f"wired swarm-sync hooks into {settings_path}", file=out)
+    print(f"  command: {command_base}", file=out)
+    print(f"coordination ON: dropped marker {marker}", file=out)
+    print("start the server with `swarmsync-serve --root <repo>` and run `swarmsync doctor`.", file=out)
+    return 0
+
+
+def cmd_doctor(client: BlackboardClient, args: argparse.Namespace, out: TextIO) -> int:
+    """Diagnose a swarm-sync setup: each check prints pass/fail + a remedy, and
+    the exit code is non-zero iff any check failed."""
+    checks: list[tuple[str, bool, str]] = []
+
+    health: Optional[dict] = None
+    try:
+        health = client.health()
+        checks.append(("server reachable", True, args.url))
+    except httpx.HTTPError as exc:
+        checks.append(
+            (
+                "server reachable",
+                False,
+                f"cannot reach {args.url} ({exc}) — start `swarmsync-serve` or set $SWARMSYNC_URL",
+            )
+        )
+
+    if health is not None:
+        match = health["version"] == __version__
+        checks.append(
+            (
+                "version match",
+                match,
+                __version__
+                if match
+                else f"CLI {__version__} != server {health['version']} — reinstall so both match",
+            )
+        )
+
+    toplevel = _git_toplevel(Path.cwd())
+    if toplevel is None:
+        checks.append(
+            ("in a git repo", False, "cwd is not inside a git repository — run from your repo")
+        )
+    else:
+        checks.append(("in a git repo", True, str(toplevel)))
+        if health is not None:
+            same = Path(health["root"]).resolve() == toplevel.resolve()
+            checks.append(
+                (
+                    "managed root == repo",
+                    same,
+                    str(toplevel)
+                    if same
+                    else f"server root {health['root']} is not this repo — restart "
+                    f"`swarmsync-serve --root {toplevel}`",
+                )
+            )
+        active = config.active() or (toplevel / ACTIVE_MARKER_FILENAME).exists()
+        checks.append(
+            (
+                "coordination active",
+                active,
+                "marker/env present"
+                if active
+                else f"coordination is OFF — `touch {toplevel / ACTIVE_MARKER_FILENAME}` "
+                "(or set SWARMSYNC_ACTIVE=1)",
+            )
+        )
+        wired = _hooks_wired(toplevel)
+        checks.append(
+            (
+                "hooks wired",
+                wired is not None,
+                wired
+                if wired is not None
+                else "no swarm-sync hooks in global/project settings.json — run `swarmsync init-hooks`",
+            )
+        )
+
+    checks.append(("db writable", *_db_writable(config.db_path())))
+
+    failed = 0
+    for label, ok, detail in checks:
+        print(f"[{'ok  ' if ok else 'FAIL'}] {label}: {detail}", file=out)
+        if not ok:
+            failed += 1
+    print(
+        f"\n{failed} check(s) failed — fix the remedy on each FAIL line."
+        if failed
+        else "\nall checks passed.",
+        file=out,
+    )
+    return 1 if failed else 0
+
+
 _COMMANDS = {
     "status": cmd_status,
     "holds": cmd_holds,
     "free": cmd_free,
     "events": cmd_events,
+    "doctor": cmd_doctor,
+    "init-hooks": cmd_init_hooks,
 }
 
 
@@ -206,6 +436,32 @@ def _build_parser() -> argparse.ArgumentParser:
         "--follow",
         action="store_true",
         help="keep polling for new events until interrupted",
+    )
+
+    sub.add_parser(
+        "doctor", help="diagnose the setup (server/root/marker/hooks/DB/version)"
+    )
+
+    init = sub.add_parser(
+        "init-hooks", help="wire the Claude Code hook block into settings.json + activate"
+    )
+    init.add_argument(
+        "--global",
+        dest="use_global",
+        action="store_true",
+        help="write ~/.claude/settings.json instead of <cwd>/.claude/settings.json",
+    )
+    init.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print what would be written; touch nothing",
+    )
+    init.add_argument(
+        "--command",
+        dest="command_base",  # NOT "command" -- that dest belongs to the subparser
+        default=None,
+        help="override the hook command base (default: the guard shim, or "
+        "`swarmsync-hook` when scripts/ isn't shipped)",
     )
     return parser
 
