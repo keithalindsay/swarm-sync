@@ -128,6 +128,17 @@ on a file, edits inside its **own git worktree**, heartbeats, then submits its b
 test-gated integrator** that merges, runs `pytest`, and re-indexes — rolling the merge back if the
 tests go red, so trunk is never poisoned. A **TTL reaper** reclaims the leases of agents that crash.
 
+```mermaid
+flowchart LR
+    A[agent] -->|1 declare intent + acquire write-lease| BB[(blackboard<br/>SQLite WAL)]
+    A -->|2 edit in a private git worktree| WT[worktree]
+    WT -->|3 submit branch| INT[serial test-gated integrator]
+    INT -->|merge, run pytest, re-index| Q{tests green?}
+    Q -->|yes| TR[(trunk stays green)]
+    Q -->|no| RB[roll the merge back]
+    RP[TTL reaper] -.->|reclaims leases of dead agents| BB
+```
+
 For the expanded, plain-language version — how each piece works, the life of one edit end to end, and
 a map from every concept to the code that implements it — see [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
@@ -327,9 +338,17 @@ network you don't control.
 
 ## Status
 
-Prototype build. Scope is intentionally tight: Python target,
-deterministic scripted agents (a real Claude Agent SDK worker is a drop-in), serial integrator, no
-TUI.
+A working prototype and a local developer tool — not a hosted service. The engineering is
+deliberately thorough: **538 tests** (run 3× with zero flakes), `ruff` + `mypy` clean, and five
+review-gated hardening phases — correctness, resource bounds, architecture consolidation, and an
+operator surface (`swarmsync status`/`holds`/`free`/`doctor`). Every fix carries a test that fails
+when the fix is removed, and the architecture pass was adversarially reviewed before it merged.
+
+Scope is intentionally tight: Python target (the classifier is stdlib `ast`; a tree-sitter backend
+is a documented extension point), deterministic scripted agents in the demo (a real Claude Agent SDK
+worker is a drop-in for the mutator), a serial integrator, and no TUI. The one designed-but-parked
+capability — per-symbol locking — is documented with its revival plan in
+[`SYMBOL_MODE_DESIGN.md`](SYMBOL_MODE_DESIGN.md).
 
 ## License
 
