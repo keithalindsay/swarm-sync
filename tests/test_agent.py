@@ -113,8 +113,10 @@ def test_run_agent_full_lifecycle(client, repo):
     # /integrate now runs the real U10 integrator: clean merge, no test suite
     # in this tiny fixture repo (nothing to gate on) -> lands.
     assert result.integrate_result is not None
-    assert result.integrate_result["_status_code"] == 200
     assert result.integrate_result["status"] == "merged"
+    # WP4.4/A5: the client no longer smuggles the HTTP transport status into
+    # the integrator's domain payload.
+    assert "_status_code" not in result.integrate_result
 
 
 def test_run_agent_backs_off_on_lease_denied(client, repo):
@@ -234,7 +236,7 @@ def test_heartbeater_survives_a_raising_heartbeat_and_keeps_beating():
 
 
 def test_two_agents_disjoint_functions_same_file_both_land(client, repo):
-    """Building block of money-shot #1: two agents editing DIFFERENT functions
+    """Building block of test case #1: two agents editing DIFFERENT functions
     in the SAME file both complete run_agent independently (no lease
     contention) and merge with zero conflicts."""
     r, base = repo
@@ -690,3 +692,367 @@ def test_integrate_passes_its_long_timeout_to_a_real_transport_only():
     owned._http = rec  # type: ignore[assignment]  # keep _owns_http=True
     owned.integrate("a1", branch="a1", repo="/tmp/x")
     assert rec.kwargs.get("timeout") == client_mod._integrate_timeout()
+
+
+# --- C11 (WP3.6): in-process failure containment -----------------------------------
+
+
+def _exploding_mutator(worktree, **kwargs):
+    raise RuntimeError("boom mid-edit")
+
+
+def test_run_agent_contains_a_raising_mutator_releases_leases_and_returns_error(client, repo):
+    """C11: an exception in the work phase must NOT raise out of run_agent and must
+    NOT leave the acquired leases active until TTL expiry. Before the fix the
+    try/finally had no except path: the mutator's RuntimeError propagated to the
+    caller and the write-lease on mod_a.py::helper stayed `active` (leaked)."""
+    r, base = repo
+    result = run_agent(
+        agent_id="agent-crash",
+        client=client,
+        repo=r,
+        task="crash mid-edit",
+        target_parcels=["mod_a.py::helper"],
+        mutator=_exploding_mutator,
+        base_commit=base,
+    )
+
+    # structured error result, not a raise.
+    assert result.status == "error"
+    assert result.error_type == "RuntimeError"
+    assert result.error is not None and "boom mid-edit" in result.error
+
+    # every lease this attempt held was released -- nothing left active.
+    active = client.leases()
+    assert not any(le["agent_id"] == "agent-crash" for le in active), (
+        f"agent-crash leaked a lease past its own crash: {active!r}"
+    )
+    # ...and the parcel is genuinely free again, immediately (no TTL wait).
+    regrab = client.lease("agent-next", "mod_a.py::helper", mode="write")
+    assert regrab["granted"] is True, "the crashed attempt's lease was not released"
+
+    # the existing finally still tore the worktree down.
+    assert not (r / ".worktrees" / "agent-crash").exists()
+
+
+def test_run_agent_containment_covers_a_failing_commit_too(client, repo, monkeypatch):
+    """The except path must cover the whole work phase, not just the mutator --
+    commit_all raising (e.g. git's own transient ref/index lock contention) is the
+    reachable-in-production case the broker's concurrency creates."""
+    from swarmsync.agent import runner as runner_mod
+
+    r, base = repo
+
+    def failing_commit(worktree, message, allow_empty=False):
+        raise git_ops.GitOpsError("fatal: Unable to create '.git/index.lock': File exists")
+
+    monkeypatch.setattr(runner_mod.git_ops, "commit_all", failing_commit)
+
+    result = run_agent(
+        agent_id="agent-gitlock",
+        client=client,
+        repo=r,
+        task="edit helper",
+        target_parcels=["mod_a.py::helper"],
+        mutator=mutators.edit_function_body,
+        mutator_kwargs={"path": "mod_a.py", "symbol": "helper", "new_body": "return 0"},
+        base_commit=base,
+    )
+    assert result.status == "error"
+    assert result.error_type == "GitOpsError"  # the broker's retry keys off this
+    assert not any(le["agent_id"] == "agent-gitlock" for le in client.leases())
+    assert not (r / ".worktrees" / "agent-gitlock").exists()
+
+
+def test_run_agent_error_containment_swallows_a_failing_release_with_a_logged_note(
+    client, repo, monkeypatch, caplog
+):
+    """Release-on-error is best-effort: if the release itself fails (server went
+    away), containment must still return the error result -- with a logged note --
+    and leave the lease to the reaper, never raise a second exception."""
+    import logging
+
+    r, base = repo
+
+    real_release = BlackboardClient.release
+
+    def failing_release(self, agent_id, lease_id):
+        if agent_id == "agent-crash2":
+            raise ConnectionError("server went away")
+        return real_release(self, agent_id, lease_id)
+
+    monkeypatch.setattr(BlackboardClient, "release", failing_release)
+
+    with caplog.at_level(logging.WARNING, logger="swarmsync.agent.runner"):
+        result = run_agent(
+            agent_id="agent-crash2",
+            client=client,
+            repo=r,
+            task="crash mid-edit",
+            target_parcels=["mod_a.py::helper"],
+            mutator=_exploding_mutator,
+            base_commit=base,
+        )
+
+    assert result.status == "error"
+    assert result.error_type == "RuntimeError"  # the ORIGINAL error, not the release's
+    assert any("release" in rec.message.lower() for rec in caplog.records), (
+        "the swallowed release failure left no logged note"
+    )
+
+
+def test_run_agent_does_not_mask_keyboard_interrupt(client, repo):
+    """Containment catches Exception, not BaseException: a KeyboardInterrupt must
+    still propagate (the operator is killing the process; masking it would turn
+    Ctrl-C into a fake 'error' result). The finally still cleans the worktree."""
+    r, base = repo
+
+    def interrupted_mutator(worktree, **kwargs):
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        run_agent(
+            agent_id="agent-int",
+            client=client,
+            repo=r,
+            task="interrupted",
+            target_parcels=["mod_a.py::helper"],
+            mutator=interrupted_mutator,
+            base_commit=base,
+        )
+    # the existing finally still ran.
+    assert not (r / ".worktrees" / "agent-int").exists()
+
+
+# --- WP4.4 (A8): the two formerly-silent swallows now leave a log trace -------
+
+
+def test_heartbeater_logs_a_failed_beat_and_does_not_raise(caplog):
+    """A dying blackboard mid-run must leave a trace: `_Heartbeater._run`
+    still swallows the failure (the daemon thread must never crash) but now
+    logs it at WARNING with the lease + agent context."""
+    import logging as _logging
+
+    from swarmsync.agent.runner import _Heartbeater
+
+    class _DyingClient:
+        def heartbeat(self, agent_id, lease_id):
+            hb._stop.set()  # end the beat loop right after this (failing) beat
+            raise RuntimeError("blackboard went away")
+
+    hb = _Heartbeater(_DyingClient(), "agent-hb", interval=0.01)
+    hb.add(42)
+    with caplog.at_level(_logging.WARNING, logger="swarmsync.agent.runner"):
+        hb._run()  # run the loop synchronously; the failure must not escape
+    beats = [r for r in caplog.records if "heartbeat for lease 42" in r.getMessage()]
+    assert len(beats) == 1, "the swallowed heartbeat failure left no logged note"
+    assert beats[0].levelno == _logging.WARNING
+    assert "agent-hb" in beats[0].getMessage()
+
+
+def test_cleanup_worktree_logs_swallowed_git_failures_and_does_not_raise(
+    tmp_path, monkeypatch, caplog
+):
+    """`_cleanup_worktree` still swallows GitOpsError on both the park and the
+    remove step (cleanup must never become the reason a run fails), but each
+    swallow now logs at DEBUG with the agent context."""
+    import logging as _logging
+
+    from swarmsync.agent import runner
+    from swarmsync.worktree.git_ops import GitOpsError
+
+    def _boom(*args, **kwargs):
+        raise GitOpsError("simulated git failure")
+
+    monkeypatch.setattr(runner.git_ops, "park_branch", _boom)
+    monkeypatch.setattr(runner.git_ops, "remove_worktree", _boom)
+    with caplog.at_level(_logging.DEBUG, logger="swarmsync.agent.runner"):
+        runner._cleanup_worktree(tmp_path, "agent-x", park_branch=True)  # no raise
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("park_branch failed" in m and "agent-x" in m for m in messages), messages
+    assert any("remove_worktree failed" in m and "agent-x" in m for m in messages), messages
+
+
+# --- WP4.6 (A1): needs_rebase wired end-to-end over real HTTP ---------------------
+
+
+def _edit_after_foreign_dep_update(worktree, path, symbol, new_body, client, dep_parcel):
+    """Test-only mutator: BEFORE applying this agent's own edit, simulate ANOTHER
+    agent updating the read-dependency parcel's content_hash on the blackboard --
+    i.e. the dep shifted between this agent's plan-time snapshot and its submit.
+    The rival takes its own write lease (post_parcel_update's C5 ownership gate
+    requires one) on a parcel this agent only READS, so the grant cannot conflict
+    with this agent's own target lease."""
+    held = client.lease("rival-agent", dep_parcel, mode="write", intent="foreign edit")
+    assert held["granted"] is True
+    updated = client.parcel_update(
+        "rival-agent", dep_parcel, "hash-moved-under-us", "rival edit"
+    )
+    assert updated["ok"] is True
+    client.release("rival-agent", held["lease_id"])
+    mutators.edit_function_body(worktree, path, symbol, new_body)
+
+
+def test_integrate_bounces_needs_rebase_when_read_dep_shifts_mid_work(client, repo):
+    """A1 end-to-end (DESIGN §5.5), over REAL HTTP (TestClient): the agent plans
+    against `mod_a.py::helper`'s current content_hash (a read-dependency it never
+    leases), a rival agent updates that hash mid-work, and the agent's own
+    `POST /integrate` submit must come back `needs_rebase` -- no merge, trunk
+    untouched, branch preserved (parked). Before WP4.6 wired
+    `IntegrateBody.expected_read_deps` through, this submission silently MERGED."""
+    r, base = repo
+    plan_hash = {p["id"]: p["content_hash"] for p in client.parcels()}["mod_a.py::helper"]
+    trunk_before = git_ops.current_commit(r, ref="integration")
+
+    result = run_agent(
+        agent_id="agent-rebase",
+        client=client,
+        repo=r,
+        task="edit other while helper shifts underneath",
+        target_parcels=["mod_a.py::other"],
+        mutator=_edit_after_foreign_dep_update,
+        mutator_kwargs={
+            "path": "mod_a.py",
+            "symbol": "other",
+            "new_body": "return z * 3",
+            "client": client,
+            "dep_parcel": "mod_a.py::helper",
+        },
+        base_commit=base,
+        heartbeat_interval=0.05,
+        read_contracts=["mod_a.py::helper"],
+    )
+
+    assert result.status == "done"  # the runner completed its protocol...
+    assert result.integrate_result is not None
+    # ...but the integrator bounced the branch instead of merging it.
+    assert result.integrate_result["status"] == "needs_rebase", (
+        "expected needs_rebase; the wire dropped expected_read_deps and the "
+        f"stale submission silently merged: {result.integrate_result}"
+    )
+    assert result.integrate_result["stale_deps"] == ["mod_a.py::helper"]
+
+    # No merge happened: trunk never moved, and the agent's edit is not on it.
+    assert git_ops.current_commit(r, ref="integration") == trunk_before
+    assert "z * 3" not in (r / "mod_a.py").read_text()
+
+    # A `needs_rebase` event names the stale dep; no `merged` event exists for
+    # this branch.
+    events = client.events(since=0)
+    rebase_events = [e for e in events if e["type"] == "needs_rebase"]
+    assert len(rebase_events) == 1
+    payload = json.loads(rebase_events[0]["payload"])
+    assert payload["branch"] == "agent-rebase"
+    assert payload["stale_deps"] == ["mod_a.py::helper"]
+    merged_for_branch = [
+        e
+        for e in events
+        if e["type"] == "merged"
+        and json.loads(e["payload"] or "{}").get("branch") == "agent-rebase"
+    ]
+    assert merged_for_branch == []
+
+    # WP3.5: the un-landed commits stay reachable -- the branch was parked.
+    parked = subprocess.run(
+        ["git", "branch", "--list", "rejected/agent-rebase-*"],
+        cwd=r,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert parked, "the bounced branch was not parked under rejected/*"
+
+    # The plan-time hash really was the parcels.content_hash the integrator
+    # compared against (shape reconciliation is content_hash-first, not
+    # contracts.type_hash, for an id that has a parcels row).
+    assert plan_hash != "hash-moved-under-us"
+
+
+def test_integrate_merges_when_read_deps_are_unchanged(client, repo):
+    """The happy-path control for A1: wiring expected_read_deps must not make the
+    check ALWAYS fire. An agent that declares the same read-dependency whose hash
+    does NOT shift mid-work still merges normally."""
+    r, base = repo
+    result = run_agent(
+        agent_id="agent-clean",
+        client=client,
+        repo=r,
+        task="edit other; helper stays put",
+        target_parcels=["mod_a.py::other"],
+        mutator=mutators.edit_function_body,
+        mutator_kwargs={"path": "mod_a.py", "symbol": "other", "new_body": "return z * 4"},
+        base_commit=base,
+        heartbeat_interval=0.05,
+        read_contracts=["mod_a.py::helper"],
+    )
+
+    assert result.status == "done"
+    assert result.integrate_result is not None
+    assert result.integrate_result["status"] == "merged", result.integrate_result
+    assert "z * 4" in (r / "mod_a.py").read_text()
+    assert not any(e["type"] == "needs_rebase" for e in client.events(since=0))
+
+
+# --- WP4.6 (C17): the runner's world-read fetches the NEWEST events ---------------
+
+
+class _EventsRecordingClient:
+    """Pass-through wrapper capturing every `.events()` result the runner reads."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.events_reads: list[list[dict]] = []
+
+    def events(self, *args, **kwargs):
+        result = self._inner.events(*args, **kwargs)
+        self.events_reads.append(result)
+        return result
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def test_runner_world_read_sees_the_newest_events(tmp_path, repo):
+    """C17: seed more events than one page holds, then prove the runner's
+    read-the-world step (its very first `.events()` call) contains the NEWEST
+    seeded event. The old `events(since=0)` read returned the OLDEST page, so
+    past 1000 rows the newest activity was invisible to it."""
+    from swarmsync.blackboard import events as events_mod
+    from swarmsync.server.app import create_app as _create_app
+
+    r, base = repo
+    app = _create_app(tmp_path / "c17-blackboard.db", reaper_interval=None)
+    with TestClient(app) as c:
+        assert c.post("/index", json={"root": str(r)}).status_code == 200
+        conn = app.state.conn
+        for i in range(1100):  # > the 1000-row page the old since=0 read got
+            events_mod.emit(conn, "planned", "seeder", {"i": i})
+        newest_seq = conn.execute("SELECT MAX(seq) FROM events").fetchone()[0]
+
+        recording = _EventsRecordingClient(BlackboardClient(c))
+        result = run_agent(
+            agent_id="agent-c17",
+            client=recording,
+            repo=r,
+            task="edit helper with a deep event log",
+            target_parcels=["mod_a.py::helper"],
+            mutator=mutators.edit_function_body,
+            mutator_kwargs={
+                "path": "mod_a.py",
+                "symbol": "helper",
+                "new_body": "return x + y + 17",
+            },
+            base_commit=base,
+            heartbeat_interval=0.05,
+        )
+        assert result.status == "done"
+
+        assert recording.events_reads, "the runner never read the event log"
+        world_read = recording.events_reads[0]  # step-1 read-the-world page
+        assert world_read, "the world-read returned no events"
+        seqs = {e["seq"] for e in world_read}
+        assert newest_seq in seqs, (
+            "the runner's awareness read missed the newest event "
+            f"(max seen {max(seqs)} < newest {newest_seq}) -- it is still "
+            "paging from the OLDEST end of the log"
+        )

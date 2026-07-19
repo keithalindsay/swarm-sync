@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import textwrap
@@ -19,7 +20,7 @@ import pytest
 from swarmsync.blackboard import db
 from swarmsync.classifier.store import run_index
 from swarmsync.coordinator import integrator
-from swarmsync.server import events as events_mod
+from swarmsync.blackboard import events as events_mod
 from swarmsync.worktree import git_ops
 
 
@@ -435,7 +436,7 @@ def test_impact_selection_runs_a_transitively_affected_test(tmp_path):
 
 
 def test_contract_change_event_emitted_when_a_frozen_signature_lands(tmp_path):
-    """DESIGN §5.3 (money-shot #3): a merge that genuinely changes a frozen
+    """DESIGN §5.3 (test case #3): a merge that genuinely changes a frozen
     contract's signature must emit a real `contract_change` event carrying
     the old/new signature + version, and report the symbol on
     `IntegrateResult.contract_changes` -- driven straight off a real
@@ -861,26 +862,14 @@ def test_reconcile_rolls_trunk_back_out_of_an_orphaned_integrate(conn, repo):
     run_index(conn, r)
     pre = git_ops.current_commit(r, ref="integration")
 
-    # Hand-build the orphan: intent recorded, merge landed, process died.
+    # Hand-build the orphan: intent recorded (event + projection row, exactly what
+    # integrate() writes atomically before merging), merge landed, process died.
     worktree = git_ops.add_worktree(r, "agent-dead", base)
     (worktree / "mod_a.py").write_text(
         "def helper(x):\n    return 'never gated'\n", encoding="utf-8"
     )
     git_ops.commit_all(worktree, "agent-dead: un-gated edit")
-    events_mod.emit(
-        conn,
-        "integrate_started",
-        "agent-dead",
-        {
-            "branch": "agent-dead",
-            "into": "integration",
-            "base_commit": base,
-            "trunk_sha_before": pre,
-            "repo": str(r),
-        },
-    )
-    ok, _conflicts = git_ops.merge_branch(r, "agent-dead", into="integration")
-    assert ok
+    _leave_orphan_behind(conn, r, "agent-dead", "integration", base, pre)
     assert git_ops.current_commit(r, ref="integration") != pre
     assert "never gated" in (r / "mod_a.py").read_text(encoding="utf-8")
 
@@ -893,6 +882,72 @@ def test_reconcile_rolls_trunk_back_out_of_an_orphaned_integrate(conn, repo):
     assert "never gated" not in (r / "mod_a.py").read_text(encoding="utf-8")
     orphaned = [e for e in events_mod.tail(conn, since_seq=0) if e.type == "integrate_orphaned"]
     assert len(orphaned) == 1, "the rollback left no audit trail"
+
+
+def test_reconcile_does_not_destroy_landed_merges_on_a_second_restart(conn, repo):
+    """Reconciliation must be IDEMPOTENT: once an orphan is rolled back and recorded,
+    a later restart must not re-roll it and wipe the gated merges that landed since.
+
+    This is finding C1. `integrate_orphaned` -- the event reconciliation emits to close
+    an orphan -- was NOT in the terminal-event set, so the orphaned `integrate_started`
+    stayed "open" forever. On any subsequent restart, replay found the same start
+    unclosed, saw trunk had moved on, and `git reset --hard` back to the pre-orphan sha,
+    DESTROYING every legitimate merge landed in between -- and it repeated every restart.
+    """
+    r, base = repo
+    run_index(conn, r)
+    pre = git_ops.current_commit(r, ref="integration")
+
+    # --- step 1: an integrate is SIGKILLed mid-gate: intent recorded (event +
+    # projection row, as integrate() writes atomically), merge landed, no terminal
+    # event.
+    worktree = git_ops.add_worktree(r, "agent-dead", base)
+    (worktree / "mod_a.py").write_text(
+        "def helper(x):\n    return 'never gated'\n", encoding="utf-8"
+    )
+    git_ops.commit_all(worktree, "agent-dead: un-gated edit")
+    _leave_orphan_behind(conn, r, "agent-dead", "integration", base, pre)
+    assert git_ops.current_commit(r, ref="integration") != pre
+
+    # --- step 2: first restart. Reconciliation correctly rolls trunk back to `pre`.
+    first = integrator.reconcile_orphaned_integrations(conn)
+    assert len(first) == 1
+    assert git_ops.current_commit(r, ref="integration") == pre
+
+    # --- step 3: agents land legitimate, gated merges. Trunk moves forward.
+    worktree_b = git_ops.add_worktree(r, "agent-b", base)
+    (worktree_b / "mod_b.py").write_text(
+        "def other(y):\n    z = y * 2\n    return z\n", encoding="utf-8"
+    )
+    git_ops.commit_all(worktree_b, "agent-b: gated edit")
+    assert integrator.integrate(
+        conn, r, "agent-b", base_commit=base, agent_id="agent-b"
+    ).status == "merged"
+
+    worktree_c = git_ops.add_worktree(r, "agent-c", base)
+    (worktree_c / "mod_c.py").write_text(
+        "def broken():\n    result = 1\n    return result\n", encoding="utf-8"
+    )
+    git_ops.commit_all(worktree_c, "agent-c: gated edit (behavior-preserving)")
+    assert integrator.integrate(
+        conn, r, "agent-c", base_commit=base, agent_id="agent-c"
+    ).status == "merged"
+
+    trunk_after_merges = git_ops.current_commit(r, ref="integration")
+    assert trunk_after_merges != pre, "the legitimate merges did not land"
+
+    # --- step 4: second restart, for any reason. Reconciliation must leave trunk alone.
+    second = integrator.reconcile_orphaned_integrations(conn)
+
+    assert git_ops.current_commit(r, ref="integration") == trunk_after_merges, (
+        "second reconciliation reset trunk back out from under the gated merges -- "
+        "the C1 double-restart data-loss bug"
+    )
+    assert second == [], (
+        "the already-reconciled orphan was reconciled AGAIN on the second restart"
+    )
+    assert "z = y * 2" in (r / "mod_b.py").read_text(encoding="utf-8")
+    assert "result = 1" in (r / "mod_c.py").read_text(encoding="utf-8")
 
 
 def test_reconcile_leaves_completed_integrates_alone(conn, repo):
@@ -926,18 +981,7 @@ def test_reconcile_is_a_noop_when_the_crash_beat_the_merge(conn, repo):
     run_index(conn, r)
     pre = git_ops.current_commit(r, ref="integration")
 
-    events_mod.emit(
-        conn,
-        "integrate_started",
-        "agent-early",
-        {
-            "branch": "agent-early",
-            "into": "integration",
-            "base_commit": base,
-            "trunk_sha_before": pre,
-            "repo": str(r),
-        },
-    )
+    _record_start(conn, r, "agent-early", "integration", base, pre)
 
     reconciled = integrator.reconcile_orphaned_integrations(conn)
 
@@ -948,16 +992,8 @@ def test_reconcile_is_a_noop_when_the_crash_beat_the_merge(conn, repo):
 
 def test_reconcile_never_raises_on_a_repo_that_is_gone(conn, tmp_path):
     """A vanished/moved repo must not stop the server booting."""
-    events_mod.emit(
-        conn,
-        "integrate_started",
-        "agent-x",
-        {
-            "branch": "b",
-            "into": "integration",
-            "trunk_sha_before": "0" * 40,
-            "repo": str(tmp_path / "does-not-exist"),
-        },
+    _record_start(
+        conn, tmp_path / "does-not-exist", "b", "integration", None, "0" * 40
     )
     reconciled = integrator.reconcile_orphaned_integrations(conn)
     assert len(reconciled) == 1
@@ -1040,4 +1076,506 @@ def test_every_rejection_route_leaves_the_blackboard_matching_trunk(
     assert _hash_of("mod_a.py::helper") == truth, (
         f"after a {rejection} rejection the blackboard still holds a hash for code that "
         f"is not on trunk: agents now plan against a state that never landed"
+    )
+
+
+# --- A8: a KeyboardInterrupt mid-gate must roll trunk back AND re-raise -------------
+
+
+def test_keyboard_interrupt_mid_gate_rolls_trunk_back_and_reraises(conn, repo, monkeypatch):
+    """An operator Ctrl-C (or uvicorn shutdown) during the gate must not leave an
+    un-gated merge on trunk.
+
+    `integrate` merges to trunk FIRST, then runs the pytest gate (up to 600s) to learn
+    the verdict. A `KeyboardInterrupt`/`SystemExit` raised in that window is NOT an
+    `Exception`, so it slips past the ordinary `except Exception` post-merge handler --
+    the un-gated merge is already sitting on trunk. The `except BaseException` guard is
+    the ONLY thing that (a) resets trunk back to the pre-merge sha and (b) re-raises the
+    interrupt (it is the operator's to act on, not ours to swallow).
+
+    This pins BOTH halves: swallow it and the interrupt is lost; catch it with a bare
+    `except Exception` and the un-gated merge stays on trunk.
+    """
+    r, base = repo
+    run_index(conn, r)
+    pre = git_ops.current_commit(r, ref="integration")
+
+    worktree = git_ops.add_worktree(r, "agent-int", base)
+    (worktree / "mod_a.py").write_text(
+        "def helper(x):\n    return 'un-gated, interrupted mid-merge'\n", encoding="utf-8"
+    )
+    git_ops.commit_all(worktree, "agent-int: edit interrupted during the gate")
+
+    # The merge lands on trunk, THEN the gate is entered -- simulate Ctrl-C there.
+    def interrupt(*a, **kw):
+        raise KeyboardInterrupt("operator hit Ctrl-C during the gate")
+
+    monkeypatch.setattr(integrator, "run_impact_tests", interrupt)
+
+    # (b) the interrupt propagates -- it is NOT swallowed.
+    with pytest.raises(KeyboardInterrupt):
+        integrator.integrate(conn, r, "agent-int", base_commit=base, agent_id="agent-int")
+
+    # (a) trunk was reset to the exact pre-merge sha -- no un-gated merge survives.
+    assert git_ops.current_commit(r, ref="integration") == pre, (
+        "trunk still carries the un-gated merge after the interrupt was raised mid-gate"
+    )
+    assert "un-gated, interrupted" not in (r / "mod_a.py").read_text(encoding="utf-8")
+
+
+# --- WP3.2: O(open) crash-recovery projection (finding C3) -------------------------
+
+
+def _open_rows(conn):
+    return conn.execute(
+        "SELECT * FROM open_integrations ORDER BY started_seq"
+    ).fetchall()
+
+
+def _record_start(conn, repo, branch, into, base, pre):
+    """Write the durable start record exactly as `integrate()` does: the
+    `integrate_started` event AND its `open_integrations` projection row, in one
+    transaction."""
+    with db.transaction(conn):
+        seq = events_mod.emit(
+            conn,
+            "integrate_started",
+            branch,
+            {
+                "branch": branch,
+                "into": into,
+                "base_commit": base,
+                "trunk_sha_before": pre,
+                "repo": str(repo),
+            },
+        )
+        conn.execute(
+            "INSERT INTO open_integrations "
+            "(started_seq, repo, branch, into_branch, trunk_sha_before, ts) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (seq, str(repo), branch, into, pre, time.time()),
+        )
+    return seq
+
+
+def _leave_orphan_behind(conn, repo, branch, into, base, pre):
+    """Simulate exactly what SIGKILL/OOM leaves behind mid-integrate: the durable
+    start record (`_record_start`) plus the un-gated merge on trunk, and NO
+    terminal event."""
+    seq = _record_start(conn, repo, branch, into, base, pre)
+    ok, _conflicts = git_ops.merge_branch(repo, branch, into=into)
+    assert ok
+    return seq
+
+
+def test_reconcile_is_not_blinded_by_a_bounded_event_scan(conn, repo, monkeypatch):
+    """Finding C3 (P1): recovery must not depend on a bounded replay of the FULL
+    event log.
+
+    The pre-projection implementation replayed the log oldest-first through a fixed
+    window (`tail(conn, since_seq=0, limit=1_000_000)`). Heartbeats emit events, so
+    real deployments blow past any fixed window in weeks -- and then a completed
+    integrate whose VERDICT lies beyond the window looks orphaned: reconciliation
+    sees the `integrate_started`, never sees the `merged`, and `git reset --hard`s
+    trunk back to the pre-merge sha, destroying a legitimately landed, gated merge.
+
+    Reproduced here without synthesizing a million rows: land a real gated merge,
+    then clamp the scan window so it ends exactly AT the start event -- the verdict
+    is beyond it, exactly as if weeks of heartbeats had pushed it there. The
+    projection implementation never replays the log at all, so the clamp is inert
+    and reconciliation correctly finds nothing open.
+    """
+    r, base = repo
+    run_index(conn, r)
+
+    wt = git_ops.add_worktree(r, "agent-hist", base)
+    (wt / "mod_a.py").write_text(
+        "def helper(x):\n    return x + 7\n", encoding="utf-8"
+    )
+    git_ops.commit_all(wt, "agent-hist: edit")
+    result = integrator.integrate(
+        conn, r, "agent-hist", base_commit=base, agent_id="agent-hist"
+    )
+    assert result.status == "merged"
+    landed = git_ops.current_commit(r, ref="integration")
+
+    start_seq = next(
+        e.seq
+        for e in events_mod.tail(conn, since_seq=0)
+        if e.type == "integrate_started"
+    )
+    real_tail = events_mod.tail
+
+    def clamped_tail(conn_, since_seq=0, limit=1000):
+        return real_tail(conn_, since_seq=since_seq, limit=min(limit, start_seq))
+
+    monkeypatch.setattr(integrator.events_mod, "tail", clamped_tail)
+
+    reconciled = integrator.reconcile_orphaned_integrations(conn)
+
+    assert reconciled == [], (
+        "a COMPLETED merge whose verdict lay beyond the event-scan window was "
+        "treated as an orphan"
+    )
+    assert git_ops.current_commit(r, ref="integration") == landed, (
+        "reconciliation reset trunk back out from under a landed, gated merge "
+        "because its verdict event lay beyond the scan window"
+    )
+    assert "x + 7" in (r / "mod_a.py").read_text(encoding="utf-8")
+
+
+def test_reconcile_reads_the_projection_not_the_event_log(conn, repo, monkeypatch):
+    """O(open): reconciliation must work off the `open_integrations` projection and
+    never replay the event log -- the log grows without bound (heartbeats), and any
+    fixed replay window is the blindness `test_reconcile_is_not_blinded_by_a_bounded_
+    event_scan` pins. A real orphan must still be found and rolled back with the log
+    entirely unavailable."""
+    r, base = repo
+    run_index(conn, r)
+    pre = git_ops.current_commit(r, ref="integration")
+
+    worktree = git_ops.add_worktree(r, "agent-dead", base)
+    (worktree / "mod_a.py").write_text(
+        "def helper(x):\n    return 'never gated'\n", encoding="utf-8"
+    )
+    git_ops.commit_all(worktree, "agent-dead: un-gated edit")
+    _leave_orphan_behind(conn, r, "agent-dead", "integration", base, pre)
+    assert git_ops.current_commit(r, ref="integration") != pre
+
+    def no_tail(*_a, **_kw):
+        raise AssertionError(
+            "reconciliation replayed the event log instead of reading the projection"
+        )
+
+    monkeypatch.setattr(integrator.events_mod, "tail", no_tail)
+
+    reconciled = integrator.reconcile_orphaned_integrations(conn)
+
+    assert len(reconciled) == 1
+    assert git_ops.current_commit(r, ref="integration") == pre
+    assert "never gated" not in (r / "mod_a.py").read_text(encoding="utf-8")
+
+
+def test_open_integration_row_lives_exactly_as_long_as_the_ungated_window(conn, repo):
+    """The projection row must exist during the gate (it IS the durable crash
+    record) and be gone after every verdict -- merged and rejected alike. A row
+    that survives a verdict would make the next restart 'reconcile' a completed
+    integrate: the C1 data loss, reintroduced through the projection."""
+    r, base = repo
+    run_index(conn, r)
+
+    seen_mid_gate: list = []
+    real_gate = integrator.run_impact_tests
+
+    def spying_gate(*a, **kw):
+        seen_mid_gate.extend(_open_rows(conn))
+        return real_gate(*a, **kw)
+
+    # --- merged verdict ---
+    wt = git_ops.add_worktree(r, "agent-ok", base)
+    (wt / "mod_a.py").write_text(
+        "def helper(x):\n    return x + 3\n", encoding="utf-8"
+    )
+    git_ops.commit_all(wt, "agent-ok: edit")
+    try:
+        integrator.run_impact_tests = spying_gate
+        result = integrator.integrate(
+            conn, r, "agent-ok", base_commit=base, agent_id="agent-ok"
+        )
+    finally:
+        integrator.run_impact_tests = real_gate
+    assert result.status == "merged"
+    assert len(seen_mid_gate) == 1, (
+        "no open_integrations row existed during the un-gated window -- a SIGKILL "
+        "there would be invisible to O(open) reconciliation"
+    )
+    assert _open_rows(conn) == [], (
+        "the projection row survived a `merged` verdict"
+    )
+
+    # --- rejected verdict (red gate) ---
+    wt_c = git_ops.add_worktree(r, "agent-red", base)
+    (wt_c / "mod_c.py").write_text(
+        "def broken():\n    raise RuntimeError('boom')\n", encoding="utf-8"
+    )
+    git_ops.commit_all(wt_c, "agent-red: break the test")
+    result = integrator.integrate(
+        conn, r, "agent-red", base_commit=base, agent_id="agent-red"
+    )
+    assert result.status == "merge_rejected"
+    assert _open_rows(conn) == [], (
+        "the projection row survived a `merge_rejected` verdict"
+    )
+
+
+def test_verdict_events_carry_the_started_seq_that_they_close(conn, repo):
+    """Adversarial-review P3: verdicts must name the exact start they close by its
+    `seq`, not leave consumers to match on (repo, branch, into) -- a reused branch
+    name would let one integrate's verdict be attributed to an unrelated older
+    start by any future event consumer."""
+    r, base = repo
+    run_index(conn, r)
+
+    wt = git_ops.add_worktree(r, "agent-a", base)
+    (wt / "mod_a.py").write_text(
+        "def helper(x):\n    return x + 4\n", encoding="utf-8"
+    )
+    git_ops.commit_all(wt, "agent-a: edit")
+    assert integrator.integrate(
+        conn, r, "agent-a", base_commit=base, agent_id="agent-a"
+    ).status == "merged"
+
+    wt_c = git_ops.add_worktree(r, "agent-red", base)
+    (wt_c / "mod_c.py").write_text(
+        "def broken():\n    raise RuntimeError('boom')\n", encoding="utf-8"
+    )
+    git_ops.commit_all(wt_c, "agent-red: break the test")
+    assert integrator.integrate(
+        conn, r, "agent-red", base_commit=base, agent_id="agent-red"
+    ).status == "merge_rejected"
+
+    events = events_mod.tail(conn, since_seq=0)
+    starts = {
+        json.loads(e.payload)["branch"]: e.seq
+        for e in events
+        if e.type == "integrate_started"
+    }
+    merged = next(e for e in events if e.type == "merged")
+    rejected = next(e for e in events if e.type == "merge_rejected")
+    assert json.loads(merged.payload)["started_seq"] == starts["agent-a"]
+    assert json.loads(rejected.payload)["started_seq"] == starts["agent-red"]
+
+
+def test_start_emit_and_projection_row_are_atomic(conn, repo):
+    """A crash BETWEEN the `integrate_started` emit and the projection INSERT must
+    be impossible: both land in one transaction or neither does. If the pairing
+    were not atomic, a death in that gap would leave a start event whose orphan the
+    O(open) reconciliation (which reads only the projection) can never see -- the
+    exact silent-poisoned-trunk failure recovery exists to prevent."""
+    r, base = repo
+    run_index(conn, r)
+    pre = git_ops.current_commit(r, ref="integration")
+
+    wt = git_ops.add_worktree(r, "agent-a", base)
+    (wt / "mod_a.py").write_text(
+        "def helper(x):\n    return x + 9\n", encoding="utf-8"
+    )
+    git_ops.commit_all(wt, "agent-a: edit")
+
+    class _FailsProjectionInsert:
+        """Proxy conn that dies exactly between the emit and the projection write."""
+
+        def __init__(self, real):
+            self._real = real
+
+        def execute(self, sql, *args):
+            if "INSERT INTO open_integrations" in sql:
+                raise sqlite3.OperationalError(
+                    "simulated crash between emit and projection write"
+                )
+            return self._real.execute(sql, *args)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    with pytest.raises(sqlite3.OperationalError):
+        integrator.integrate(
+            conn=_FailsProjectionInsert(conn),
+            repo=r,
+            branch="agent-a",
+            base_commit=base,
+            agent_id="agent-a",
+        )
+
+    # Atomicity: the start emit must have been rolled back WITH the failed
+    # projection write -- an event with no row is a start no restart can see.
+    starts = [
+        e for e in events_mod.tail(conn, since_seq=0) if e.type == "integrate_started"
+    ]
+    assert starts == [], (
+        "integrate_started was committed without its projection row: the emit and "
+        "the INSERT are not atomic, and a crash between them orphans trunk invisibly"
+    )
+    assert _open_rows(conn) == []
+    # The failure happened before the merge -- trunk must be untouched.
+    assert git_ops.current_commit(r, ref="integration") == pre
+
+
+# --- WP3.5 (C14): post-land re-index retires ghost parcels/contracts ----------------
+
+
+def test_landed_rename_retires_ghost_parcels_and_contracts(conn, repo):
+    """A file renamed by a LANDED merge must not leave ghost rows behind.
+
+    Pre-WP3.5, `classifier.store.run_index` documented "no stale-row pruning": the
+    old path's `parcels` rows and the old symbol's `contracts` row survived every
+    re-index, so `GET /parcels` kept serving a file that no longer exists,
+    `GET /contract/{old_symbol}` kept 200-ing a dead signature, and a renamed
+    symbol NEVER emitted `contract_change` (the old row simply never changed), so
+    dependents were never told. The honest rename story needs no rename detection:
+    the new path's rows appear via the normal re-index, and the old path's rows
+    retire with `parcel_retired`/`contract_retired` events.
+    """
+    r, base = repo
+    # threshold=0: every cross-module function/class symbol is a frozen contract,
+    # so mod_a.py::helper (imported by tests/test_a.py) has a contracts row.
+    run_index(conn, r, threshold=0)
+    assert conn.execute(
+        "SELECT 1 FROM contracts WHERE symbol = 'mod_a.py::helper'"
+    ).fetchone() is not None
+
+    wt = git_ops.add_worktree(r, "agent-mv", base)
+    (wt / "mod_a.py").rename(wt / "mod_renamed.py")
+    (wt / "tests" / "test_a.py").write_text(
+        "from mod_renamed import helper\n\n\n"
+        "def test_helper():\n"
+        "    assert isinstance(helper(1), int)\n",
+        encoding="utf-8",
+    )
+    git_ops.commit_all(wt, "agent-mv: rename mod_a.py -> mod_renamed.py")
+
+    result = integrator.integrate(
+        conn, r, "agent-mv", base_commit=base, agent_id="agent-mv", threshold=0
+    )
+    assert result.status == "merged"
+
+    # The old path's parcels are gone from the blackboard (what /parcels serves).
+    assert conn.execute(
+        "SELECT id FROM parcels WHERE path = 'mod_a.py'"
+    ).fetchall() == []
+    # The old symbol's contract row is gone (GET /contract/mod_a.py::helper -> 404).
+    assert conn.execute(
+        "SELECT 1 FROM contracts WHERE symbol = 'mod_a.py::helper'"
+    ).fetchone() is None
+    # The new path's rows appeared via the normal re-index (the rename's other half).
+    assert conn.execute(
+        "SELECT 1 FROM parcels WHERE id = 'mod_renamed.py::helper'"
+    ).fetchone() is not None
+    assert conn.execute(
+        "SELECT 1 FROM contracts WHERE symbol = 'mod_renamed.py::helper'"
+    ).fetchone() is not None
+
+    # One parcel_retired event per retired parcel, why=file_deleted.
+    events = events_mod.tail(conn, since_seq=0)
+    retired_payloads = [
+        json.loads(e.payload) for e in events if e.type == "parcel_retired"
+    ]
+    retired_ids = {p["parcel"] for p in retired_payloads}
+    assert "mod_a.py::helper" in retired_ids
+    assert "mod_a.py::<module>" in retired_ids
+    assert all(p["why"] == "file_deleted" for p in retired_payloads)
+    # The retired contract is announced too (its own event -- see integrator docs).
+    contract_retired = [
+        json.loads(e.payload) for e in events if e.type == "contract_retired"
+    ]
+    assert [p["symbol"] for p in contract_retired] == ["mod_a.py::helper"]
+    assert all(p["why"] == "symbol_deleted" for p in contract_retired)
+
+    # The result reports what was retired, for callers/tests.
+    assert "mod_a.py::helper" in result.retired_parcels
+    assert result.retired_contracts == ["mod_a.py::helper"]
+
+    # trunk stays green.
+    assert _full_suite_green(r)
+
+
+def test_retirement_respects_fk_dependents_and_scopes_to_touched_paths(conn, repo):
+    """Retiring a parcel must delete its FK dependents (leases, pheromone) first --
+    `foreign_keys=ON` would otherwise raise -- and must ONLY consider paths the
+    landed merge touched: an unrelated ghost row is never swept up per-merge."""
+    r, base = repo
+    run_index(conn, r)
+    now = time.time()
+    # An active lease + a pheromone row on a parcel the merge will delete.
+    conn.execute(
+        "INSERT INTO leases (parcel_id, agent_id, mode, acquired_at, ttl_expires_at,"
+        " heartbeat_at, status) VALUES (?, ?, 'write', ?, ?, ?, 'active')",
+        ("mod_a.py::helper", "agent-old", now, now + 300.0, now),
+    )
+    conn.execute(
+        "INSERT INTO pheromone (parcel_id, agent_id, kind, strength, updated_at)"
+        " VALUES (?, ?, 'touched', 1.0, ?)",
+        ("mod_a.py::helper", "agent-old", now),
+    )
+    # An unrelated ghost parcel (its file never existed) that this merge does NOT
+    # touch -- retirement is scoped to the merge's changed files, not a full sweep.
+    conn.execute(
+        "INSERT INTO parcels (id, path, blast_radius, updated_at)"
+        " VALUES ('ghost.py::<module>', 'ghost.py', 0, ?)",
+        (now,),
+    )
+
+    wt = git_ops.add_worktree(r, "agent-del", base)
+    (wt / "mod_a.py").unlink()
+    (wt / "tests" / "test_a.py").unlink()  # its test goes with it, gate stays green
+    git_ops.commit_all(wt, "agent-del: delete mod_a.py outright")
+
+    result = integrator.integrate(
+        conn, r, "agent-del", base_commit=base, agent_id="agent-del"
+    )
+    assert result.status == "merged"
+
+    # Parcel + FK dependents all gone -- no FK violation, no ghost lease.
+    assert conn.execute(
+        "SELECT id FROM parcels WHERE path = 'mod_a.py'"
+    ).fetchall() == []
+    assert conn.execute(
+        "SELECT 1 FROM leases WHERE parcel_id = 'mod_a.py::helper'"
+    ).fetchone() is None
+    assert conn.execute(
+        "SELECT 1 FROM pheromone WHERE parcel_id = 'mod_a.py::helper'"
+    ).fetchone() is None
+    # The event names the lease holder whose lease was closed by retirement.
+    events = events_mod.tail(conn, since_seq=0)
+    helper_retired = next(
+        json.loads(e.payload)
+        for e in events
+        if e.type == "parcel_retired"
+        and json.loads(e.payload)["parcel"] == "mod_a.py::helper"
+    )
+    assert helper_retired["why"] == "file_deleted"
+    assert "agent-old" in helper_retired.get("released_leases", [])
+
+    # Scope: the untouched ghost row survives (no full-table sweep per merge).
+    assert conn.execute(
+        "SELECT 1 FROM parcels WHERE id = 'ghost.py::<module>'"
+    ).fetchone() is not None
+
+
+def test_each_event_stamps_its_own_time_not_the_call_entry_time(
+    conn, repo, monkeypatch
+):
+    """C16: every event one `integrate()` emits must carry ITS OWN wall-clock
+    `ts`, not a single timestamp captured at call entry. One integrate spans the
+    whole pytest gate -- up to SWARMSYNC_GATE_TIMEOUT (600s default) -- so a
+    call-entry timestamp threaded through would stamp the `merged` verdict
+    minutes stale, and `ts` ordering across the call's own events would lie."""
+    r, base = repo
+    run_index(conn, r)
+
+    real_gate = integrator.run_impact_tests
+
+    def slow_gate(*args, **kwargs):
+        time.sleep(0.05)  # stand-in for a long (up to 600s) gate run
+        return real_gate(*args, **kwargs)
+
+    monkeypatch.setattr(integrator, "run_impact_tests", slow_gate)
+
+    wt = git_ops.add_worktree(r, "agent-slow", base)
+    (wt / "mod_a.py").write_text(
+        "def helper(x):\n    return x + 9\n", encoding="utf-8"
+    )
+    git_ops.commit_all(wt, "agent-slow: edit")
+    result = integrator.integrate(
+        conn, r, "agent-slow", base_commit=base, agent_id="agent-slow"
+    )
+    assert result.status == "merged"
+
+    events = events_mod.tail(conn, since_seq=0)
+    started = next(e for e in events if e.type == "integrate_started")
+    merged = next(e for e in events if e.type == "merged")
+    assert merged.ts > started.ts, (
+        f"`merged` (ts={merged.ts}) is not stamped after `integrate_started` "
+        f"(ts={started.ts}): the verdict carries a stale call-entry timestamp "
+        "instead of its own emit time (C16)"
     )

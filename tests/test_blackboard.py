@@ -4,6 +4,11 @@ Done when:
   - init_db(tmp) creates all 6 tables
   - PRAGMA journal_mode returns 'wal'
   - a second init_db on the same file is a no-op (idempotent, no errors, no data loss)
+
+WP3.4 adds the schema-version gate + managed-root binding tests:
+  - fresh DBs are stamped `schema_version = SCHEMA_VERSION` in `meta`
+  - legacy DBs (app tables, no stamp) and wrong-version DBs are REFUSED
+  - `bind_managed_root` pins a DB to one repo root and refuses a different one
 """
 from __future__ import annotations
 
@@ -198,3 +203,195 @@ def test_models_validate_from_sqlite_rows(tmp_path):
         assert event.type == "lease_granted"
     finally:
         conn.close()
+
+
+# --------------------------------------------------------------------------
+# WP3.4 — schema version gate (finding C7)
+# --------------------------------------------------------------------------
+
+
+def _make_legacy_db(dbfile) -> None:
+    """Build a pre-`meta` (schema v1) DB: application tables exist, no stamp.
+
+    Uses the real schema script and then drops `meta`, so the fixture stays in
+    lockstep with the DDL instead of hand-copying it.
+    """
+    raw = sqlite3.connect(str(dbfile))
+    try:
+        raw.executescript(db.SCHEMA)
+        raw.executescript("DROP TABLE meta;")
+    finally:
+        raw.close()
+
+
+def test_init_db_stamps_fresh_db_with_current_schema_version(tmp_path):
+    dbfile = tmp_path / "blackboard.db"
+    conn = db.init_db(dbfile)
+    try:
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'"
+        ).fetchone()
+        assert row is not None
+        assert row["value"] == str(db.SCHEMA_VERSION)
+        assert db.SCHEMA_VERSION == 2
+    finally:
+        conn.close()
+
+
+def test_second_init_db_does_not_alter_the_version_stamp(tmp_path):
+    dbfile = tmp_path / "blackboard.db"
+    db.init_db(dbfile).close()
+    conn = db.init_db(dbfile)  # must not raise, must not re-stamp/duplicate
+    try:
+        rows = conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'"
+        ).fetchall()
+        assert [r["value"] for r in rows] == [str(db.SCHEMA_VERSION)]
+    finally:
+        conn.close()
+
+
+def test_init_db_refuses_legacy_db_without_version_stamp(tmp_path):
+    """Finding C7: pre-meta DBs used to be silently accepted (CREATE IF NOT
+    EXISTS masked the difference) and then stranded by any schema change."""
+    dbfile = tmp_path / "legacy.db"
+    _make_legacy_db(dbfile)
+
+    with pytest.raises(db.SchemaVersionError) as exc:
+        db.init_db(dbfile)
+    msg = str(exc.value)
+    assert "--fresh" in msg  # the remedy is named
+    # the refusal must not have half-upgraded the file: still no meta table
+    raw = sqlite3.connect(str(dbfile))
+    try:
+        assert (
+            raw.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='meta'"
+            ).fetchone()
+            is None
+        )
+    finally:
+        raw.close()
+
+
+def test_init_db_refuses_legacy_db_with_meta_but_no_version_row(tmp_path):
+    dbfile = tmp_path / "blackboard.db"
+    conn = db.init_db(dbfile)
+    conn.execute("DELETE FROM meta WHERE key='schema_version'")
+    conn.close()
+
+    with pytest.raises(db.SchemaVersionError):
+        db.init_db(dbfile)
+
+
+@pytest.mark.parametrize("stamp", ["1", "3"])
+def test_init_db_refuses_version_mismatch_older_and_newer(tmp_path, stamp):
+    """The gate covers both directions: an older stamp AND a newer one (a DB
+    written by future code must not be silently downgraded either)."""
+    dbfile = tmp_path / "blackboard.db"
+    conn = db.init_db(dbfile)
+    conn.execute("UPDATE meta SET value=? WHERE key='schema_version'", (stamp,))
+    conn.close()
+
+    with pytest.raises(db.SchemaVersionError) as exc:
+        db.init_db(dbfile)
+    msg = str(exc.value)
+    assert f"v{stamp}" in msg
+    assert f"v{db.SCHEMA_VERSION}" in msg
+    assert "--fresh" in msg
+
+
+def test_init_db_on_empty_file_is_treated_as_fresh(tmp_path):
+    """`connect()` (and sqlite generally) may leave a zero-byte file behind;
+    that must count as fresh, not legacy."""
+    dbfile = tmp_path / "blackboard.db"
+    dbfile.touch()
+    conn = db.init_db(dbfile)
+    try:
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'"
+        ).fetchone()
+        assert row["value"] == str(db.SCHEMA_VERSION)
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------
+# WP3.4 — managed-root binding (finding U8)
+# --------------------------------------------------------------------------
+
+
+def test_bind_managed_root_first_call_stores_the_root(tmp_path):
+    dbfile = tmp_path / "blackboard.db"
+    conn = db.init_db(dbfile)
+    try:
+        assert db.stored_managed_root(conn) is None
+        db.bind_managed_root(conn, "/repo/alpha")
+        assert db.stored_managed_root(conn) == "/repo/alpha"
+    finally:
+        conn.close()
+
+
+def test_bind_managed_root_same_root_is_a_noop(tmp_path):
+    dbfile = tmp_path / "blackboard.db"
+    conn = db.init_db(dbfile)
+    try:
+        db.bind_managed_root(conn, "/repo/alpha")
+        db.bind_managed_root(conn, "/repo/alpha")  # must not raise
+        db.bind_managed_root(conn, "/repo/alpha")
+        rows = conn.execute(
+            "SELECT value FROM meta WHERE key='managed_root'"
+        ).fetchall()
+        assert [r["value"] for r in rows] == ["/repo/alpha"]
+    finally:
+        conn.close()
+
+
+def test_bind_managed_root_different_root_raises_naming_both_and_remedies(tmp_path):
+    dbfile = tmp_path / "blackboard.db"
+    conn = db.init_db(dbfile)
+    try:
+        db.bind_managed_root(conn, "/repo/alpha")
+        with pytest.raises(db.ManagedRootMismatchError) as exc:
+            db.bind_managed_root(conn, "/repo/beta")
+        msg = str(exc.value)
+        assert "/repo/alpha" in msg  # the original binding
+        assert "/repo/beta" in msg  # the offending root
+        assert "--fresh" in msg  # remedy 1: rotate
+        assert "original root" in msg  # remedy 2: point back at the bound root
+        # the failed bind must not have overwritten the stored root
+        assert db.stored_managed_root(conn) == "/repo/alpha"
+    finally:
+        conn.close()
+
+
+def test_bind_managed_root_survives_reconnect(tmp_path):
+    """The binding is a property of the DB FILE, not the connection."""
+    dbfile = tmp_path / "blackboard.db"
+    conn = db.init_db(dbfile)
+    db.bind_managed_root(conn, "/repo/alpha")
+    conn.close()
+
+    conn2 = db.init_db(dbfile)
+    try:
+        assert db.stored_managed_root(conn2) == "/repo/alpha"
+        with pytest.raises(db.ManagedRootMismatchError):
+            db.bind_managed_root(conn2, "/repo/beta")
+    finally:
+        conn2.close()
+
+
+def test_bind_managed_root_concurrent_first_bind_one_winner(tmp_path):
+    """Two connections racing the first bind: INSERT OR IGNORE + read-back means
+    one wins and the loser sees the winner's root (raises on a different root)."""
+    dbfile = tmp_path / "blackboard.db"
+    conn_a = db.init_db(dbfile)
+    conn_b = db.connect(dbfile)
+    try:
+        db.bind_managed_root(conn_a, "/repo/alpha")
+        with pytest.raises(db.ManagedRootMismatchError):
+            db.bind_managed_root(conn_b, "/repo/beta")
+        assert db.stored_managed_root(conn_b) == "/repo/alpha"
+    finally:
+        conn_a.close()
+        conn_b.close()

@@ -14,7 +14,7 @@ Core API:
 
 GRANULARITY: emit at symbol granularity, but the ENFORCED lease granularity is chosen
 in graph.py / server config and defaults to FILE (see DESIGN §2 de-risking). Keep the
-symbol spans so symbol-mode can be switched on per parcel for money-shot #1.
+symbol spans so symbol-mode can be switched on per parcel for test case #1.
 
 Span/hash design note (this unit's own decision, not spec-mandated in this much
 detail): a top-level `def`/`async def` and a method inside a class get a concrete,
@@ -42,11 +42,14 @@ from typing import Optional, Union
 
 from swarmsync.blackboard.models import Parcel
 
+# Re-export (WP4.4): the id scheme now lives in `blackboard.parcel_id`, but
+# `hooks/adapter.py` and tests historically import MODULE_SYMBOL from here --
+# keep that path working.
+from swarmsync.blackboard.parcel_id import MODULE_SYMBOL as MODULE_SYMBOL
+
 logger = logging.getLogger(__name__)
 
 StrPath = Union[str, Path]
-
-MODULE_SYMBOL = "<module>"
 
 # Directory name fragments to never descend into when walking a repo tree.
 _SKIP_DIRS = {"__pycache__", ".git", ".venv", "venv", ".pytest_cache", "node_modules"}

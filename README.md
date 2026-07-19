@@ -96,11 +96,11 @@ You should see:
 
 ```
 RESULTS
-  PASS: case #1 (three agents on three files land concurrently, clean)
-  PASS: case #2 (contended whole-file parcel serializes)
-  PASS: case #3 (frozen-contract change notifies + dependent re-plans)
-  PASS: case #4 (crash mid-edit is recovered)
-  PASS: case #5 (serial gated integration rejects a bad edit)
+  PASS: test case #1 (three agents on three files land concurrently, clean)
+  PASS: test case #2 (contended whole-file parcel serializes)
+  PASS: test case #3 (frozen-contract change notifies + dependent re-plans)
+  PASS: test case #4 (crash mid-edit is recovered)
+  PASS: test case #5 (serial gated integration rejects a bad edit)
   PASS: overall (zero collisions, trunk green throughout)
 ```
 
@@ -141,10 +141,19 @@ released automatically when the agent stops. When two agents reach for the same 
 denied with a message like:
 
 ```
-swarm-sync: payments.py is leased by agent-a; pick different work or retry shortly.
+swarm-sync: payments.py is leased by agent-a (~280s left on the current hold; the hold renews while its holder stays active). Pick different work -- run `swarmsync holds` to see who holds what (or GET http://127.0.0.1:8787/leases).
 ```
 
+> A Claude Code **skill** ships in this repo at [`.claude/skills/swarmsync/`](.claude/skills/swarmsync/SKILL.md):
+> it teaches an agent the lease protocol, how to respond to a deny, and the `swarmsync` CLI. Copy it
+> into your own `~/.claude/skills/` (or a project's `.claude/skills/`) so agents pick it up automatically.
+
 ### Setup
+
+**Quick path:** from your repo, run `swarmsync init-hooks` — it writes the hook block below into
+`<repo>/.claude/settings.json` (idempotently; `--dry-run` to preview, `--global` for `~/.claude`) and
+drops the `.swarmsync-active` marker to turn coordination on. Then `swarmsync doctor` confirms the
+whole setup. The rest of this section is what those two commands do, by hand.
 
 **1 — Wire the hooks.** Add this to `~/.claude/settings.json` (global) or
 `<project>/.claude/settings.json` (project-scoped), pointing the `command` paths at your actual
@@ -199,6 +208,23 @@ no-op and every edit is allowed, so installing the hooks never interferes with o
 **4 — Run your agents.** That's it. Edits to free files proceed silently; edits to a file another
 agent holds are denied with the message above until it's released.
 
+### Operating a session — the `swarmsync` CLI
+
+A single read-only command talks to the running blackboard over the same HTTP the hooks use (default
+`$SWARMSYNC_URL`), so you — or a denied agent, from its own shell — can see and steer coordination:
+
+```bash
+swarmsync status              # is the server up, bound to which repo, how busy?
+swarmsync holds               # every active hold: parcel, holder, mode, TTL-remaining
+swarmsync free payments.py    # of these paths, which are free? (exit 1 if any held)
+swarmsync events --follow     # tail the event stream
+swarmsync doctor              # diagnose the setup; each check prints a fix if it fails
+```
+
+`swarmsync free foo.py && …` gates work in one line — the deny message an agent hits points it right
+back here (`swarmsync holds`). For the raw API, the server also serves interactive Swagger docs at
+`GET http://127.0.0.1:8787/docs`.
+
 ### Troubleshooting
 
 Two failure modes are quiet by design (the hooks *fail open* so they never block ordinary work), so
@@ -212,16 +238,38 @@ they're worth knowing before they bite:
   startup line. One server coordinates **one** repo; for a second repo, run a second server on
   another port.
 - **The hook talks to port 8787 by default.** The adapter's default `SWARMSYNC_URL` is
-  `http://127.0.0.1:8787`, which assumes you started the server with `swarmsync-serve`. There's a
-  second launcher, `swarm-sync`, that defaults to port **8000** — if you use that one for a
-  hook-enforced session without also setting `SWARMSYNC_URL`, the hook can't reach the server and
-  (failing open) allows every edit. For hook sessions, use `swarmsync-serve --port 8787`, or export
-  `SWARMSYNC_URL` to match whatever you started.
+  `http://127.0.0.1:8787`, matching the launcher's default port — so a stock `swarmsync-serve` and a
+  stock hook find each other with no configuration. If you serve on a different `--port` (or host),
+  export `SWARMSYNC_URL` to match, or the hook can't reach the server and (failing open) allows
+  every edit.
 
-| Launcher | Default port | Use for |
+There is exactly **one launcher**: `swarmsync-serve` (the `swarm-sync` command is the same program —
+both console scripts run the same `main`). Same defaults everywhere: port **8787**, DB
+`swarmsync.db` (or `SWARMSYNC_DB`), `--root`/`--fresh`, the managed-root banner, and the startup
+clock check. Earlier versions shipped a second launcher on port 8000 with different defaults;
+following the wrong one was a silent fail-open, so it's gone.
+
+## Configuration (environment variables)
+
+Everything is optional — unset knobs use the defaults below, and a garbage value falls back to the
+default rather than crashing (a typo must never take the blackboard down or silently disable a
+lease). All reads go through [`swarmsync/config.py`](swarmsync/config.py), the one module allowed to
+touch the environment.
+
+| Variable | Default | Meaning |
 |---|---|---|
-| `swarmsync-serve` | **8787** | Claude Code hook sessions (matches the hook's default URL) |
-| `swarm-sync` | **8000** | direct/uvicorn use; set `SWARMSYNC_URL` if you use it with hooks |
+| `SWARMSYNC_ACTIVE` | unset (off) | Hook opt-in: exactly `1` activates coordination for a session regardless of marker files (the `.swarmsync-active` marker is the per-repo alternative). |
+| `SWARMSYNC_URL` | `http://127.0.0.1:8787` | Blackboard base URL the hook adapter talks to. Must match where `swarmsync-serve` is listening. |
+| `SWARMSYNC_TOKEN` | unset (no auth) | Bearer token required on every mutating route when set; the hook sends it automatically. |
+| `SWARMSYNC_ROOTS` | launch cwd | Managed-root allow-list for `/index`/`/integrate` (403 outside it). Exactly **one** root; `--root` sets it for you. |
+| `SWARMSYNC_DB` | `swarmsync.db` | Default SQLite path for the launcher's `--db` (the flag wins). `SWARM_SYNC_DB` is honored as a deprecated alias, with a stderr warning. |
+| `SWARMSYNC_LEASE_TTL` | `300` (seconds) | Lease TTL the hook acquires/renews with. Zero/negative/over-ceiling values are refused loudly and the default used — a typo must not disable lease protection. |
+| `SWARMSYNC_GATE_TIMEOUT` | `600` (seconds) | Wall-clock ceiling on the integrator's pytest gate; also widens the agent client's `/integrate` HTTP timeout to match. |
+| `SWARMSYNC_MAX_LEASES_PER_AGENT` | `256` | Cap on active leases one agent id may hold (bounds `ensure_parcel` abuse). |
+| `SWARMSYNC_MAX_BODY_BYTES` | `10485760` (10 MiB) | Request bodies declaring more than this are rejected 413 before buffering. |
+| `SWARMSYNC_EVENTS_COMPACT_INTERVAL` | `60` (seconds) | How often the background reaper runs an events-compaction pass. |
+| `SWARMSYNC_EVENTS_HEARTBEAT_MAX_AGE` | `3600` (1 hour) | Retention window for heartbeat events — the keepalive traffic that dominates log growth. |
+| `SWARMSYNC_EVENTS_MAX_AGE` | `604800` (7 days) | Retention horizon for any event (still-open integrate audit rows survive regardless). |
 
 ---
 

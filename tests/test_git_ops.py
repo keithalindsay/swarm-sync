@@ -263,3 +263,100 @@ def test_add_worktree_still_accepts_ordinary_agent_ids(repo):
         wt = git_ops.add_worktree(r, name, base)
         assert wt.exists()
         git_ops.remove_worktree(r, name, delete_branch=True)
+
+
+# --- WP3.5 (P2 + C6-interim): rejected branches are parked out of pruning's reach ---
+
+
+def _commit_reachable(repo, sha) -> bool:
+    result = git_ops._run(
+        ["git", "cat-file", "-e", f"{sha}^{{commit}}"], cwd=repo, check=False
+    )
+    return result.returncode == 0
+
+
+def test_prune_stale_worktree_never_deletes_a_rejected_branch(repo):
+    """Defense in depth: even if a stale worktree sits ON a `rejected/*` branch,
+    `_prune_stale_worktree` removes the worktree but must KEEP the branch -- it is
+    the only reference to a rejected attempt's commits."""
+    r, base = repo
+    # A parked branch with a unique commit on it.
+    wt = git_ops.add_worktree(r, "victim", base)
+    (wt / "fileA.txt").write_text("rejected work\n")
+    sha = git_ops.commit_all(wt, "work that was rejected")
+    git_ops._run(["git", "worktree", "remove", "--force", str(wt)], cwd=r)
+    git_ops._run(["git", "branch", "-m", "victim", "rejected/victim-20260718"], cwd=r)
+    # A stale worktree checked out ON the rejected branch (no -b: existing branch).
+    stale = r / ".worktrees" / "stale-on-rejected"
+    git_ops._run(
+        ["git", "worktree", "add", str(stale), "rejected/victim-20260718"], cwd=r
+    )
+
+    git_ops._prune_stale_worktree(r, "rejected/victim-20260718", stale)
+
+    assert not stale.exists()  # the worktree itself IS pruned
+    branches = git_ops._run(
+        ["git", "branch", "--list", "rejected/victim-20260718"], cwd=r
+    ).stdout
+    assert branches.strip() != "", "prune deleted a rejected/* branch"
+    assert _commit_reachable(r, sha)
+
+
+def test_rejected_branch_parked_and_commits_survive_rerun_of_same_attempt_id(repo):
+    """The preserved-commits contract, end to end at this layer: broker attempt ids
+    are deterministic (`{task_id}-attempt-{n}`), so a re-run of the same task list
+    reuses the SAME branch name -- and `add_worktree`'s prune ran `git branch -D`
+    on it unconditionally, destroying the rejected attempt's only commits before
+    doing anything else. Post-WP3.5 the rejection path PARKS the work under a
+    timestamped `rejected/*` ref that pruning never touches."""
+    from swarmsync.agent.runner import _cleanup_worktree
+
+    r, base = repo
+    name = "task-1-attempt-1"
+    wt = git_ops.add_worktree(r, name, base)
+    (wt / "fileA.txt").write_text("work the integrator will reject\n")
+    sha = git_ops.commit_all(wt, "rejected attempt's commit")
+
+    # The runner's rejection-path cleanup: keep the work, park it out of reach.
+    _cleanup_worktree(r, name, delete_branch=False, park_branch=True)
+
+    # Re-run the same task list -> same deterministic attempt id.
+    wt2 = git_ops.add_worktree(r, name, base)
+    assert wt2.exists()
+
+    # The rejected commits are still reachable, from a rejected/* ref.
+    assert _commit_reachable(r, sha), (
+        "re-running the same task id destroyed the rejected attempt's commits"
+    )
+    parked = git_ops._run(
+        ["git", "for-each-ref", "--format=%(refname:short) %(objectname)",
+         "refs/heads/rejected/"],
+        cwd=r,
+    ).stdout.strip().splitlines()
+    assert any(
+        line.startswith(f"rejected/{name}-") and line.endswith(sha) for line in parked
+    ), f"no rejected/* ref points at the preserved commit: {parked!r}"
+
+
+def test_park_branch_names_never_collide_across_repeated_rejections(repo):
+    """Two rejections of the same attempt id must park under distinct names."""
+    r, base = repo
+    name = "task-2-attempt-1"
+
+    wt = git_ops.add_worktree(r, name, base)
+    (wt / "fileA.txt").write_text("first rejected try\n")
+    git_ops.commit_all(wt, "first rejection")
+    git_ops.remove_worktree(r, name, delete_branch=False)
+    first = git_ops.park_branch(r, name)
+
+    wt = git_ops.add_worktree(r, name, base)
+    (wt / "fileA.txt").write_text("second rejected try\n")
+    git_ops.commit_all(wt, "second rejection")
+    git_ops.remove_worktree(r, name, delete_branch=False)
+    second = git_ops.park_branch(r, name)
+
+    assert first != second
+    assert first.startswith("rejected/") and second.startswith("rejected/")
+    for parked in (first, second):
+        out = git_ops._run(["git", "branch", "--list", parked], cwd=r).stdout
+        assert out.strip() != ""

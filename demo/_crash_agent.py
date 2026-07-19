@@ -1,4 +1,4 @@
-"""Standalone helper process for demo money-shot #4 (crash mid-edit recovery).
+"""Standalone helper process for demo test case #4 (crash mid-edit recovery).
 
 Not a test and not imported by anything else -- `demo/run_demo.py` launches this
 file as a REAL, separate OS process (`subprocess.Popen`), lets it run the normal

@@ -1,13 +1,13 @@
-"""U14/U15 -- End-to-end demo: all five money shots. DESIGN.md §7.
+"""U14/U15 -- End-to-end demo: all five test cases. DESIGN.md §7.
 
 U14 done when (BUILD_PLAN.md): `python demo/run_demo.py` runs >=3 agents on
-sample_repo, prints PASS for money-shots #1/#2/#4/#5, exits 0; zero same-file
+sample_repo, prints PASS for test cases #1/#2/#4/#5, exits 0; zero same-file
 textual collisions reached `integration`; trunk green throughout.
 
 U15 done when (BUILD_PLAN.md): the demo shows an agent changing a frozen
 signature (emitting a real `contract_change` event), a dependent agent
 observing it, re-reading the contract, and landing a call-site fix with tests
-green; money-shot #3 prints PASS and the full demo exits 0 with all five PASS.
+green; test case #3 prints PASS and the full demo exits 0 with all five PASS.
 (At file granularity -- the shipping mode -- the change takes a whole-file WRITE
 lease, not a symbol-level exclusive lease: the frozen-contract exclusive-upgrade
 is parked with symbol mode. Contract DETECTION is granularity-independent and
@@ -79,14 +79,14 @@ def test_run_demo_script_exits_zero_and_prints_pass_for_all_five_shots():
     )
 
     out = result.stdout
-    assert "PASS: money-shot #1" in out
-    assert "PASS: money-shot #2" in out
-    assert "PASS: money-shot #3" in out
-    assert "PASS: money-shot #4" in out
-    assert "PASS: money-shot #5" in out
+    assert "PASS: test case #1" in out
+    assert "PASS: test case #2" in out
+    assert "PASS: test case #3" in out
+    assert "PASS: test case #4" in out
+    assert "PASS: test case #5" in out
     assert "PASS: overall" in out
-    assert "FAIL: money-shot" not in out
-    assert "ALL FIVE MONEY SHOTS PASS" in out
+    assert "FAIL: test case" not in out
+    assert "ALL FIVE TEST CASES PASS" in out
 
 
 # --- structured, in-process assertions -- all read the ONE `demo_run` fixture ------
@@ -134,7 +134,7 @@ def test_run_demo_has_zero_textual_merge_conflicts_in_its_event_log(demo_run):
 
     reasons = [json.loads(r["payload"])["reason"] for r in rows if r["payload"]]
     assert "merge_conflict" not in reasons
-    # money-shot #5's own deliberate rejection IS expected, for a real reason.
+    # test case #5's own deliberate rejection IS expected, for a real reason.
     assert "tests_failed" in reasons
 
 
@@ -150,7 +150,7 @@ def test_run_demo_leaves_trunk_test_suite_green_at_the_end(demo_run):
     assert suite.returncode == 0, suite.stdout + suite.stderr
 
 
-# --- U15: money-shot #3's own specifics (frozen-contract change + re-plan) ---------
+# --- U15: test case #3's own specifics (frozen-contract change + re-plan) ---------
 
 
 def test_run_demo_shot3_emits_contract_change_and_lands_dependent_fixes(demo_run):

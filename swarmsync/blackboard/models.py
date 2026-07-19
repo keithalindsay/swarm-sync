@@ -4,6 +4,8 @@ Pydantic models mirroring the schema:
   Parcel, Lease, Contract, Pheromone, Intent, Event
 Plus the request/response bodies used by the FastAPI endpoints (§4.2):
   LeaseRequest, LeaseResult, IntentBody, HeartbeatBody, ParcelUpdateBody, IntegrateBody
+  ParcelLeaseInfo, ParcelWithLeases (the `GET /parcels` row: parcel columns +
+  the active-lease join -- WP4.5's declaration of the previously implicit shape)
 
 These are the wire contract between agent/client.py and server/app.py — keep them
 in sync with schema.sql. Row models use `model_config = ConfigDict(from_attributes=True)`
@@ -14,7 +16,30 @@ from __future__ import annotations
 
 from typing import Literal, Optional
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
+
+from swarmsync.blackboard.db import BUSY_TIMEOUT_SECONDS
+
+# --- TTL bounds (C9) ---------------------------------------------------------------
+# A lease TTL must be STRICTLY positive. A `ttl <= 0` makes
+# `ttl_expires_at = now + ttl` land in the past, so the lease is granted AND already
+# expired: `server.leases.acquire`'s CAS predicate (`ttl_expires_at > now`) treats the
+# born-dead row as non-blocking, so a SECOND agent is ALSO immediately granted -- two
+# writers on one parcel, both told they hold the lock. The ceiling guards the
+# symmetric hazard: a huge TTL is an effectively permanent lease the reaper never
+# fires on. Enforced as pydantic field constraints on the wire bodies below, so
+# `POST /lease {"ttl": 0}` is a 422 rather than a silent double-grant.
+LEASE_TTL_MAX_SECONDS = 86400.0  # 24h
+
+# Defense-in-depth floor (C13): a TTL should comfortably exceed the SQLite
+# `busy_timeout` (see blackboard/db.py) -- >= 2x it -- so the heartbeat liveness
+# predicate can never be raced by a lock wait that shrinks the live window toward
+# request latency. DERIVED from the busy_timeout constant rather than hardcoded, so
+# retuning the timeout cannot silently strand this floor at a stale multiple. NOT
+# enforced on the wire: the hook's own keepalive tests deliberately use sub-second
+# TTLs to exercise renewal quickly, so a hard floor would be a false constraint
+# here. Callers that can (the hook adapter) warn below it.
+LEASE_TTL_FLOOR_SECONDS = 2 * BUSY_TIMEOUT_SECONDS
 
 # --- literals mirroring the CHECK-by-convention columns in schema.sql -------------
 
@@ -43,6 +68,18 @@ EventType = Literal[
     # resets out and records as `integrate_orphaned`.
     "integrate_started",
     "integrate_orphaned",
+    # WP3.5 (C14): the integrator's post-land re-index retires `parcels` rows whose
+    # file a landed merge deleted/renamed (`parcel_retired`, why=file_deleted) and
+    # `contracts` rows whose symbol no longer exists (`contract_retired`,
+    # why=symbol_deleted). Dependents observe these instead of polling a ghost row
+    # that would otherwise never change again.
+    "parcel_retired",
+    "contract_retired",
+    # WP3.1 (S2): one marker per non-empty compaction pass, carrying the pruned
+    # count + seq range (`server.events.compact_events`). Registered here so the
+    # maintenance row is a first-class citizen of the log; `GET /events` keeps its
+    # widened `EventOut` anyway as defense against future registry-external rows.
+    "events_compacted",
 ]
 
 
@@ -85,6 +122,42 @@ class Lease(BaseModel):
     status: LeaseStatus
 
 
+class HealthOut(BaseModel):
+    """`GET /health` -- the operational snapshot (WP5.1, U2). Read-only and
+    unauthenticated: it is the one surface an operator or agent hits to learn the
+    server is up, which single repo root it is bound to, where its blackboard DB
+    lives, and how busy it is (active leases, last event seq). `swarmsync status`
+    and `swarmsync doctor` are built on it. Field names are the wire contract."""
+
+    version: str
+    root: str
+    db_path: str
+    active_leases: int
+    last_event_seq: int
+
+
+class ParcelLeaseInfo(BaseModel):
+    """One active lease as embedded in a `GET /parcels` row's `active_leases`
+    (WP4.5, A6). NOT a full `Lease`: the endpoint deliberately projects just the
+    identity triple a reader needs to see who holds a parcel -- and the lease's
+    row id is exposed under the key `lease_id` (not `id`), matching the wire
+    shape the hook adapter already duck-types against. Field names here ARE the
+    wire contract; renaming one is a breaking API change."""
+
+    lease_id: int
+    agent_id: str
+    mode: LeaseMode
+
+
+class ParcelWithLeases(Parcel):
+    """`GET /parcels` response row (WP4.5, A6): every `parcels` column exactly
+    as in `Parcel`, plus the endpoint's `active_leases` join -- the currently
+    active, unexpired leases on this parcel. Declares the shape the endpoint has
+    always returned; the JSON is unchanged."""
+
+    active_leases: list[ParcelLeaseInfo] = Field(default_factory=list)
+
+
 class Contract(BaseModel):
     """A frozen interface surface. DESIGN.md §3 step 5."""
 
@@ -121,7 +194,10 @@ class Intent(BaseModel):
 
 
 class Event(BaseModel):
-    """One row of the append-only pheromone/audit log. Source of truth for replay."""
+    """One row of the append-only pheromone/audit log. Audit and observability --
+    NOT a replay source of truth: the SQLite tables are the state of record, and
+    crash recovery reads the `open_integrations` projection (see events.py's
+    honesty note and DESIGN §4.1)."""
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -140,7 +216,9 @@ class LeaseRequest(BaseModel):
     parcel_id: str
     mode: LeaseMode = "write"
     intent: Optional[str] = None
-    ttl: Optional[float] = None
+    # C9: a TTL, when supplied, must be strictly positive and within the ceiling.
+    # None means "use the server's default window" (server.leases.DEFAULT_TTL_SECONDS).
+    ttl: Optional[float] = Field(default=None, gt=0, le=LEASE_TTL_MAX_SECONDS)
     # Opt-in whole-file parcel auto-creation for callers (the hook adapter) that
     # lease arbitrary real files rather than ids resolved from a real index.
     # See `server.leases._ensure_parcel`.
@@ -151,6 +229,13 @@ class LeaseResult(BaseModel):
     granted: bool
     lease_id: Optional[int] = None
     reason: Optional[str] = None
+    # On a DENY, the identity + expiry of the conflicting active lease that best
+    # explains the denial, so a caller (the hook adapter) can name the holder and say
+    # when it frees WITHOUT a second /leases round-trip. Both stay None on the granted
+    # path and on any deny where no single holder is identifiable (e.g. a race in which
+    # the blocker released between the CAS and the lookup). See server.leases.acquire.
+    holder: Optional[str] = None  # conflicting write/exclusive (or blocking read) agent_id
+    holder_ttl_expires_at: Optional[float] = None  # that lease's ttl_expires_at (epoch s)
 
 
 class IntentBody(BaseModel):
@@ -165,7 +250,9 @@ class HeartbeatBody(BaseModel):
     # Optional TTL (seconds) to renew with; None -> the server's default window.
     # The hook keepalive (S5) sends its own long TTL so a renewed lease keeps the
     # long window instead of collapsing back to the short server default.
-    ttl: Optional[float] = None
+    # C9: same bounds as LeaseRequest -- a renewal with ttl <= 0 would push the lease
+    # into the past and revive the double-lease `heartbeat`'s liveness guard prevents.
+    ttl: Optional[float] = Field(default=None, gt=0, le=LEASE_TTL_MAX_SECONDS)
 
 
 class ParcelUpdateBody(BaseModel):
@@ -181,3 +268,13 @@ class IntegrateBody(BaseModel):
     repo: str  # filesystem path to the git repo `branch` lives in (U10 needs it to merge)
     base_commit: Optional[str] = None
     into: str = "integration"
+    # WP4.6 (A1): the submitting agent's plan-time read-dependency snapshot,
+    # `{parcel_or_contract_id: expected_hash}`, forwarded verbatim to
+    # `coordinator.integrator.integrate(expected_read_deps=...)` (DESIGN §5.5).
+    # The integrator compares each id against the blackboard's CURRENT
+    # `parcels.content_hash` (parcels are checked first) or, for an id with no
+    # parcels row, `contracts.type_hash`; any mismatch means a read-dependency
+    # shifted between plan and submit -> the verdict is `needs_rebase` and NO
+    # merge is attempted. Optional and opt-in: omitted/None skips the check
+    # entirely (every pre-WP4.6 caller's wire behavior, unchanged).
+    expected_read_deps: Optional[dict[str, str]] = None

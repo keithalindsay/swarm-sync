@@ -18,7 +18,7 @@ from swarmsync.agent import mutators
 from swarmsync.agent.client import BlackboardClient
 from swarmsync.classifier.graph import SymbolModeError
 from swarmsync.coordinator import broker
-from swarmsync.server import leases as leases_mod
+from swarmsync.blackboard import leases as leases_mod
 from swarmsync.server.app import create_app
 from swarmsync.worktree import git_ops
 
@@ -538,3 +538,273 @@ def test_frozen_contract_target_is_upgraded_to_an_exclusive_lease_parked_mechani
         and json.loads(e["payload"]).get("parcel_id") == module_id
     ]
     assert granted and all(g["mode"] == "exclusive" for g in granted)
+
+
+# --- C11 (WP3.6): broker failure containment -----------------------------------------
+
+
+def _exploding_mutator(worktree, **kwargs):
+    raise RuntimeError("boom mid-edit")
+
+
+def test_broker_contains_a_crashing_task_and_keeps_sibling_results(conn_and_client, repo):
+    """C11: one task crashing must not abort the whole run. Before the fix the
+    mutator's RuntimeError propagated through run_agent and out of
+    `future.result()`, so `broker.run` raised and EVERY other task's result was
+    discarded (the sibling's edit had even landed on trunk already -- the caller
+    just never got told)."""
+    conn, client = conn_and_client
+    r, base = repo
+    task_bad = broker.Task(
+        task_id="crashing-task",
+        targets=[("mod_a.py", "helper")],
+        mutator=_exploding_mutator,
+        base_commit=base,
+    )
+    task_good = broker.Task(
+        task_id="edit-compute",
+        targets=[("mod_b.py", "compute")],
+        mutator=mutators.edit_function_body,
+        mutator_kwargs={"path": "mod_b.py", "symbol": "compute", "new_body": "return n * 10"},
+        base_commit=base,
+    )
+
+    # disjoint targets -> same wave, genuinely concurrent dispatch.
+    results = broker.run(conn, r, [task_bad, task_good], client, n_agents=2)
+
+    # the sibling's result survived AND its edit landed.
+    assert results["edit-compute"].status == "done"
+    assert "return n * 10" in (r / "mod_b.py").read_text()
+
+    # the crashing task is recorded as an error result for THAT task only.
+    bad = results["crashing-task"]
+    assert bad.status == "error"
+    assert bad.error_type == "RuntimeError"
+    assert bad.error is not None and "boom mid-edit" in bad.error
+
+    # and the crashed attempt's lease was released, not leaked until TTL.
+    active = client.leases()
+    assert active == [], f"a crashed task leaked active leases: {active!r}"
+
+
+def test_broker_records_an_error_result_when_the_runner_itself_raises(
+    conn_and_client, repo, monkeypatch
+):
+    """Even if run_agent somehow raises PAST its own containment, the broker must
+    catch it per-task, record an error result, and keep the run going."""
+    conn, client = conn_and_client
+    r, base = repo
+    real_run_agent = broker.run_agent
+
+    def raising_run_agent(*args, **kwargs):
+        if kwargs["task"] == "raises-out-of-the-runner":
+            raise RuntimeError("runner escaped containment")
+        return real_run_agent(*args, **kwargs)
+
+    monkeypatch.setattr(broker, "run_agent", raising_run_agent)
+
+    task_bad = broker.Task(
+        task_id="raises-out-of-the-runner",
+        targets=[("mod_a.py", "helper")],
+        mutator=mutators.edit_function_body,
+        mutator_kwargs={"path": "mod_a.py", "symbol": "helper", "new_body": "return 0"},
+        base_commit=base,
+    )
+    task_good = broker.Task(
+        task_id="edit-compute",
+        targets=[("mod_b.py", "compute")],
+        mutator=mutators.edit_function_body,
+        mutator_kwargs={"path": "mod_b.py", "symbol": "compute", "new_body": "return n * 10"},
+        base_commit=base,
+    )
+
+    results = broker.run(conn, r, [task_bad, task_good], client, n_agents=2)
+
+    assert results["edit-compute"].status == "done"
+    bad = results["raises-out-of-the-runner"]
+    assert bad.status == "error"
+    assert bad.error_type == "RuntimeError"
+    assert bad.error is not None and "escaped containment" in bad.error
+
+
+def test_broker_retries_once_on_transient_gitops_error_and_succeeds(
+    conn_and_client, repo, caplog
+):
+    """A GitOpsError is git's own transient ref/index lock contention -- exactly
+    what concurrent `git worktree add`/checkout in one repo can hit -- so the
+    broker grants ONE bounded retry, and logs it so an operator can see it."""
+    import logging
+
+    conn, client = conn_and_client
+    r, base = repo
+    calls = {"n": 0}
+
+    def transient_git_failure_mutator(worktree, path, symbol, new_body):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise git_ops.GitOpsError("fatal: Unable to create '.git/index.lock': File exists")
+        mutators.edit_function_body(worktree, path, symbol, new_body)
+
+    task = broker.Task(
+        task_id="edit-helper",
+        targets=[("mod_a.py", "helper")],
+        mutator=transient_git_failure_mutator,
+        mutator_kwargs={"path": "mod_a.py", "symbol": "helper", "new_body": "return x - y"},
+        base_commit=base,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="swarmsync.coordinator.broker"):
+        results = broker.run(conn, r, [task], client, n_agents=1)
+
+    assert calls["n"] == 2  # first attempt failed, the ONE retry ran
+    assert results["edit-helper"].status == "done"
+    assert "return x - y" in (r / "mod_a.py").read_text()
+    # the retry is visible: a logged, inspectable note naming the task.
+    retry_notes = [
+        rec for rec in caplog.records if "retry" in rec.message.lower() and "edit-helper" in rec.message
+    ]
+    assert retry_notes, "the GitOpsError retry left no inspectable trace"
+
+
+def test_broker_gitops_retry_is_bounded_second_failure_records_the_error(
+    conn_and_client, repo
+):
+    """The GitOpsError retry is ONE retry, not a loop: a second failure records
+    the error result for the task and moves on."""
+    conn, client = conn_and_client
+    r, base = repo
+    calls = {"n": 0}
+
+    def always_git_failure(worktree, **kwargs):
+        calls["n"] += 1
+        raise git_ops.GitOpsError("lock contention that never clears")
+
+    task = broker.Task(
+        task_id="edit-helper",
+        targets=[("mod_a.py", "helper")],
+        mutator=always_git_failure,
+        base_commit=base,
+    )
+
+    results = broker.run(conn, r, [task], client, n_agents=1)
+
+    assert calls["n"] == 2, "expected exactly one original attempt + one retry"
+    result = results["edit-helper"]
+    assert result.status == "error"
+    assert result.error_type == "GitOpsError"
+    # nothing leaked despite two crashed attempts.
+    assert client.leases() == []
+
+
+def test_broker_non_gitops_error_is_not_retried(conn_and_client, repo):
+    """The bounded retry exists for git's transient lock contention ONLY -- an
+    arbitrary crash is not presumed transient and gets no second run (a mutator
+    with side effects must not be silently re-run on an unknown failure)."""
+    conn, client = conn_and_client
+    r, base = repo
+    calls = {"n": 0}
+
+    def counting_explosion(worktree, **kwargs):
+        calls["n"] += 1
+        raise RuntimeError("not a git lock problem")
+
+    task = broker.Task(
+        task_id="crashing-task",
+        targets=[("mod_a.py", "helper")],
+        mutator=counting_explosion,
+        base_commit=base,
+    )
+
+    results = broker.run(conn, r, [task], client, n_agents=1)
+
+    assert calls["n"] == 1
+    assert results["crashing-task"].status == "error"
+    assert results["crashing-task"].error_type == "RuntimeError"
+
+
+# --- WP4.6 (A7): per-thread worker connections ------------------------------------
+
+
+def test_broker_workers_get_distinct_per_thread_connections(
+    conn_and_client, repo, tmp_path, monkeypatch
+):
+    """`run(db_path=...)` must open ONE fresh connection per dispatched worker
+    task (each distinct from the caller's own `conn`) and close it when the
+    task finishes -- instead of every worker thread sharing the caller's single
+    SQLite handle. Instrumented at the broker's own `_open_task_conn` seam so
+    the server's per-request `db.connect` calls (same module function) don't
+    pollute the count."""
+    conn, client = conn_and_client
+    r, base = repo
+
+    opened: list = []
+    lock = threading.Lock()
+    real_open = broker._open_task_conn
+
+    def recording_open(db_path):
+        c = real_open(db_path)
+        with lock:
+            opened.append((threading.get_ident(), c))
+        return c
+
+    monkeypatch.setattr(broker, "_open_task_conn", recording_open)
+
+    task_a = broker.Task(
+        task_id="pt-edit-helper",
+        targets=[("mod_a.py", "helper")],
+        mutator=mutators.edit_function_body,
+        mutator_kwargs={"path": "mod_a.py", "symbol": "helper", "new_body": "return x - y - 1"},
+        base_commit=base,
+    )
+    task_b = broker.Task(
+        task_id="pt-edit-compute",
+        targets=[("mod_b.py", "compute")],
+        mutator=mutators.edit_function_body,
+        mutator_kwargs={"path": "mod_b.py", "symbol": "compute", "new_body": "return n * 11"},
+        base_commit=base,
+    )
+
+    results = broker.run(
+        conn, r, [task_a, task_b], client, n_agents=2, db_path=tmp_path / "blackboard.db"
+    )
+
+    assert results["pt-edit-helper"].status == "done"
+    assert results["pt-edit-compute"].status == "done"
+
+    # One fresh connection per dispatched task; all distinct objects, and none
+    # of them is the caller's shared conn.
+    assert len(opened) == 2, opened
+    conns = [c for _tid, c in opened]
+    assert len({id(c) for c in conns}) == 2
+    assert all(c is not conn for c in conns)
+    # ...and each was closed when its task finished (a closed sqlite3
+    # connection raises ProgrammingError on any use).
+    import sqlite3 as _sqlite3
+
+    for c in conns:
+        with pytest.raises(_sqlite3.ProgrammingError):
+            c.execute("SELECT 1")
+
+
+def test_broker_without_db_path_keeps_the_shared_conn_fallback(
+    conn_and_client, repo, monkeypatch
+):
+    """Omitting `db_path` must preserve the pre-WP4.6 behavior for direct-conn
+    callers: no per-task connection is ever opened."""
+    conn, client = conn_and_client
+    r, base = repo
+
+    def forbidden_open(db_path):  # pragma: no cover - the assertion IS the call
+        raise AssertionError("_open_task_conn must not be called without db_path")
+
+    monkeypatch.setattr(broker, "_open_task_conn", forbidden_open)
+
+    task = broker.Task(
+        task_id="fallback-edit-helper",
+        targets=[("mod_a.py", "helper")],
+        mutator=mutators.edit_function_body,
+        mutator_kwargs={"path": "mod_a.py", "symbol": "helper", "new_body": "return x + y + 2"},
+        base_commit=base,
+    )
+    results = broker.run(conn, r, [task], client, n_agents=1)
+    assert results["fallback-edit-helper"].status == "done"

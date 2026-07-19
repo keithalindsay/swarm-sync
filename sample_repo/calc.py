@@ -2,14 +2,14 @@
 
 Built in Unit U13 as the fixture repo swarm-sync's agents edit concurrently in the
 demo (DESIGN.md §7). Four independent top-level functions, none of which call each
-other -- `add`/`sub` (or `mul`/`div`) is what money-shot #1 targets: two agents
+other -- `add`/`sub` (or `mul`/`div`) is what test case #1 targets: two agents
 editing two different functions in the SAME file at the same time, so symbol-mode
 leasing has something real to prove disjoint on.
 
 `add` also ends up as sample_repo's highest-fan-in symbol once `formats.py`,
 `api.py`, and their own test suites call it across a module boundary -- that
 makes it a frozen-contract candidate (blast_radius >= FREEZE_THRESHOLD=3,
-DESIGN §3 step 5), which is what money-shot #3 (U15) changes under an
+DESIGN §3 step 5), which is what test case #3 (U15) changes under an
 exclusive lease.
 """
 from __future__ import annotations

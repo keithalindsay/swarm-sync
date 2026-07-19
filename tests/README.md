@@ -15,4 +15,4 @@ Per-unit tests. Each BUILD_PLAN unit ships with the test that proves its "done w
 - test_reaper.py       (U11) stale lease reaped after TTL; parcel reacquirable
 - test_broker.py       (U12) co-schedulable tasks dispatched concurrently
 - test_sample_repo.py  (U13) sample_repo pytest suite is green
-- test_demo.py         (U14/U15) demo money-shot assertions all PASS
+- test_demo.py         (U14/U15) demo test case assertions all PASS

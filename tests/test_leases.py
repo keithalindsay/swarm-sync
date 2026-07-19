@@ -13,7 +13,7 @@ import time
 import pytest
 
 from swarmsync.blackboard import db
-from swarmsync.server import leases
+from swarmsync.blackboard import leases
 
 
 @pytest.fixture()
@@ -490,6 +490,92 @@ def test_hook_leasing_an_unindexed_file_does_not_brick_the_broker(conn, tmp_path
     assert broker.load_scheduling_graph(conn, repo) is not None, "a new class bricked dispatch"
 
 
+# --- C8 (P2): same-agent same-mode reacquire is idempotent, never a self-deny ------
+
+
+def test_same_agent_write_reacquire_is_granted_not_self_denied(conn):
+    """Claude Code batches parallel Edit calls from ONE agent; two prechecks both
+    see no lease and both POST /lease. The second acquire from the SAME agent in the
+    SAME mode must be GRANTED (the agent already holds the parcel), never denied --
+    otherwise the agent is blocked from a file it just locked, with itself named as
+    the blocker. Pre-fix (CAS matches ANY active write lease with no same-agent
+    exemption) the second acquire is DENIED and this fails."""
+    parcel_id = _make_parcel(conn)
+
+    r1 = leases.acquire(conn, parcel_id, "agent-A", mode="write")
+    r2 = leases.acquire(conn, parcel_id, "agent-A", mode="write")
+
+    assert r1.granted is True
+    assert r2.granted is True, "same-agent same-mode reacquire must not self-deny"
+    assert r2.lease_id is not None
+
+
+def test_same_agent_reacquire_still_blocks_a_different_agent(conn):
+    """The same-agent exemption must NOT weaken real mutual exclusion: while agent-A
+    holds the write lease (even after reacquiring it), a DIFFERENT agent must still be
+    denied, and the two different agents must never both hold a live write lease."""
+    parcel_id = _make_parcel(conn)
+
+    assert leases.acquire(conn, parcel_id, "agent-A", mode="write").granted is True
+    assert leases.acquire(conn, parcel_id, "agent-A", mode="write").granted is True
+
+    rb = leases.acquire(conn, parcel_id, "agent-B", mode="write")
+    assert rb.granted is False, "a different agent must still be denied"
+
+    live = conn.execute(
+        "SELECT DISTINCT agent_id FROM leases "
+        "WHERE parcel_id = ? AND status = 'active' AND ttl_expires_at > ? "
+        "AND mode IN ('write', 'exclusive')",
+        (parcel_id, time.time()),
+    ).fetchall()
+    assert [r["agent_id"] for r in live] == ["agent-A"], (
+        "exactly one agent may hold a live write lease"
+    )
+
+
+def test_same_agent_different_mode_reacquire_still_conflicts(conn):
+    """The idempotency is scoped to the SAME (parcel, agent, mode). A same-agent
+    request in a CONFLICTING mode (read while it holds write) is still denied, so the
+    exemption cannot be abused to smuggle in an incompatible lease."""
+    parcel_id = _make_parcel(conn)
+    assert leases.acquire(conn, parcel_id, "agent-A", mode="write").granted is True
+    assert leases.acquire(conn, parcel_id, "agent-A", mode="read").granted is False
+
+
+def test_barrier_gated_same_agent_batched_prechecks_all_grant(conn):
+    """N threads race a write-acquire on the SAME parcel as the SAME agent behind a
+    barrier -- the batched-parallel-Edit pattern the lock must support. Every one must
+    be granted (no self-deny), and no OTHER agent may sneak a live write lease in."""
+    import threading
+
+    parcel_id = _make_parcel(conn)
+    n_threads = 16
+    barrier = threading.Barrier(n_threads)
+    results: list[object] = []
+    lock = threading.Lock()
+
+    def worker(_i: int) -> None:
+        barrier.wait()
+        r = leases.acquire(conn, parcel_id, "agent-solo", mode="write")
+        with lock:
+            results.append(r)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert all(r.granted for r in results), "same-agent batched acquires must all grant"
+
+    holders = conn.execute(
+        "SELECT DISTINCT agent_id FROM leases "
+        "WHERE parcel_id = ? AND status = 'active' AND ttl_expires_at > ?",
+        (parcel_id, time.time()),
+    ).fetchall()
+    assert [h["agent_id"] for h in holders] == ["agent-solo"]
+
+
 def test_build_graph_tolerates_a_symbol_on_disk_with_no_parcel_row(tmp_path):
     """The class-level fix, stated directly: the parcel map is only ever as fresh as
     the last POST /index (there is no incremental indexing), so a symbol on disk with
@@ -515,3 +601,298 @@ def test_build_graph_tolerates_a_symbol_on_disk_with_no_parcel_row(tmp_path):
     graph = build_graph(parcels, tmp_path)  # must not raise KeyError
     assert "m.py::known" in graph.signatures
     assert "m.py::added_since_index" not in graph.signatures  # no parcel -> no signature
+
+
+# --- WP2.S: a denied acquire surfaces WHO holds the parcel and WHEN it expires ----
+# U3/A6: pre-fix, LeaseResult.reason was a bare string and the holder's identity/ttl
+# were never returned, forcing the hook adapter into a second /leases round-trip.
+
+
+def test_denied_write_names_the_conflicting_holder_and_ttl(conn):
+    """A DIFFERENT agent's denied write must name the current write holder and carry
+    that lease's ttl_expires_at as STRUCTURED fields (not just prose), so the caller
+    learns who blocks and when it frees without a second round-trip. Mutating out the
+    holder-population line drops these back to None and this fails."""
+    parcel_id = _make_parcel(conn)
+
+    r1 = leases.acquire(conn, parcel_id, "agent-holder", mode="write", ttl=30.0)
+    assert r1.granted
+    held = conn.execute(
+        "SELECT ttl_expires_at FROM leases WHERE id = ?", (r1.lease_id,)
+    ).fetchone()
+
+    r2 = leases.acquire(conn, parcel_id, "agent-other", mode="write")
+    assert r2.granted is False
+    assert r2.holder == "agent-holder"
+    assert r2.holder_ttl_expires_at == pytest.approx(held["ttl_expires_at"])
+    assert "agent-holder" in r2.reason  # human string enriched too
+
+
+def test_denied_read_against_write_holder_names_that_holder(conn):
+    """An incoming READ denied by a write holder still identifies that holder."""
+    parcel_id = _make_parcel(conn)
+    leases.acquire(conn, parcel_id, "agent-w", mode="write")
+    r = leases.acquire(conn, parcel_id, "agent-r", mode="read")
+    assert r.granted is False
+    assert r.holder == "agent-w"
+    assert r.holder_ttl_expires_at is not None
+
+
+def test_granted_acquire_leaves_holder_fields_none(conn):
+    """The granted path must be unchanged: no holder, no holder ttl."""
+    parcel_id = _make_parcel(conn)
+    r = leases.acquire(conn, parcel_id, "agent-1", mode="write")
+    assert r.granted is True
+    assert r.holder is None
+    assert r.holder_ttl_expires_at is None
+
+
+def test_same_agent_idempotent_reacquire_is_granted_with_no_holder(conn):
+    """Phase-1 WP1.5: a same-(parcel, agent, mode) re-acquire is GRANTED, so it is
+    NEVER a deny and must not populate holder fields (it would otherwise name the
+    agent as blocking itself)."""
+    parcel_id = _make_parcel(conn)
+    assert leases.acquire(conn, parcel_id, "agent-A", mode="write").granted is True
+    r2 = leases.acquire(conn, parcel_id, "agent-A", mode="write")
+    assert r2.granted is True
+    assert r2.holder is None
+    assert r2.holder_ttl_expires_at is None
+
+
+def test_denied_write_prefers_write_holder_over_blocking_readers(conn):
+    """Tie-break: multiple readers hold the parcel AND a write/exclusive holder also
+    does; the denied incoming write must name the WRITE/exclusive holder (the exclusive
+    owner whose release frees the parcel), not one of the readers."""
+    parcel_id = _make_parcel(conn)
+    # A live write holder and a live reader cannot BOTH be produced via acquire() on one
+    # parcel (the write would be denied), so seed the mixed set directly to exercise the
+    # ORDER BY tie-break: one active reader + one active write holder on the same parcel.
+    now = time.time()
+    conn.execute(
+        "INSERT INTO leases (parcel_id, agent_id, mode, acquired_at, ttl_expires_at, "
+        "heartbeat_at, status) VALUES (?, ?, 'read', ?, ?, ?, 'active')",
+        (parcel_id, "agent-reader", now, now + 5.0, now),
+    )
+    conn.execute(
+        "INSERT INTO leases (parcel_id, agent_id, mode, acquired_at, ttl_expires_at, "
+        "heartbeat_at, status) VALUES (?, ?, 'write', ?, ?, ?, 'active')",
+        (parcel_id, "agent-writer", now, now + 60.0, now),
+    )
+    r = leases.acquire(conn, parcel_id, "agent-new", mode="write")
+    assert r.granted is False
+    assert r.holder == "agent-writer"  # write holder wins the tie-break over the reader
+
+
+def test_denied_write_among_only_readers_picks_soonest_to_expire(conn):
+    """Tie-break fallback: when only readers block an incoming write, name the reader
+    that frees the parcel SOONEST (smallest ttl_expires_at), i.e. the earliest retry."""
+    parcel_id = _make_parcel(conn)
+    now = time.time()
+    conn.execute(
+        "INSERT INTO leases (parcel_id, agent_id, mode, acquired_at, ttl_expires_at, "
+        "heartbeat_at, status) VALUES (?, ?, 'read', ?, ?, ?, 'active')",
+        (parcel_id, "agent-late", now, now + 100.0, now),
+    )
+    conn.execute(
+        "INSERT INTO leases (parcel_id, agent_id, mode, acquired_at, ttl_expires_at, "
+        "heartbeat_at, status) VALUES (?, ?, 'read', ?, ?, ?, 'active')",
+        (parcel_id, "agent-soon", now, now + 5.0, now),
+    )
+    r = leases.acquire(conn, parcel_id, "agent-new", mode="write")
+    assert r.granted is False
+    assert r.holder == "agent-soon"
+    assert r.holder_ttl_expires_at == pytest.approx(now + 5.0)
+
+
+# --- WP3.3 A1 (S1/P2): per-agent active-lease cap bounds the acquire surface --------
+
+
+def test_acquire_denied_at_per_agent_lease_cap(conn, monkeypatch):
+    """`POST /lease` with `ensure_parcel=True` let any client mint UNLIMITED parcels
+    rows + acquirable leases (repro: 500/500 distinct ids granted pre-fix). At the
+    cap, the acquire must be DENIED with a reason naming both the cap and the env
+    knob -- and, because no single holder explains a quota denial, the holder fields
+    must stay None. The denied path must also not have minted the parcel row."""
+    monkeypatch.setenv("SWARMSYNC_MAX_LEASES_PER_AGENT", "5")
+
+    for i in range(5):
+        r = leases.acquire(
+            conn, f"f{i}.py::<module>", "agent-A", mode="write", ensure_parcel=True
+        )
+        assert r.granted is True
+
+    r6 = leases.acquire(
+        conn, "f5.py::<module>", "agent-A", mode="write", ensure_parcel=True
+    )
+    assert r6.granted is False
+    assert "5" in r6.reason and "SWARMSYNC_MAX_LEASES_PER_AGENT" in r6.reason
+    assert r6.holder is None
+    assert r6.holder_ttl_expires_at is None
+    # the quota deny happens BEFORE _ensure_parcel: no parcel row was minted for it
+    assert conn.execute(
+        "SELECT 1 FROM parcels WHERE id = 'f5.py::<module>'"
+    ).fetchone() is None
+
+
+def test_lease_cap_is_per_agent_not_global(conn, monkeypatch):
+    """The cap bounds each agent id separately: agent-A at its cap must not block
+    agent-B's first acquire (it is a per-client DoS bound, not a global brake)."""
+    monkeypatch.setenv("SWARMSYNC_MAX_LEASES_PER_AGENT", "2")
+    assert leases.acquire(conn, "a.py::<module>", "agent-A", mode="write", ensure_parcel=True).granted
+    assert leases.acquire(conn, "b.py::<module>", "agent-A", mode="write", ensure_parcel=True).granted
+    assert not leases.acquire(conn, "c.py::<module>", "agent-A", mode="write", ensure_parcel=True).granted
+    assert leases.acquire(conn, "d.py::<module>", "agent-B", mode="write", ensure_parcel=True).granted
+
+
+def test_lease_cap_does_not_block_idempotent_reacquire_or_count_dead_leases(conn, monkeypatch):
+    """Renewing a lease you already hold adds no rows, so an agent AT the cap must
+    still get its same-(parcel, mode) re-acquire granted (refresh path runs before
+    the quota check). Released leases stop counting, freeing quota."""
+    monkeypatch.setenv("SWARMSYNC_MAX_LEASES_PER_AGENT", "2")
+    r1 = leases.acquire(conn, "a.py::<module>", "agent-A", mode="write", ensure_parcel=True)
+    r2 = leases.acquire(conn, "b.py::<module>", "agent-A", mode="write", ensure_parcel=True)
+    assert r1.granted and r2.granted
+
+    # at cap: re-acquire of an already-held parcel still granted, with the SAME id
+    again = leases.acquire(conn, "a.py::<module>", "agent-A", mode="write", ensure_parcel=True)
+    assert again.granted is True
+    assert again.lease_id == r1.lease_id
+
+    # a NEW parcel is denied at cap; releasing one frees the slot
+    assert not leases.acquire(conn, "c.py::<module>", "agent-A", mode="write", ensure_parcel=True).granted
+    assert leases.release(conn, r2.lease_id, "agent-A") is True
+    assert leases.acquire(conn, "c.py::<module>", "agent-A", mode="write", ensure_parcel=True).granted
+
+
+# --- WP3.3 A2 (S1/P2): ensure_parcel validates the parcel-id shape ------------------
+
+
+@pytest.mark.parametrize(
+    "bad_id",
+    [
+        "",
+        "x" * 513,
+        "evil\x00null.py::<module>",
+        "evil\nnewline.py::<module>",
+        "evil\rcarriage.py::<module>",
+    ],
+    ids=["empty", "overlong", "nul", "newline", "carriage-return"],
+)
+def test_ensure_parcel_rejects_malformed_ids_without_creating_a_row(conn, bad_id):
+    """The auto-create path must not mint a parcels row (nor a lease) for an id that
+    is empty, absurdly long, or carries NUL/newline (log forging, C-truncation).
+    Pre-fix all of these were granted and created rows."""
+    r = leases.acquire(conn, bad_id, "agent-A", mode="write", ensure_parcel=True)
+    assert r.granted is False
+    assert "parcel_id" in r.reason
+    assert conn.execute("SELECT COUNT(*) FROM parcels").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM leases").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    "good_id",
+    [
+        "package.json::<module>",
+        "src/deep/nested/component.test.tsx::<module>",
+        "path with spaces/file.py::<module>",
+        "m.py::MyClass.method",
+        "x" * 500,  # long but under the cap
+    ],
+    ids=["non-py", "nested-path", "spaces", "qualified-symbol", "long-but-legal"],
+)
+def test_ensure_parcel_still_accepts_legitimate_ids(conn, good_id):
+    """The validation bounds abuse only: every shape the indexer/hook legitimately
+    produces (relative paths, `::<module>` interstitials, qualified symbols) passes."""
+    r = leases.acquire(conn, good_id, "agent-A", mode="write", ensure_parcel=True)
+    assert r.granted is True, f"legitimate id {good_id!r} was rejected: {r.reason}"
+
+
+# --- WP3.3 C1: re-acquire is LITERALLY idempotent (refresh, not duplicate insert) ---
+
+
+def test_reacquire_returns_the_same_lease_id_and_leaves_one_row(conn):
+    """Pre-fix, WP1.5's CAS self-exemption made each same-(parcel, agent, mode)
+    re-acquire GRANT by inserting a fresh duplicate row (repro: 3 acquires -> ids
+    [1, 2, 3], 3 active rows). A caller tracking one lease_id then couldn't cleanly
+    free the parcel, and the un-renewed duplicates expired into spurious `reaped`
+    events. Post-fix: 3 acquires -> ONE row, one id, returned every time."""
+    parcel_id = _make_parcel(conn)
+    r1 = leases.acquire(conn, parcel_id, "agent-A", mode="write")
+    r2 = leases.acquire(conn, parcel_id, "agent-A", mode="write")
+    r3 = leases.acquire(conn, parcel_id, "agent-A", mode="write")
+    assert r1.granted and r2.granted and r3.granted
+    assert r1.lease_id == r2.lease_id == r3.lease_id
+
+    rows = conn.execute(
+        "SELECT id FROM leases WHERE parcel_id = ? AND status = 'active'", (parcel_id,)
+    ).fetchall()
+    assert len(rows) == 1, "re-acquire must refresh, not duplicate"
+    assert rows[0]["id"] == r1.lease_id
+
+    # releasing the ONE tracked id must actually free the parcel for another agent
+    assert leases.release(conn, r1.lease_id, "agent-A") is True
+    assert leases.acquire(conn, parcel_id, "agent-B", mode="write").granted is True
+
+
+def test_reacquire_refreshes_the_ttl_like_a_heartbeat(conn):
+    """The refresh path must extend the existing lease's ttl_expires_at (same
+    SQLite-clock predicate as heartbeat), so a re-acquiring agent is renewed, not
+    left to lapse on the original acquire's clock."""
+    parcel_id = _make_parcel(conn)
+    r1 = leases.acquire(conn, parcel_id, "agent-A", mode="write", ttl=5.0)
+    before = conn.execute(
+        "SELECT ttl_expires_at FROM leases WHERE id = ?", (r1.lease_id,)
+    ).fetchone()["ttl_expires_at"]
+
+    r2 = leases.acquire(conn, parcel_id, "agent-A", mode="write", ttl=60.0)
+    assert r2.lease_id == r1.lease_id
+    after = conn.execute(
+        "SELECT ttl_expires_at FROM leases WHERE id = ?", (r1.lease_id,)
+    ).fetchone()["ttl_expires_at"]
+    assert after > before
+
+
+def test_reacquire_of_an_expired_own_lease_inserts_fresh_not_refreshes(conn):
+    """The refresh predicate carries the same liveness clause as heartbeat: an
+    agent's own EXPIRED lease must not be revived by a re-acquire -- the CAS inserts
+    a fresh row instead (lazy expiry, same as any other acquire over a dead lease)."""
+    parcel_id = _make_parcel(conn)
+    r1 = leases.acquire(conn, parcel_id, "agent-A", mode="write", ttl=-1.0)
+    assert r1.granted
+
+    r2 = leases.acquire(conn, parcel_id, "agent-A", mode="write", ttl=30.0)
+    assert r2.granted is True
+    assert r2.lease_id != r1.lease_id, "an expired lease must not be refreshed back to life"
+
+
+# --- WP3.3 C2: a cross-mode self-conflict deny must not tell the agent to wait for
+#     itself --------------------------------------------------------------------------
+
+
+def test_self_cross_mode_deny_says_own_lease_not_third_party_holder(conn):
+    """agent-A holds 'write' and requests 'exclusive': the deny is correct (the modes
+    conflict) but pre-fix the reason read "held by 'agent-A'" -- phrasing the agent's
+    own lease as a third party it should wait on, which never resolves. The reason
+    must say the conflict is the requester's OWN lease; the structured holder fields
+    stay truthful (they do name agent-A)."""
+    parcel_id = _make_parcel(conn)
+    assert leases.acquire(conn, parcel_id, "agent-A", mode="write").granted is True
+
+    r = leases.acquire(conn, parcel_id, "agent-A", mode="exclusive")
+    assert r.granted is False
+    assert r.holder == "agent-A"  # structured fields: truthful
+    assert r.holder_ttl_expires_at is not None
+    assert "your own" in r.reason
+    assert "'write'" in r.reason and "'exclusive'" in r.reason
+    assert "held by" not in r.reason
+
+
+def test_other_agent_deny_reason_is_unchanged_by_the_self_wording(conn):
+    """A genuinely third-party deny keeps the established 'held by' wording."""
+    parcel_id = _make_parcel(conn)
+    assert leases.acquire(conn, parcel_id, "agent-A", mode="write").granted is True
+    r = leases.acquire(conn, parcel_id, "agent-B", mode="write")
+    assert r.granted is False
+    assert r.holder == "agent-A"
+    assert "held by 'agent-A'" in r.reason
+    assert "your own" not in r.reason

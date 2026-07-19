@@ -2,7 +2,7 @@
 
 Built in Unit U13. Depends on `calc.add`/`calc.mul`/`calc.div`, so this module is
 part of `calc.add`'s cross-module fan-in (DESIGN §3 step 5) and a natural
-dependent for money-shot #3: if `calc.add`'s signature ever changes,
+dependent for test case #3: if `calc.add`'s signature ever changes,
 `total_with_tax` below is the call site that needs re-planning.
 """
 from __future__ import annotations

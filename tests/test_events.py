@@ -13,7 +13,7 @@ import time
 import pytest
 
 from swarmsync.blackboard import db
-from swarmsync.server import events, leases
+from swarmsync.blackboard import events, leases
 
 
 @pytest.fixture()
@@ -163,6 +163,48 @@ def test_tail_returns_event_models_with_expected_fields(conn):
 # --- pheromone: drop is an upsert keyed on (parcel_id, agent_id, kind) ------------
 
 
+# --- WP4.5 (prep C17): tail_newest -- the newest n, still ascending ----------------
+
+
+def test_tail_newest_returns_newest_n_in_ascending_order(conn):
+    for i in range(5):
+        events.emit(conn, "planned", f"agent-{i}", ts=float(i))
+    everything = events.tail(conn)
+    assert len(everything) == 5
+
+    newest = events.tail_newest(conn, 2)
+    assert [e.seq for e in newest] == [e.seq for e in everything[-2:]]
+    assert [e.seq for e in newest] == sorted(e.seq for e in newest)
+    assert [e.agent_id for e in newest] == ["agent-3", "agent-4"]
+
+
+def test_tail_newest_more_than_available_returns_all(conn):
+    events.emit(conn, "planned", "agent-1")
+    events.emit(conn, "done", "agent-1")
+    newest = events.tail_newest(conn, 100)
+    assert [e.seq for e in newest] == [e.seq for e in events.tail(conn)]
+
+
+def test_tail_newest_empty_log_returns_empty(conn):
+    assert events.tail_newest(conn, 10) == []
+
+
+def test_tail_newest_rejects_nonpositive_n(conn):
+    with pytest.raises(ValueError):
+        events.tail_newest(conn, 0)
+    with pytest.raises(ValueError):
+        events.tail_newest(conn, -3)
+
+
+def test_tail_newest_serves_registry_external_marker_rows(conn):
+    """Same decoding as `tail`: an `events_compacted` maintenance row (outside
+    the frozen EventType registry) is served, not dropped or 500'd."""
+    events.emit(conn, "heartbeat", "a1", ts=time.time() - 8000)
+    assert events.compact_events(conn) == 1
+    newest = events.tail_newest(conn, 10)
+    assert [e.type for e in newest] == [events.EVENTS_COMPACTED]
+
+
 def test_drop_pheromone_creates_row(conn):
     parcel_id = _make_parcel(conn)
     ph = events.drop_pheromone(conn, parcel_id, "agent-1", "planned", 1.0)
@@ -258,6 +300,98 @@ def test_decay_pheromone_clock_skew_guard_does_not_grow_strength(conn):
     assert row["strength"] == pytest.approx(0.5, abs=1e-9)
 
 
+# --- C15 (WP4.5): decay must be one atomic UPDATE, no read-modify-write -----------
+# The old shape SELECTed strengths, computed decay in Python, and executemany-
+# UPDATEd by PK -- a drop_pheromone landing between the read and the write (the
+# reaper decays every 1s on its own connection) was overwritten with a stale
+# decayed value. A true in-process race is not deterministically forceable here,
+# so the fix gets (a) a SEMANTIC test -- decay derives from the CURRENT committed
+# strength at execution time, i.e. a re-drop is never resurrected stale -- and
+# (b) a code-SHAPE test asserting the single-UPDATE implementation directly.
+
+
+def test_decay_pheromone_decays_from_the_current_committed_strength(conn):
+    parcel_id = _make_parcel(conn)
+    events.drop_pheromone(conn, parcel_id, "agent-1", "touched", 1.0, ts=0.0)
+    # A later drop REPLACES the row (strength 0.8 at t=10) -- the C15 stand-in
+    # for "a drop landed before the decay executed". The decay at t=20 must
+    # start from 0.8/updated_at=10, never from any earlier snapshot of the row.
+    events.drop_pheromone(conn, parcel_id, "agent-1", "touched", 0.8, ts=10.0)
+
+    events.decay_pheromone(conn, half_life=10.0, ts=20.0)
+
+    row = conn.execute("SELECT * FROM pheromone").fetchone()
+    assert row["strength"] == pytest.approx(0.4, abs=1e-9)  # 0.8 * 0.5 ** (10/10)
+    assert row["updated_at"] == 20.0
+
+
+def test_decay_pheromone_dropped_row_decays_from_its_committed_value(conn):
+    # The prompt's semantic anchor: dropped at 1.0, decayed with a now far in
+    # the future -> decays from the committed 1.0 (to ~0), never goes negative.
+    parcel_id = _make_parcel(conn)
+    events.drop_pheromone(conn, parcel_id, "agent-1", "planned", 1.0, ts=0.0)
+
+    touched = events.decay_pheromone(conn, half_life=5.0, ts=1_000_000.0)
+
+    assert touched == 1
+    row = conn.execute("SELECT * FROM pheromone").fetchone()
+    assert 0.0 <= row["strength"] == pytest.approx(0.0, abs=1e-9)
+    assert row["updated_at"] == 1_000_000.0
+
+
+class _TracingConn:
+    """Wraps a real connection, recording every SQL statement text. Duck-typed:
+    decay_pheromone only needs `execute`/`executemany`."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.statements: list[str] = []
+
+    def execute(self, sql, *args):
+        self.statements.append(sql)
+        return self._inner.execute(sql, *args)
+
+    def executemany(self, sql, *args):
+        self.statements.append(sql)
+        return self._inner.executemany(sql, *args)
+
+
+def test_decay_pheromone_works_through_the_python_pow_fallback(conn):
+    """C15: on SQLite builds without SQLITE_ENABLE_MATH_FUNCTIONS,
+    `db._configure` registers `db._pow_fallback` as `pow`. This box HAS the
+    built-in, so force the fallback onto the connection (create_function
+    overrides the built-in) and prove the decay statement still computes
+    identically through it."""
+    conn.create_function("pow", 2, db._pow_fallback, deterministic=True)
+    parcel_id = _make_parcel(conn)
+    events.drop_pheromone(conn, parcel_id, "agent-1", "touched", 1.0, ts=0.0)
+
+    assert events.decay_pheromone(conn, half_life=10.0, ts=10.0) == 1
+    row = conn.execute("SELECT * FROM pheromone").fetchone()
+    assert row["strength"] == pytest.approx(0.5, abs=1e-9)
+
+
+def test_decay_pheromone_is_a_single_update_statement(conn):
+    """C15 code-shape guard: exactly ONE statement, an UPDATE, and no SELECT of
+    strengths anywhere -- reverting to read-modify-write fails here even though
+    the arithmetic (and every semantic test above) would still pass."""
+    parcel_id = _make_parcel(conn)
+    events.drop_pheromone(conn, parcel_id, "agent-1", "touched", 1.0, ts=0.0)
+    events.drop_pheromone(conn, parcel_id, "agent-2", "planned", 0.7, ts=5.0)
+
+    tracer = _TracingConn(conn)
+    touched = events.decay_pheromone(tracer, half_life=10.0, ts=10.0)
+
+    assert touched == 2
+    assert len(tracer.statements) == 1, (
+        f"decay must be one atomic statement, ran {len(tracer.statements)}: "
+        f"{tracer.statements}"
+    )
+    only = tracer.statements[0].strip().upper()
+    assert only.startswith("UPDATE PHEROMONE")
+    assert "SELECT" not in only  # no read-modify-write round trip
+
+
 # --- regression: leases.py now funnels through events.emit ------------------------
 
 
@@ -268,3 +402,143 @@ def test_leases_events_are_visible_via_tail(conn):
     tailed = events.tail(conn)
     assert [e.type for e in tailed] == ["lease_granted"]
     assert tailed[0].agent_id == "agent-1"
+
+
+# --- WP3.1 (finding S2): events retention/compaction ------------------------------
+#
+# Reproduced first: before `compact_events` existed, month-old heartbeat rows
+# survived any number of reaper passes (the table only ever grew -- nothing in the
+# codebase issued a DELETE against `events`). These tests pin the new contract.
+
+
+HOUR = 3600.0
+DAY = 86400.0
+
+
+def _emit_at(conn, type_, age, agent_id="agent-1", payload=None):
+    """Emit an event `age` seconds in the past; returns its seq."""
+    return events.emit(conn, type_, agent_id, payload, ts=time.time() - age)
+
+
+def _open_integration_for(conn, seq, age):
+    """Mirror integrator's projection row for an `integrate_started` seq."""
+    conn.execute(
+        "INSERT INTO open_integrations "
+        "(started_seq, repo, branch, into_branch, trunk_sha_before, ts) "
+        "VALUES (?, 'r', 'b', 'integration', 'deadbeef', ?)",
+        (seq, time.time() - age),
+    )
+
+
+def test_compact_events_prunes_only_old_heartbeats_in_short_window(conn):
+    old_hb = _emit_at(conn, "heartbeat", 2 * HOUR)
+    young_hb = _emit_at(conn, "heartbeat", 0.5 * HOUR)
+    old_but_audit = _emit_at(conn, "merged", 2 * HOUR)  # audit value: NOT pruned
+
+    pruned = events.compact_events(conn, heartbeat_max_age=HOUR, max_age=7 * DAY)
+
+    assert pruned == 1
+    remaining = {r["seq"] for r in conn.execute("SELECT seq FROM events").fetchall()}
+    assert old_hb not in remaining
+    assert young_hb in remaining
+    assert old_but_audit in remaining
+
+
+def test_compact_events_long_horizon_prunes_any_type(conn):
+    ancient_merged = _emit_at(conn, "merged", 8 * DAY)
+    ancient_orphan = _emit_at(conn, "integrate_orphaned", 8 * DAY)
+    week_young_merged = _emit_at(conn, "merged", 6 * DAY)
+
+    pruned = events.compact_events(conn, heartbeat_max_age=HOUR, max_age=7 * DAY)
+
+    assert pruned == 2
+    remaining = {r["seq"] for r in conn.execute("SELECT seq FROM events").fetchall()}
+    assert ancient_merged not in remaining
+    assert ancient_orphan not in remaining
+    assert week_young_merged in remaining  # younger than the horizon: audit history
+
+
+def test_compact_events_never_deletes_open_integration_start(conn):
+    """The recovery-relevant start survives unconditionally, however old.
+
+    (Recovery itself reads the `open_integrations` projection since WP3.2, so
+    compaction can't break it either way -- this guard additionally keeps the
+    audit row behind a still-open integrate.) Mutation target: dropping the
+    `seq NOT IN (SELECT started_seq FROM open_integrations)` guard fails this.
+    """
+    started = _emit_at(conn, "integrate_started", 30 * DAY)
+    _open_integration_for(conn, started, 30 * DAY)
+    doomed = _emit_at(conn, "heartbeat", 30 * DAY)
+
+    pruned = events.compact_events(conn, heartbeat_max_age=HOUR, max_age=7 * DAY)
+
+    assert pruned == 1  # the heartbeat only
+    remaining = {r["seq"] for r in conn.execute("SELECT seq FROM events").fetchall()}
+    assert started in remaining
+    assert doomed not in remaining
+
+
+def test_compact_events_emits_one_marker_with_count_and_seq_range(conn):
+    s1 = _emit_at(conn, "heartbeat", 3 * HOUR)
+    s2 = _emit_at(conn, "heartbeat", 2 * HOUR)
+    keep = _emit_at(conn, "heartbeat", 0.1 * HOUR)
+
+    pruned = events.compact_events(conn, heartbeat_max_age=HOUR, max_age=7 * DAY)
+    assert pruned == 2
+
+    markers = conn.execute(
+        "SELECT * FROM events WHERE type = ?", (events.EVENTS_COMPACTED,)
+    ).fetchall()
+    assert len(markers) == 1
+    payload = json.loads(markers[0]["payload"])
+    assert payload["pruned"] == 2
+    assert payload["seq_min"] == min(s1, s2)
+    assert payload["seq_max"] == max(s1, s2)
+    assert keep > 0  # (still present; range covers only the pruned rows)
+
+
+def test_compact_events_noop_pass_emits_nothing(conn):
+    """The compactor must not become its own growth source: a pass that prunes
+    nothing (including one right after a successful pass) inserts no marker."""
+    _emit_at(conn, "heartbeat", 2 * HOUR)
+    assert events.compact_events(conn, heartbeat_max_age=HOUR, max_age=7 * DAY) == 1
+    before = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+
+    for _ in range(3):
+        assert events.compact_events(conn, heartbeat_max_age=HOUR, max_age=7 * DAY) == 0
+
+    after = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+    assert after == before  # repeated no-op passes added zero rows
+
+
+def test_compact_events_windows_read_from_env(conn, monkeypatch):
+    monkeypatch.setenv(events.HEARTBEAT_MAX_AGE_ENV, str(10 * 60.0))  # 10 minutes
+    monkeypatch.setenv(events.EVENT_MAX_AGE_ENV, str(DAY))
+
+    hb = _emit_at(conn, "heartbeat", 30 * 60.0)  # 30 min: past the 10-min env window
+    old_planned = _emit_at(conn, "planned", 2 * DAY)  # past the 1-day env horizon
+
+    assert events.compact_events(conn) == 2
+    remaining = {r["seq"] for r in conn.execute("SELECT seq FROM events").fetchall()}
+    assert hb not in remaining
+    assert old_planned not in remaining
+
+
+def test_compact_events_garbage_env_falls_back_to_defaults(conn, monkeypatch):
+    monkeypatch.setenv(events.HEARTBEAT_MAX_AGE_ENV, "not-a-number")
+    monkeypatch.setenv(events.EVENT_MAX_AGE_ENV, "-5")
+
+    young_hb = _emit_at(conn, "heartbeat", 0.5 * HOUR)  # under the 1h default
+    assert events.compact_events(conn) == 0
+    assert young_hb in {r["seq"] for r in conn.execute("SELECT seq FROM events").fetchall()}
+
+
+def test_tail_returns_compaction_marker_rows(conn):
+    """`events_compacted` is outside the frozen EventType registry (models.py is
+    owned by a parallel WP); `tail` must still surface it, not crash or drop it."""
+    _emit_at(conn, "heartbeat", 2 * HOUR)
+    events.compact_events(conn, heartbeat_max_age=HOUR, max_age=7 * DAY)
+
+    tailed = events.tail(conn)
+    assert [e.type for e in tailed] == [events.EVENTS_COMPACTED]
+    assert json.loads(tailed[0].payload)["pruned"] == 1

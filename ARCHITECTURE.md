@@ -62,7 +62,7 @@ database serializes them: the first insert succeeds, the second's `only if none 
 and inserts nothing. One winner, one loser (`rowcount == 1` vs `0`), no gap. The loser is told
 "denied — that file's taken" and picks other work or waits. The safety comes from leaning on the
 database's own atomicity guarantee instead of hand-rolling a lock. See
-[`server/leases.py`](swarmsync/server/leases.py) — the `acquire()` docstring and SQL are the
+[`blackboard/leases.py`](swarmsync/blackboard/leases.py) — the `acquire()` docstring and SQL are the
 canonical reference.
 
 **Read vs. write.** Many agents can hold a *read* lease on one file at once (reading doesn't
@@ -104,7 +104,7 @@ End to end, what happens when an agent changes some code (the broker-driven path
    lets others avoid duplicating the work. → `POST /intent`
 4. **Acquire the lease (CAS).** The agent requests a write lease on its target file. Granted → it
    owns the file. Denied → it backs off or picks another task. → `POST /lease`,
-   `server/leases.py::acquire`
+   `blackboard/leases.py::acquire`
 5. **Edit in isolation.** The agent works in **its own git worktree** — a private checkout — so two
    agents can't even physically touch the same file on disk. It heartbeats every few seconds to keep
    the lease alive. → `worktree/git_ops.py`, `agent/runner.py`
@@ -131,10 +131,11 @@ branch.
 | ↳ write to blackboard | [`classifier/store.py`](swarmsync/classifier/store.py) | `run_index` — populates `parcels` + `contracts` (this is `POST /index`). |
 | **Blackboard** (shared memory) | [`blackboard/db.py`](swarmsync/blackboard/db.py), [`schema.sql`](swarmsync/blackboard/schema.sql) | The single SQLite-WAL database and its schema: `parcels`, `leases`, `contracts`, `pheromone`, `intents`, `events`. |
 | ↳ typed rows | [`blackboard/models.py`](swarmsync/blackboard/models.py) | Pydantic models every reader validates through (`Parcel`, `LeaseMode`, `LeaseResult`, …). |
-| **Lease** (the lock) | [`server/leases.py`](swarmsync/server/leases.py) | `acquire` (atomic CAS), `heartbeat`, `release`, `_ensure_parcel`. The mutual-exclusion primitive. |
-| **Pheromone trail / event log** | [`server/events.py`](swarmsync/server/events.py) | `emit` — the single write path into the append-only `events` table, which doubles as the audit log and the recovery source of truth. |
+| **Lease** (the lock) | [`blackboard/leases.py`](swarmsync/blackboard/leases.py) | `acquire` (atomic CAS), `heartbeat`, `release`, `_ensure_parcel`. The mutual-exclusion primitive. |
+| **Pheromone trail / event log** | [`blackboard/events.py`](swarmsync/blackboard/events.py) | `emit` — the single write path into the append-only `events` table: the audit/observability log. The SQLite tables are the state of record; crash recovery reads the `open_integrations` projection (WP3.2), not this log. |
 | **HTTP API** | [`server/app.py`](swarmsync/server/app.py) | FastAPI wiring every endpoint; `check_single_root` enforces the one-managed-root rule. |
-| ↳ launcher | [`server/serve.py`](swarmsync/server/serve.py) | `swarmsync-serve` — starts the blackboard server. |
+| ↳ launcher | [`server/serve.py`](swarmsync/server/serve.py) | `swarmsync-serve` — starts the blackboard server (the `swarm-sync` script is an alias of the same `main`; WP4.2). |
+| ↳ config | [`config.py`](swarmsync/config.py) | The one module that reads the environment: typed accessors for every `SWARMSYNC_*` knob (README has the full table). |
 | **Broker** (scheduler) | [`coordinator/broker.py`](swarmsync/coordinator/broker.py) | Matches tasks to parcels, spawns agents in file-disjoint waves, reassigns on reap (`resolve_task`, `_run_task_once`). |
 | **Integrator** (the gate) | [`coordinator/integrator.py`](swarmsync/coordinator/integrator.py) | Serial, pytest-gated merge with rollback-on-red, post-merge re-index, and orphan recovery (`reconcile_orphaned_integrations`). |
 | **Reaper** | [`coordinator/reaper.py`](swarmsync/coordinator/reaper.py) | Expires the leases of crashed agents past TTL and decays pheromone. |
@@ -142,7 +143,7 @@ branch.
 | **Agent** | [`agent/runner.py`](swarmsync/agent/runner.py), [`agent/client.py`](swarmsync/agent/client.py) | The full sync-protocol lifecycle in a worktree; `client.py` is the thin, swappable interface a real Claude Agent SDK worker drops into. |
 | ↳ demo stand-in | [`agent/mutators.py`](swarmsync/agent/mutators.py) | Deterministic scripted edits used in place of a live LLM so the demo/tests are reproducible. |
 | **Claude Code hooks** | [`hooks/adapter.py`](swarmsync/hooks/adapter.py), [`scripts/swarmsync-hook-guard`](scripts/swarmsync-hook-guard) | The transparent enforcement path: gates every `Edit`/`Write` a Claude subagent makes. The guard is a zero-overhead shim when coordination is off. |
-| **Demo** | [`demo/run_demo.py`](demo/run_demo.py) | Boots everything and runs the five "money shot" scenarios end to end. |
+| **Demo** | [`demo/run_demo.py`](demo/run_demo.py) | Boots everything and runs the five "test case" scenarios end to end. |
 
 ---
 
@@ -161,6 +162,30 @@ swarm-sync coordinates agents two ways, and a contributor must not confuse them:
   for `Edit`/`Write`-family tools, so a `Bash` write (`sed -i`, `cat >`) bypasses it entirely. The
   hook path is a cooperative protocol among well-behaved agents, not a sandbox.
 
+  One configuration constraint follows from how the hook keys its parcel ids: it resolves them
+  relative to the **git toplevel** of the edited file's repo, so on the hook path the server's
+  managed root (`swarmsync-serve --root`) must **be** that git toplevel. Serving a *subdirectory*
+  of a larger git repo as the managed root is a broker-path-only configuration today — the hook
+  would key ids off the toplevel and mint parcels the server doesn't recognize. (Teaching the hook
+  to discover the server's root at session start is the planned lift; see IMPROVEMENT_PLAN Phase 5.)
+
+### Hook coordination identity has a Claude Code version floor
+
+The hook derives each edit's lease identity from the payload (`hooks/adapter.py::_agent_id`): a
+subagent's PreToolUse/PostToolUse/SubagentStop payload carries a **unique `agent_id`**, and that is
+what lets swarm-sync tell the parallel subagents of one session apart and give each its own leases.
+All subagents of a session **share the parent `session_id`** — so `agent_id` is the *only* field that
+distinguishes them, which is why it takes precedence over `session_id`. A main-thread payload has no
+`agent_id` and correctly leases under its `session_id` (the whole session is one editor there).
+
+This is an **honest version dependency, not a bug**: per-subagent coordination requires a Claude Code
+version whose hook payloads include `agent_id`. On an older version whose payloads omit it, every
+subagent of a session falls back to the shared `session_id` and the fabric cannot distinguish them —
+they collapse to one holder and effectively coordinate at session granularity. A payload lacking
+*both* fields (malformed/unrecognized) does **not** collapse to a shared constant: the adapter mints a
+per-invocation-unique id and warns on stderr, so two different agents are never *silently* fused into
+one lease holder (fail-open in effect, never false-sharing).
+
 ---
 
 ## Good places to contribute (where the real problems are)
@@ -170,15 +195,15 @@ which makes them the best entry points for improving the project.
 
 - **Symbol-granularity leasing** — parked, not merely missing. The payoff and the full staged revival
   plan are in [`SYMBOL_MODE_DESIGN.md`](SYMBOL_MODE_DESIGN.md). The blocker: the lease conflict rule
-  in `server/leases.py::acquire` is a string match with no containment awareness. Teaching it that
+  in `blackboard/leases.py::acquire` is a string match with no containment awareness. Teaching it that
   `m.py::alpha` lives inside `m.py::<module>` is the crux.
 - **`exclusive` buys nothing over `write` today** — the CAS predicate treats the two identically
-  (`server/leases.py`). Reviving a true exclusive mode is Stage 1 of the symbol-mode plan and needs
+  (`blackboard/leases.py`). Reviving a true exclusive mode is Stage 1 of the symbol-mode plan and needs
   no symbol mode itself.
 - **Contract freeze is detection, not prevention** — the integrator *detects* a landed signature
   change and emits `contract_change` (`coordinator/integrator.py`), but the preventive half (an
   exclusive lock on a frozen symbol before it changes) is inert at file granularity. See DESIGN §5.3.
-- **The heartbeat clock knife-edge** — `server/leases.py::heartbeat` is the one predicate where a
+- **The heartbeat clock knife-edge** — `blackboard/leases.py::heartbeat` is the one predicate where a
   stale clock points the *unsafe* way (it could revive a dead lease). It's currently correct because
   it reads SQLite's own clock, but a deployment that shrinks the TTL toward request latency reopens
   it. Well-commented; worth hardening.
@@ -200,7 +225,7 @@ unless you set `SWARMSYNC_TOKEN`.
 
 ## Further reading
 
-- [`DESIGN.md`](DESIGN.md) — the full spec: schema, every endpoint, all five money-shot demos, the
+- [`DESIGN.md`](DESIGN.md) — the full spec: schema, every endpoint, all five test case demos, the
   complete failure-handling table, and the operational surface (env vars, launchers).
 - [`SYMBOL_MODE_DESIGN.md`](SYMBOL_MODE_DESIGN.md) — why per-symbol leasing is parked and how it
   would come back.
