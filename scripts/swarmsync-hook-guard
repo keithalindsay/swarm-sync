@@ -34,11 +34,44 @@ resolve_hook_bin() {
     return 1
 }
 
-MARKER_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
+# Read the hook event once so we can both inspect it (to locate the repo being
+# edited) and forward it unchanged to the adapter.
+INPUT=$(cat)
 
-if [ -n "$SWARMSYNC_ACTIVE" ] || [ -f "$MARKER_DIR/.swarmsync-active" ]; then
+# Is coordination active for THIS edit? Three signals, cheapest first:
+#   1. env SWARMSYNC_ACTIVE set, OR
+#   2. a .swarmsync-active marker at the session/project dir, OR
+#   3. a .swarmsync-active marker at or above the edited FILE's directory.
+# (3) is essential when the coordinated repo is a *subdirectory* of the session's
+# project dir: CLAUDE_PROJECT_DIR then points at the parent, the marker lives in
+# the sub-repo, and checking only (1)/(2) silently fails open with NO coordination.
+is_active() {
+    [ -n "$SWARMSYNC_ACTIVE" ] && return 0
+
+    marker_dir="${CLAUDE_PROJECT_DIR:-$PWD}"
+    [ -f "$marker_dir/.swarmsync-active" ] && return 0
+
+    # Locate the target path from the hook payload (file_path for Edit/Write/
+    # MultiEdit, notebook_path for NotebookEdit; cwd as a last resort).
+    target=$(printf '%s' "$INPUT" | sed -n 's/.*"file_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)
+    [ -n "$target" ] || target=$(printf '%s' "$INPUT" | sed -n 's/.*"notebook_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)
+    [ -n "$target" ] || target=$(printf '%s' "$INPUT" | sed -n 's/.*"cwd"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)
+
+    dir=$(dirname -- "$target" 2>/dev/null)
+    while [ -n "$dir" ] && [ "$dir" != "/" ] && [ "$dir" != "." ]; do
+        [ -f "$dir/.swarmsync-active" ] && return 0
+        dir=$(dirname -- "$dir")
+    done
+
+    return 1
+}
+
+if is_active; then
     if HOOK_BIN=$(resolve_hook_bin) && [ -x "$HOOK_BIN" ]; then
-        exec "$HOOK_BIN" "$@"
+        # Re-feed the event we consumed above; exit with the adapter's status so a
+        # DENY (non-zero) still blocks the tool call.
+        printf '%s' "$INPUT" | "$HOOK_BIN" "$@"
+        exit $?
     fi
 fi
 
