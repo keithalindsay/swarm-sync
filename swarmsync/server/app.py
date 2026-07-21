@@ -68,6 +68,7 @@ import dataclasses
 import hmac
 import json
 import os
+import sqlite3
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -618,7 +619,28 @@ def create_app(
         }
         if body.ttl is not None:
             kwargs["ttl"] = body.ttl
-        return leases_mod.acquire(conn, body.parcel_id, body.agent_id, **kwargs)
+
+        # DESIGN §4.2: a well-formed request must never yield a 5xx. On the default
+        # `ensure_parcel=False` path the store deliberately raises
+        # `sqlite3.IntegrityError` (FOREIGN KEY failed) when the id names a parcel
+        # with no `parcels` row -- an intentional store-level invariant (tested in
+        # test_leases.py/test_blackboard.py). Left unhandled it leaks to the caller
+        # as a bare 500 with a stack trace. Translate that "unknown parcel" case at
+        # the HTTP boundary into the same clean 404 the sibling `/parcel/update`
+        # endpoint already returns, so a caller sees a structured "no such parcel"
+        # instead of a server error. A parcel id can legitimately vanish between
+        # plan time and lease time (WP3.5 `parcel_retired`), so an in-flight agent
+        # re-leasing a retired id without `ensure_parcel` hits exactly this path --
+        # a normal coordination outcome, not a fault. Catching the store exception
+        # (rather than pre-checking existence) leaves `ensure_parcel=True`'s
+        # auto-create-and-grant path untouched and does not weaken the store-level
+        # FK invariant -- the fix is purely at the wire boundary.
+        try:
+            return leases_mod.acquire(conn, body.parcel_id, body.agent_id, **kwargs)
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(
+                status_code=404, detail=f"no parcel {body.parcel_id!r}"
+            ) from exc
 
     # --- POST /heartbeat ---------------------------------------------------------
 
