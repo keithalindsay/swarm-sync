@@ -42,12 +42,15 @@ touching the operator's global git config.
 """
 from __future__ import annotations
 
+import logging
 import re
 import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 # WP3.5: namespace for parked rejected-attempt branches. Everything under this
@@ -233,15 +236,32 @@ def remove_worktree(repo: Path | str, name: str, delete_branch: bool = True) -> 
     removed) still needs the `delete_branch` step below to run. With `check=True` the
     missing-worktree case raised and silently skipped the branch delete, so a leaked
     branch from a prior run was never actually pruned.
+
+    `check=False` alone leaked, though: under concurrent git (`index.lock` contention
+    at 16-way parallelism, reproduced in 2 of 5 runs) the remove fails, the directory
+    survives, and `git worktree prune` can never reclaim it -- prune only drops entries
+    whose directory is MISSING. In a long-lived server that is an unbounded disk leak.
+    So a failed remove falls back to the same rmtree-then-prune sequence
+    `_prune_stale_worktree` already uses.
     """
     _reject_unsafe_name(name, "worktree/branch name")
     repo = Path(repo)
     worktree_path = repo / ".worktrees" / name
-    _run(
+    removed = _run(
         ["git", "worktree", "remove", "--force", "--", str(worktree_path)],
         cwd=repo,
         check=False,
     )
+    if removed.returncode != 0 and worktree_path.exists():
+        logger.warning(
+            "git worktree remove failed for %s (exit %d): %s -- falling back to "
+            "rmtree + prune so the directory is not leaked",
+            worktree_path,
+            removed.returncode,
+            removed.stderr.strip(),
+        )
+        shutil.rmtree(worktree_path, ignore_errors=True)
+        _run(["git", "worktree", "prune"], cwd=repo, check=False)
     if delete_branch:
         _run(["git", "branch", "-D", "--end-of-options", name], cwd=repo, check=False)
 

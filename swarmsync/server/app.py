@@ -125,11 +125,13 @@ class ReleaseBody(BaseModel):
 
 class EventOut(Event):
     """`GET /events` response row. Identical to `blackboard.models.Event` except
-    `type` is widened to `str`: the log legitimately contains maintenance rows
-    (`events.EVENTS_COMPACTED`) whose type is outside the frozen EventType
-    registry (models.py is owned by a parallel work package -- see
-    `server.events.EVENTS_COMPACTED`), and FastAPI re-validates the response
-    against this model, so the Literal would 500 any page containing one."""
+    `type` is widened to `str`.
+
+    Not for `events_compacted` -- that IS in the EventType registry. The widening
+    is defensive: FastAPI re-validates the response against this model, so a row
+    written by a different build against the same file would 500 the whole page
+    rather than serving the rest. A tailer losing the log because one row is
+    unrecognized is worse than a tailer seeing a type it doesn't know."""
 
     type: str  # type: ignore[assignment]  # deliberate widening of the Literal
 
@@ -768,25 +770,59 @@ def create_app(
                 )
             return {"ok": False, "parcel_id": body.parcel_id, "reason": reason}
 
+        # The gate above produces the good error messages; THIS statement is the
+        # authoritative one. Re-asserting ownership inside the UPDATE's own WHERE
+        # makes check-and-write a single serialized statement, closing the window
+        # where a lease lapses between the two -- the same single-statement pattern
+        # `leases.acquire` and `leases.reap_once` already use. Without it a
+        # just-expired holder could still land a write after a new holder lawfully
+        # took the parcel, and since `_check_read_deps` compares plan-time snapshots
+        # against this exact content_hash, the innocent new holder is the one who
+        # gets bounced with `needs_rebase`.
         cur = conn.execute(
-            """
+            f"""
             UPDATE parcels
             SET content_hash = :content_hash,
                 state_summary = COALESCE(:state_summary, state_summary),
                 updated_at = :now
             WHERE id = :parcel_id
-            """,
+              AND EXISTS (
+                SELECT 1 FROM leases
+                WHERE parcel_id = :parcel_id
+                  AND agent_id = :agent_id
+                  AND mode IN ('write', 'exclusive')
+                  AND status = 'active'
+                  AND ttl_expires_at > {leases_mod._NOW_SQL}
+              )
+            """,  # noqa: S608 - _NOW_SQL is a module constant, never caller input
             {
                 "content_hash": body.content_hash,
                 "state_summary": body.state_summary,
                 "now": now,
                 "parcel_id": body.parcel_id,
+                "agent_id": body.agent_id,
             },
         )
         if cur.rowcount == 0:
-            raise HTTPException(
-                status_code=404, detail=f"no parcel {body.parcel_id!r}"
-            )
+            # The parcel existed at the top of this handler and ownership passed, so
+            # a miss here means the lease lapsed in between -- report it as the same
+            # not-the-holder outcome rather than a 404, which would wrongly tell the
+            # caller the parcel is gone. A genuine disappearance still 404s.
+            still_there = conn.execute(
+                "SELECT 1 FROM parcels WHERE id = ? LIMIT 1", (body.parcel_id,)
+            ).fetchone()
+            if still_there is None:
+                raise HTTPException(
+                    status_code=404, detail=f"no parcel {body.parcel_id!r}"
+                )
+            return {
+                "ok": False,
+                "parcel_id": body.parcel_id,
+                "reason": (
+                    f"{body.agent_id!r}'s write lease on {body.parcel_id!r} lapsed "
+                    "before the update could land"
+                ),
+            }
         # DESIGN §4.1 schema comment: pheromone.kind is planned|touched|done -- this
         # is literally the 'done' signal (DESIGN §4.3 step 6), so drop it here.
         events_mod.drop_pheromone(

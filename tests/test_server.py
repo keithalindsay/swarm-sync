@@ -819,9 +819,10 @@ def test_events_since_semantics_preserved_with_clamped_limit(client, fixture_rep
 
 
 def test_events_endpoint_serves_compaction_marker_rows(client):
-    """WP3.1 S2: the `events_compacted` marker is outside the frozen EventType
-    registry; GET /events must serve it (the widened EventOut response model),
-    not 500 on response validation."""
+    """GET /events must serve the `events_compacted` maintenance marker rather
+    than 500 on response validation. (The marker is a registered EventType; an
+    earlier docstring here claimed it sat outside the registry, which stopped
+    being true once models.py added it.)"""
     import time as time_mod
 
     from swarmsync.blackboard import db as db_mod
@@ -1037,3 +1038,86 @@ def test_events_tail_clamped_to_the_events_cap(client):
     assert client.get(
         "/events", params={"tail": MAX_EVENTS_LIMIT}
     ).status_code == 200
+
+
+def test_parcel_update_refuses_a_lease_that_lapses_after_the_ownership_gate(
+    client, fixture_repo
+):
+    """The ownership gate and the write used to be two separate statements, so a
+    lease could lapse in the gap and a just-expired holder still landed a write --
+    after a NEW holder had lawfully taken the parcel. `_check_read_deps` compares
+    plan-time snapshots against exactly this content_hash, so the victim is the
+    innocent new holder, bounced with a spurious `needs_rebase`.
+
+    The ownership predicate now lives inside the UPDATE's own WHERE, making
+    check-and-write one serialized statement. This drives the race directly:
+    expire the lease in the window between the gate and the write."""
+    from swarmsync.blackboard import db as db_mod
+    from swarmsync.server.app import get_conn
+
+    _index(client, fixture_repo)
+    parcel = "mod_a.py::helper"
+
+    granted = client.post(
+        "/lease",
+        json={"agent_id": "agent-slow", "parcel_id": parcel, "mode": "write",
+              "ttl": 60.0},
+    ).json()
+    assert granted["granted"] is True
+    lease_id = granted["lease_id"]
+
+    app = client.app
+    conn = db_mod.connect(app.state.db_path)
+    original_hash = conn.execute(
+        "SELECT content_hash FROM parcels WHERE id = ?", (parcel,)
+    ).fetchone()["content_hash"]
+
+    class _LapseAfterGate:
+        """Passes everything through, but the first time the handler's ownership
+        SELECT runs, expires the lease immediately after it returns."""
+
+        def __init__(self, real):
+            self._real = real
+            self._fired = False
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+        def execute(self, sql, *args, **kwargs):
+            is_gate = "FROM leases" in sql and "mode IN" in sql and "UPDATE" not in sql
+            cur = self._real.execute(sql, *args, **kwargs)
+            if is_gate and not self._fired:
+                self._fired = True
+                self._real.execute(
+                    "UPDATE leases SET ttl_expires_at = ? WHERE id = ?",
+                    (time.time() - 1.0, lease_id),
+                )
+            return cur
+
+    proxy = _LapseAfterGate(conn)
+    app.dependency_overrides[get_conn] = lambda: proxy
+    try:
+        resp = client.post(
+            "/parcel/update",
+            json={
+                "parcel_id": parcel,
+                "agent_id": "agent-slow",
+                "content_hash": "hash-written-by-a-dead-lease",
+            },
+        )
+    finally:
+        app.dependency_overrides.pop(get_conn, None)
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["ok"] is False, "a lapsed lease must not land a write"
+    assert "lapsed" in body["reason"]
+
+    row = conn.execute(
+        "SELECT content_hash FROM parcels WHERE id = ?", (parcel,)
+    ).fetchone()
+    assert row["content_hash"] == original_hash, (
+        "the parcel must be untouched -- this is the value _check_read_deps "
+        "compares plan-time snapshots against"
+    )
+    conn.close()

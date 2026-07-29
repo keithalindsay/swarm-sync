@@ -9,6 +9,9 @@ Done when:
 from __future__ import annotations
 
 
+import logging
+import subprocess
+
 import pytest
 
 from swarmsync.worktree import git_ops
@@ -360,3 +363,40 @@ def test_park_branch_names_never_collide_across_repeated_rejections(repo):
     for parked in (first, second):
         out = git_ops._run(["git", "branch", "--list", parked], cwd=r).stdout
         assert out.strip() != ""
+
+
+def test_remove_worktree_rmtrees_the_dir_when_git_remove_fails(repo, monkeypatch, caplog):
+    """`git worktree remove` is check=False so a caller cleaning up after a run
+    that never created a worktree still reaches the branch delete. But under
+    concurrent git (index.lock contention) the remove can FAIL with the directory
+    still present -- and `git worktree prune` can never reclaim that, because prune
+    only drops entries whose directory is MISSING. In a long-lived server that is
+    an unbounded disk leak, so a failed remove falls back to rmtree + prune."""
+    r, base = repo
+    name = "agent-leaky"
+    wt = git_ops.add_worktree(r, name, base)
+    assert wt.exists()
+
+    real_run = git_ops._run
+    pruned = []
+
+    def flaky_run(args, cwd, check=True):
+        if "worktree" in args and "remove" in args:
+            # what git actually does when another process holds index.lock
+            return subprocess.CompletedProcess(
+                args, 128, stdout="", stderr="fatal: Unable to create index.lock"
+            )
+        if "worktree" in args and "prune" in args:
+            pruned.append(tuple(args))
+        return real_run(args, cwd=cwd, check=check)
+
+    monkeypatch.setattr(git_ops, "_run", flaky_run)
+
+    with caplog.at_level(logging.WARNING):
+        git_ops.remove_worktree(r, name, delete_branch=False)
+
+    assert not wt.exists(), "a failed `git worktree remove` must not leak the directory"
+    assert pruned, "the stale admin entry must be pruned after the rmtree"
+    assert any("leaked" in rec.message or "rmtree" in rec.message for rec in caplog.records), (
+        "a silent fallback is nearly as bad as the leak -- it must be observable"
+    )

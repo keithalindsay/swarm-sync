@@ -534,8 +534,8 @@ def test_compact_events_garbage_env_falls_back_to_defaults(conn, monkeypatch):
 
 
 def test_tail_returns_compaction_marker_rows(conn):
-    """`events_compacted` is outside the frozen EventType registry (models.py is
-    owned by a parallel WP); `tail` must still surface it, not crash or drop it."""
+    """`tail` must surface the `events_compacted` maintenance marker, not drop it
+    -- the compaction audit trail is the only record that events were pruned."""
     _emit_at(conn, "heartbeat", 2 * HOUR)
     events.compact_events(conn, heartbeat_max_age=HOUR, max_age=7 * DAY)
 

@@ -327,5 +327,15 @@ def subprocess_env(**overrides: str) -> dict[str, str]:
     here so the architecture guard ("only config.py touches os.environ") stays
     meaningful without a whitelist -- an environment PASSTHROUGH is the one
     read that genuinely cannot be expressed as a named accessor.
+
+    Pytest's own env vars are STRIPPED. The gate runs `pytest` in a subprocess
+    to decide whether a merge lands, and an operator with `PYTEST_ADDOPTS` set
+    in their shell (`--cov`, `-p` plugins, `-x`) silently changes what the gate
+    runs. Observed: `PYTEST_ADDOPTS="--cov=swarmsync"` makes the gate's own run
+    fail, so a green branch is rejected. The gate's verdict must depend on the
+    repo under test, not on the shell that happened to launch the server.
     """
-    return {**os.environ, **overrides}
+    env = {**os.environ, **overrides}
+    for var in ("PYTEST_ADDOPTS", "PYTEST_PLUGINS", "PYTEST_CURRENT_TEST"):
+        env.pop(var, None)
+    return env

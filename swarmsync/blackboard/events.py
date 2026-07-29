@@ -147,11 +147,12 @@ def _rows_to_events(rows: list[sqlite3.Row]) -> list[Event]:
         if data["type"] in _VALID_EVENT_TYPES:
             out.append(Event.model_validate(data))
         else:
-            # Maintenance rows (`events_compacted`) carry a type outside the frozen
-            # EventType registry (owned by models.py -- see EVENTS_COMPACTED above).
-            # They come from our own compactor writing our own table, so constructing
-            # without Literal validation is safe; dropping them instead would hide
-            # the compaction audit trail from every tailer.
+            # Defensive only: every type this package writes -- `events_compacted`
+            # included -- is in the registry, so nothing we emit lands here. It
+            # exists for rows written by a different build against the same file.
+            # Constructing without Literal validation beats the alternative of
+            # silently dropping them, which would hide an audit trail from every
+            # tailer with no signal that anything was skipped.
             out.append(Event.model_construct(**data))
     return out
 
@@ -248,25 +249,23 @@ def compact_events(
         return 0
 
     seqs = [row["seq"] for row in rows]
-    # Direct INSERT, not `emit`: EVENTS_COMPACTED is outside the models.py
-    # EventType registry (frozen to a parallel WP; see the constant's comment),
-    # and emit's registry check must stay strict for every other caller.
-    conn.execute(
-        "INSERT INTO events (agent_id, type, payload, ts) VALUES (?, ?, ?, ?)",
-        (
-            None,
-            EVENTS_COMPACTED,
-            json.dumps(
-                {
-                    "pruned": len(seqs),
-                    "seq_min": min(seqs),
-                    "seq_max": max(seqs),
-                    "heartbeat_max_age": hb_age,
-                    "max_age": horizon,
-                }
-            ),
-            now,
-        ),
+    # Through `emit`, like every other writer. This was a direct INSERT, justified
+    # by a comment saying EVENTS_COMPACTED sat outside the models.py EventType
+    # registry "frozen to a parallel WP". That registry was updated and the
+    # workaround was never removed -- `models.py` has carried "events_compacted"
+    # since, so the bypass of this module's single-write-path invariant had been
+    # unnecessary for some time, defended by a stale comment.
+    emit(
+        conn,
+        EVENTS_COMPACTED,
+        payload={
+            "pruned": len(seqs),
+            "seq_min": min(seqs),
+            "seq_max": max(seqs),
+            "heartbeat_max_age": hb_age,
+            "max_age": horizon,
+        },
+        ts=now,
     )
     return len(seqs)
 

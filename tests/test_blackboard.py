@@ -381,9 +381,13 @@ def test_bind_managed_root_survives_reconnect(tmp_path):
         conn2.close()
 
 
-def test_bind_managed_root_concurrent_first_bind_one_winner(tmp_path):
-    """Two connections racing the first bind: INSERT OR IGNORE + read-back means
-    one wins and the loser sees the winner's root (raises on a different root)."""
+def test_bind_managed_root_second_binder_loses_and_sees_the_winners_root(tmp_path):
+    """Two connections, sequential: INSERT OR IGNORE + read-back means the first
+    bind wins and a second one for a different root raises, seeing the winner's.
+
+    Deliberately NOT threaded -- this pins the INSERT OR IGNORE semantics, not the
+    race. (It was previously named `..._concurrent_first_bind_one_winner`, which
+    promised a concurrency test its body never performed.)"""
     dbfile = tmp_path / "blackboard.db"
     conn_a = db.init_db(dbfile)
     conn_b = db.connect(dbfile)

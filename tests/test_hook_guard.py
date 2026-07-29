@@ -66,6 +66,10 @@ def _run_guard(guard: Path, *, active_env: bool, project_dir: Path, path: str, a
         [str(guard), *args],
         env=env,
         cwd=str(project_dir),
+        # The guard reads its payload with an unconditional `INPUT=$(cat)`. Without
+        # an explicit stdin it inherits the terminal under `pytest -s` (capture off)
+        # and blocks forever. DEVNULL keeps `-s` usable for watching live output.
+        stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
         timeout=30,

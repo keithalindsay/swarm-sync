@@ -17,6 +17,21 @@ import os
 import pytest
 
 from swarmsync import config
+import contextlib
+
+@contextlib.contextmanager
+def mock_environ(values):
+    """Swap os.environ wholesale, then restore. Lets a test assert on what
+    `subprocess_env` REMOVES without leaking vars into the rest of the run."""
+    original = dict(os.environ)
+    os.environ.clear()
+    os.environ.update(values)
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(original)
+
 
 
 @pytest.fixture(autouse=True)
@@ -234,3 +249,31 @@ def test_subprocess_env_copies_environment_and_applies_overrides(monkeypatch):
     # a COPY: mutating it must not touch the real environment
     env["WP42_MARKER"] = "mutated"
     assert os.environ["WP42_MARKER"] == "present"
+
+
+def test_subprocess_env_strips_pytest_vars_so_the_gate_cannot_be_hijacked():
+    """The merge gate runs `pytest` in a subprocess to decide whether a branch
+    lands. If the operator's shell exports PYTEST_ADDOPTS, that subprocess
+    inherits it and the gate runs something other than the repo's own suite --
+    observed: `PYTEST_ADDOPTS="--cov=swarmsync"` makes the gate's run fail, so a
+    green branch is REJECTED. The verdict must depend on the repo under test,
+    not on the shell that launched the server."""
+    hijacks = {
+        "PYTEST_ADDOPTS": "--cov=swarmsync",
+        "PYTEST_PLUGINS": "some_plugin",
+        "PYTEST_CURRENT_TEST": "leaked::test",
+    }
+    real = dict(os.environ)
+    real.update(hijacks)
+    with mock_environ(real):
+        env = config.subprocess_env()
+    for var in hijacks:
+        assert var not in env, f"{var} must not reach the gate's subprocess"
+    # still a passthrough for everything else
+    assert env.get("PATH") == real.get("PATH")
+
+
+def test_subprocess_env_strip_does_not_mutate_the_real_environment():
+    with mock_environ({**os.environ, "PYTEST_ADDOPTS": "--cov=swarmsync"}):
+        config.subprocess_env()
+        assert os.environ["PYTEST_ADDOPTS"] == "--cov=swarmsync"
