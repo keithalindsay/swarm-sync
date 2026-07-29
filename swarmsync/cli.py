@@ -18,6 +18,7 @@ import argparse
 import copy
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -261,6 +262,91 @@ def _db_writable(db_path: str) -> tuple[bool, str]:
     return False, f"{p}: directory {parent} is not writable — pick another --db/$SWARMSYNC_DB"
 
 
+class SettingsUnreadable(Exception):
+    """`settings.json` exists but this CLI could not turn it into a JSON object.
+
+    Deliberately DISTINCT from "the file is absent": absence legitimately means
+    "start from `{}`", while an unparseable file means we do not know what the
+    user has configured -- and writing over it would destroy it."""
+
+
+def _read_settings(settings_path: Path) -> dict:
+    """The existing settings object at `settings_path`, or `{}` if it is absent.
+
+    DATA LOSS GUARD. This used to be a single `except (OSError, ValueError):
+    existing = {}` -- which collapsed two opposite situations into one:
+
+      * the file does not exist (ENOENT)  -> `{}` is the correct starting point;
+      * the file exists but does not parse -> `{}` is a LIE, and the caller then
+        wrote `{}` + swarm-sync's four hook entries straight over it.
+
+    A trailing comma, a `//` comment, a non-UTF-8 byte, or a partially-written
+    file was therefore enough to silently destroy every permission, env var,
+    model setting, statusLine and foreign hook the user had -- and with
+    `--global`, in `~/.claude/settings.json`. That defeats `_merge_hooks`, which
+    exists for the sole purpose of preserving foreign hooks.
+
+    So: ENOENT -> `{}`; ANY other failure (parse error, decode error, a
+    permissions error on read, or a JSON value that is not an object) ->
+    `SettingsUnreadable`, and the caller refuses to write anything at all.
+    """
+    try:
+        raw = settings_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        raise SettingsUnreadable(f"could not read {settings_path}: {exc}") from exc
+    except ValueError as exc:  # UnicodeDecodeError -- the file is not UTF-8 text
+        raise SettingsUnreadable(
+            f"could not parse {settings_path}: it is not valid UTF-8 text ({exc})"
+        ) from exc
+
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        raise SettingsUnreadable(
+            f"could not parse {settings_path} as JSON: {exc}"
+        ) from exc
+    if not isinstance(data, dict):
+        raise SettingsUnreadable(
+            f"could not parse {settings_path}: the top level is a "
+            f"{type(data).__name__}, but Claude Code settings must be a JSON object"
+        )
+    return data
+
+
+def _write_settings_atomically(settings_path: Path, merged: dict) -> None:
+    """Replace `settings_path` with `merged`, backing the old file up first.
+
+    Two properties, both about not losing the operator's file:
+
+      * BACKUP -- an existing settings.json is copied to `settings.json.bak`
+        before anything is replaced, so a wiring the operator did not want has a
+        one-move undo.
+      * ATOMIC -- the new content is written to a temp file in the SAME directory
+        (so `os.replace` is a same-filesystem rename) and renamed over the target.
+        A crash, a full disk, or an interrupt therefore leaves either the old file
+        or the new one, never a half-written settings.json -- which is itself one
+        of the unparseable shapes `_read_settings` now has to refuse.
+    """
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    if settings_path.exists():
+        backup = settings_path.with_name(settings_path.name + ".bak")
+        shutil.copy2(settings_path, backup)
+
+    tmp = settings_path.with_name(settings_path.name + f".tmp.{os.getpid()}")
+    try:
+        tmp.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(settings_path)
+    except BaseException:
+        # Never leave the temp file behind to be mistaken for real settings.
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def cmd_init_hooks(client: BlackboardClient, args: argparse.Namespace, out: TextIO) -> int:
     """Write swarm-sync's hook block into settings.json (idempotent) and drop the
     `.swarmsync-active` marker so coordination is on for this repo."""
@@ -270,9 +356,24 @@ def cmd_init_hooks(client: BlackboardClient, args: argparse.Namespace, out: Text
         else Path.cwd() / ".claude" / "settings.json"
     )
     try:
-        existing = json.loads(settings_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        existing = {}
+        existing = _read_settings(settings_path)
+    except SettingsUnreadable as exc:
+        # Refuse LOUDLY and change nothing -- not even the activation marker, so a
+        # refused run is never half-applied. The remedy names the file, because the
+        # operator is the only one who can say what belongs in it.
+        print(f"swarm-sync: {exc}", file=out)
+        print(
+            "refusing to write it: replacing a settings.json we cannot read would "
+            "destroy whatever permissions, env, model settings and foreign hooks it "
+            "holds.",
+            file=out,
+        )
+        print(
+            f"Fix the JSON in {settings_path} (or move it aside) and re-run "
+            "`swarmsync init-hooks`.",
+            file=out,
+        )
+        return 1
 
     command_base = args.command_base or _resolve_hook_command()
     merged = _merge_hooks(copy.deepcopy(existing), command_base)
@@ -286,8 +387,14 @@ def cmd_init_hooks(client: BlackboardClient, args: argparse.Namespace, out: Text
         print(f"# --dry-run: would drop marker {marker}", file=out)
         return 0
 
-    settings_path.parent.mkdir(parents=True, exist_ok=True)
-    settings_path.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
+    try:
+        _write_settings_atomically(settings_path, merged)
+    except OSError as exc:
+        # The original file is still whole (that is the point of the temp+rename);
+        # say so, so the operator does not go looking for damage.
+        print(f"swarm-sync: could not write {settings_path}: {exc}", file=out)
+        print("the existing settings.json is unchanged.", file=out)
+        return 1
     marker.touch()
     print(f"wired swarm-sync hooks into {settings_path}", file=out)
     print(f"  command: {command_base}", file=out)

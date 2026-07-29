@@ -265,6 +265,142 @@ def test_init_hooks_dry_run_touches_nothing(git_repo):
     assert not (git_repo / ".swarmsync-active").exists()
 
 
+@pytest.mark.parametrize(
+    "corrupt",
+    [
+        '{"model": "opus", "hooks": {},}',          # trailing comma
+        '// my settings\n{"model": "opus"}',        # JSONC-style comment
+        '{"model": "opus", "hooks": {"PreTool',     # truncated / partial write
+        "",                                          # zero-byte file
+    ],
+    ids=["trailing-comma", "comment", "truncated", "empty"],
+)
+def test_init_hooks_refuses_to_write_over_an_unparseable_settings_file(git_repo, corrupt):
+    """DATA LOSS: a settings.json this CLI cannot PARSE must never be replaced.
+
+    The old code caught ValueError alongside OSError and fell back to
+    `existing = {}`, then unconditionally wrote the merged result -- so a single
+    trailing comma (or a comment, or a half-written file) silently destroyed the
+    user's permissions, env, model, statusLine and every foreign hook, replacing
+    the file with swarm-sync's four entries alone. `_merge_hooks` exists precisely
+    to preserve foreign hooks; parsing failure must therefore REFUSE, not reset.
+    """
+    claude = git_repo / ".claude"
+    claude.mkdir()
+    settings = claude / "settings.json"
+    settings.write_text(corrupt, encoding="utf-8")
+
+    code, text = _cli(["init-hooks"])
+
+    assert code != 0, "init-hooks must exit non-zero rather than clobber the file"
+    assert settings.read_text(encoding="utf-8") == corrupt, "settings.json was rewritten"
+    assert "could not parse" in text.lower() or "refus" in text.lower()
+    assert str(settings) in text  # names the file the operator must fix
+    assert not (git_repo / ".swarmsync-active").exists(), (
+        "a refused init-hooks must not half-apply by dropping the marker"
+    )
+
+
+def test_init_hooks_refuses_a_settings_file_with_bad_encoding(git_repo):
+    """A non-UTF-8 settings.json is a read (UnicodeDecodeError -> ValueError)
+    failure, not an absent file -- same refusal, same preservation."""
+    claude = git_repo / ".claude"
+    claude.mkdir()
+    settings = claude / "settings.json"
+    raw = b'{"model": "\xff\xfe not utf-8"}'
+    settings.write_bytes(raw)
+
+    code, text = _cli(["init-hooks"])
+
+    assert code != 0
+    assert settings.read_bytes() == raw
+    assert "could not parse" in text.lower() or "refus" in text.lower()
+
+
+def test_init_hooks_refuses_when_settings_json_is_not_an_object(git_repo):
+    """A parseable-but-wrong-shaped settings.json (a list, a bare string) would
+    make `_merge_hooks` raise or, worse, be discarded -- refuse it too."""
+    claude = git_repo / ".claude"
+    claude.mkdir()
+    settings = claude / "settings.json"
+    settings.write_text('["not", "an", "object"]', encoding="utf-8")
+
+    code, _ = _cli(["init-hooks"])
+
+    assert code != 0
+    assert settings.read_text(encoding="utf-8") == '["not", "an", "object"]'
+
+
+def test_init_hooks_backs_up_the_previous_settings_before_overwriting(git_repo):
+    """Even on the good path, the prior file is preserved at settings.json.bak --
+    the operator's undo for a wiring they did not want."""
+    claude = git_repo / ".claude"
+    claude.mkdir()
+    original = json.dumps({"model": "claude-opus-4-8", "env": {"FOO": "bar"}})
+    (claude / "settings.json").write_text(original, encoding="utf-8")
+
+    code, _ = _cli(["init-hooks"])
+
+    assert code == 0
+    backup = claude / "settings.json.bak"
+    assert backup.exists(), "no settings.json.bak was written before the overwrite"
+    assert json.loads(backup.read_text(encoding="utf-8")) == json.loads(original)
+    # and the live file really did get the hooks merged in, keeping the foreign keys
+    live = json.loads((claude / "settings.json").read_text(encoding="utf-8"))
+    assert live["model"] == "claude-opus-4-8"
+    assert live["env"] == {"FOO": "bar"}
+    assert set(live["hooks"]) == {"PreToolUse", "PostToolUse", "SubagentStop", "SessionStart"}
+
+
+def test_init_hooks_leaves_no_partial_file_when_the_rename_fails(git_repo, monkeypatch):
+    """The write is temp-file + atomic rename: a failure mid-write must leave the
+    ORIGINAL settings.json intact, never a truncated one."""
+    claude = git_repo / ".claude"
+    claude.mkdir()
+    original = json.dumps({"model": "claude-opus-4-8"})
+    (claude / "settings.json").write_text(original, encoding="utf-8")
+
+    def boom(self, target):
+        raise OSError("simulated rename failure")
+
+    monkeypatch.setattr(cli.Path, "replace", boom)
+
+    code, _ = _cli(["init-hooks"])
+
+    assert code != 0
+    assert json.loads((claude / "settings.json").read_text(encoding="utf-8")) == json.loads(
+        original
+    ), "the original settings.json must survive a failed write"
+    assert not list(claude.glob("*.tmp*")), "a temp file was left behind"
+
+
+def test_init_hooks_still_writes_when_settings_json_is_simply_absent(git_repo):
+    """ENOENT is NOT a parse failure: an absent settings.json legitimately means
+    'start from {}' and must keep working exactly as before."""
+    code, _ = _cli(["init-hooks"])
+    assert code == 0
+    hooks = json.loads((git_repo / ".claude" / "settings.json").read_text())["hooks"]
+    assert set(hooks) == {"PreToolUse", "PostToolUse", "SubagentStop", "SessionStart"}
+    assert not (git_repo / ".claude" / "settings.json.bak").exists(), (
+        "nothing existed to back up"
+    )
+
+
+def test_init_hooks_dry_run_reports_a_corrupt_file_without_touching_it(git_repo):
+    """--dry-run must surface the same refusal (so the operator learns before
+    committing to a write), and still touch nothing."""
+    claude = git_repo / ".claude"
+    claude.mkdir()
+    (claude / "settings.json").write_text('{"a": 1,}', encoding="utf-8")
+
+    code, text = _cli(["init-hooks", "--dry-run"])
+
+    assert code != 0
+    assert (claude / "settings.json").read_text(encoding="utf-8") == '{"a": 1,}'
+    assert not (git_repo / ".swarmsync-active").exists()
+    assert "could not parse" in text.lower() or "refus" in text.lower()
+
+
 def test_doctor_flags_unreachable_off_and_unwired(git_repo):
     code, text = _cli(["--url", "http://127.0.0.1:9", "--timeout", "1", "doctor"])
     assert code != 0
