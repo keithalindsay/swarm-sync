@@ -290,21 +290,28 @@ WHERE parcel_id = :parcel_id AND agent_id = :agent_id AND mode = :mode
 RETURNING id;
 ```
 
-Any row returned → **granted**, carrying the *existing* `lease_id`. (`<sqlite_now>` is SQLite's own
-clock, `((julianday('now') - 2440587.5) * 86400.0)`, not the Python-bound `:now` — a stale caller
-clock must never revive a lease that lapsed while the statement waited to serialize.)
+Any row returned → **granted**, carrying the *existing* `lease_id`.
+
+Throughout, `<sqlite_now>` is SQLite's **own** clock —
+`((julianday('now') - 2440587.5) * 86400.0)`, evaluated when the statement serializes rather than
+when Python bound its parameters. Every liveness predicate and every timestamp either statement
+writes uses it, deliberately: a caller whose clock is stale must never be able to revive a lease that
+lapsed while its statement waited for the write lock, nor stamp a `ttl_expires_at` that disagrees
+with the predicate the next acquirer will be judged by. The two clocks agree to well under a
+millisecond, so the values remain directly comparable to any `time.time()` written elsewhere.
 
 **Path 2 — the CAS insert**, reached only when path 1 matched nothing:
 
 ```sql
 INSERT INTO leases
     (parcel_id, agent_id, mode, acquired_at, ttl_expires_at, heartbeat_at, intent, status)
-SELECT :parcel_id, :agent_id, :mode, :now, :ttl_expires_at, :now, :intent, 'active'
+SELECT :parcel_id, :agent_id, :mode, <sqlite_now>, <sqlite_now> + :ttl, <sqlite_now>,
+       :intent, 'active'
 WHERE NOT EXISTS (
     SELECT 1 FROM leases l
     WHERE l.parcel_id = :parcel_id
       AND l.status = 'active'
-      AND l.ttl_expires_at > :now
+      AND l.ttl_expires_at > <sqlite_now>
       AND (l.mode IN ('write', 'exclusive') OR :mode IN ('write', 'exclusive'))
       AND NOT (l.agent_id = :agent_id AND l.mode = :mode)
 )
@@ -332,7 +339,7 @@ is always single-statement-atomic.
 
 Read-leases are shared; `write` and `exclusive` each exclude every other lease on that parcel — and
 the predicate treats the two as **indistinguishable**, so `exclusive` buys no exclusion beyond
-`write` today. An expired lease (`ttl_expires_at <= :now`) is treated as not-active by the same
+`write` today. An expired lease (`ttl_expires_at <= <sqlite_now>`) is treated as not-active by the same
 WHERE clause, so an acquire against an only-expired holder succeeds without waiting for the reaper —
 lazy expiry. All of this is the safety net that makes trusting the planner's predicted touch-sets
 acceptable: a misprediction that double-targets a parcel simply loses the race and serializes.

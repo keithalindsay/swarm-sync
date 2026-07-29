@@ -33,7 +33,7 @@ designed, measured, and decided not to build.
 ## Status
 
 A working prototype and a local developer tool — not a hosted service. The engineering is
-deliberately thorough: **540 tests** (run 3× with zero flakes), `ruff` + `mypy` clean, and five
+deliberately thorough: **563 tests** (run 3× with zero flakes), `ruff` + `mypy` clean, and five
 review-gated hardening phases — correctness, resource bounds, architecture consolidation, and an
 operator surface (`swarmsync status`/`holds`/`free`/`doctor`). Every fix carries a test that fails
 when the fix is removed, and the architecture pass was adversarially reviewed before it merged.
