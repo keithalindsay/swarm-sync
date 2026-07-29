@@ -98,7 +98,15 @@ CREATE TABLE IF NOT EXISTS open_integrations (
   branch           TEXT NOT NULL,
   into_branch      TEXT NOT NULL,        -- the `into` trunk ("into" is an SQL keyword)
   trunk_sha_before TEXT NOT NULL,        -- what to reset `into` back to
-  ts               REAL NOT NULL
+  ts               REAL NOT NULL,
+  -- How many times startup reconciliation has TRIED and failed to roll this orphan
+  -- back (schema v3). A failed rollback keeps the row -- deleting it stranded an
+  -- un-gated merge on trunk with nothing left that could ever detect it -- so the
+  -- retry needs a bound, or a genuinely dead repo would be retried on every boot
+  -- forever, hold its `integrate_started` event out of compaction permanently, and
+  -- sit in /health's orphan count with no way to clear it. See
+  -- `coordinator.integrator.MAX_RECONCILE_ATTEMPTS`.
+  reconcile_attempts INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS events (

@@ -114,6 +114,17 @@ _kill_process_group = gate._kill_process_group
 _close_streams = gate._close_streams
 _reverse_dep_files = gate._reverse_dep_files
 
+# How many boots may FAIL to roll one orphaned integrate back before it is
+# abandoned. A failed rollback keeps its `open_integrations` row so the next boot
+# retries -- deleting it is what stranded an un-gated merge on trunk with nothing
+# left that could detect it -- but the retry must be bounded, or a repo that is
+# genuinely gone is retried forever, pins its `integrate_started` event out of
+# compaction, and permanently occupies /health's orphan count. Five is generous
+# for the transient cases this is really for (an unmounted share, a permissions
+# blip, a checkout mid-restore), all of which resolve within a boot or two, and
+# small enough that a truly dead repo clears itself in a handful of restarts.
+MAX_RECONCILE_ATTEMPTS = 5
+
 
 @dataclass
 class IntegrateResult:
@@ -709,8 +720,8 @@ def reconcile_orphaned_integrations(conn: sqlite3.Connection) -> list[dict]:
         the returned record instead.
     """
     rows = conn.execute(
-        "SELECT started_seq, repo, branch, into_branch, trunk_sha_before, ts "
-        "FROM open_integrations ORDER BY started_seq"
+        "SELECT started_seq, repo, branch, into_branch, trunk_sha_before, ts, "
+        "reconcile_attempts FROM open_integrations ORDER BY started_seq"
     ).fetchall()
 
     reconciled: list[dict] = []
@@ -720,13 +731,22 @@ def reconcile_orphaned_integrations(conn: sqlite3.Connection) -> list[dict]:
         branch = str(row["branch"] or "")
         into = str(row["into_branch"] or "")
         sha_before = row["trunk_sha_before"]
-        record = {"repo": repo, "branch": branch, "into": into, "action": None, "error": None}
+        attempts = int(row["reconcile_attempts"] or 0) + 1
+        record: dict = {
+            "repo": repo,
+            "branch": branch,
+            "into": into,
+            "action": None,
+            "error": None,
+            "attempts": attempts,
+        }
         if not repo or not into or not sha_before:
             # Defensive only (the schema is NOT NULL and `integrate` always fills
             # these); mirrors the old behavior: report, emit no verdict, keep the row.
             record["action"] = "skipped: incomplete open_integrations row"
             reconciled.append(record)
             continue
+        resolved = True
         try:
             current = git_ops.current_commit(repo, ref=into)
             if current == sha_before:
@@ -737,12 +757,41 @@ def reconcile_orphaned_integrations(conn: sqlite3.Connection) -> list[dict]:
                 record["action"] = f"reset {into} {current[:8]} -> {sha_before[:8]}"
         except Exception as exc:  # noqa: BLE001 -- must never block startup
             record["error"] = repr(exc)
-            record["action"] = "FAILED"
-        # The orphan verdict and the projection DELETE are ONE transaction (same
+            # THE ORPHAN IS NOT RESOLVED. Trunk still carries the un-gated merge, and
+            # this projection row is -- per this function's own docstring -- "the only
+            # thing that can detect it". Deleting it here (as this code used to,
+            # unconditionally, three lines below the `action = "FAILED"` assignment)
+            # left the poisoned trunk permanently undetectable: no event, no row, no
+            # future restart that could find or retry it. The failure this whole
+            # mechanism exists for -- a repo momentarily unreachable (unmounted share,
+            # permissions blip, a checkout mid-restore) -- thereby DISARMED the
+            # recovery. So: keep the row and retry on the next boot.
+            #
+            # Bounded, though. A repo that is genuinely gone (deleted, not moved) would
+            # otherwise be retried on every boot for the life of the DB, keep its
+            # `integrate_started` event out of compaction forever (the `started_seq`
+            # guard in `events.compact_events`), and sit in /health's orphan count with
+            # no operator move that clears it. After MAX_RECONCILE_ATTEMPTS the row is
+            # abandoned -- loudly, in the event payload and the returned record, never
+            # silently, because abandoning means giving up on a trunk that may still be
+            # carrying an un-gated merge.
+            if attempts >= MAX_RECONCILE_ATTEMPTS:
+                record["action"] = (
+                    f"ABANDONED after {attempts} failed attempts "
+                    f"(max {MAX_RECONCILE_ATTEMPTS}); {into} in {repo} may still "
+                    f"carry an un-gated merge -- reset it to {str(sha_before)[:8]} "
+                    "by hand"
+                )
+            else:
+                record["action"] = "FAILED"
+                resolved = False
+        # The orphan verdict and the projection write are ONE transaction (same
         # invariant as every terminal emit in `integrate`): a crash between them
         # would either re-reconcile this orphan on the next restart (row without
         # verdict -- resetting trunk out from under merges landed in between, the
-        # C1 data loss) or silently close it with no audit trail.
+        # C1 data loss) or silently close it with no audit trail. That holds for the
+        # retry path too: the attempt counter and the event recording the attempt
+        # must agree, or the bound is meaningless.
         with db.transaction(conn):
             events_mod.emit(
                 conn,
@@ -756,10 +805,37 @@ def reconcile_orphaned_integrations(conn: sqlite3.Connection) -> list[dict]:
                     "started_seq": start_seq,
                     "reconciliation": record["action"],
                     "error": record["error"],
+                    "attempts": attempts,
                 },
             )
-            conn.execute(
-                "DELETE FROM open_integrations WHERE started_seq = ?", (start_seq,)
-            )
+            if resolved:
+                conn.execute(
+                    "DELETE FROM open_integrations WHERE started_seq = ?", (start_seq,)
+                )
+            else:
+                conn.execute(
+                    "UPDATE open_integrations SET reconcile_attempts = ? "
+                    "WHERE started_seq = ?",
+                    (attempts, start_seq),
+                )
         reconciled.append(record)
     return reconciled
+
+
+def unresolved_orphan_count(conn: sqlite3.Connection) -> int:
+    """How many `open_integrations` rows are still unresolved right now.
+
+    An unresolved row means trunk MAY be carrying an un-gated merge at this
+    moment -- the single most consequential state this system can be in, since it
+    falsifies "trunk is always test-green". Before, that fact lived only in a
+    startup `print` an operator had to have been watching, and (after the delete
+    bug above) often nowhere at all. `GET /health` and `swarmsync doctor` both
+    read this so it is a question anyone can ask at any time.
+
+    Note the count is only meaningful once startup reconciliation has run: while a
+    server is serving, an `integrate` in flight legitimately has a row open for the
+    duration of its gate. Callers phrase it as "unresolved", not "orphaned".
+    """
+    return int(
+        conn.execute("SELECT COUNT(*) AS n FROM open_integrations").fetchone()["n"]
+    )

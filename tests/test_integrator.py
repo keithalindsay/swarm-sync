@@ -1579,3 +1579,145 @@ def test_each_event_stamps_its_own_time_not_the_call_entry_time(
         f"(ts={started.ts}): the verdict carries a stale call-entry timestamp "
         "instead of its own emit time (C16)"
     )
+
+
+# --- a FAILED rollback must not destroy the only record of the orphan --------------
+# `reconcile_orphaned_integrations` sets `action="FAILED"` when `reset_hard` raises
+# and then fell through to the UNCONDITIONAL `DELETE FROM open_integrations`. So the
+# un-gated merge stayed on trunk, the projection row -- the ONLY thing that can ever
+# detect it, per the function's own docstring -- was deleted, and no future restart
+# could find or retry it. The failure mode this whole mechanism exists for (a repo
+# that is momentarily unreachable: an unmounted NFS share, a permissions blip, a
+# checkout being restored) permanently disarmed the recovery.
+
+
+def test_a_failed_rollback_keeps_the_orphan_row_so_a_later_boot_can_retry(conn, tmp_path):
+    """The row must SURVIVE a failed reconcile -- and the retry must actually work
+    once the repo comes back."""
+    r, base = _make_repo_with_orphan_setup(tmp_path)
+    moved = tmp_path / "moved-away"
+
+    # The repo is unreachable at this boot (modelled by moving it aside -- the real
+    # cases are an unmounted share or a permissions blip, both transient).
+    pre = git_ops.current_commit(r, ref="integration")
+    _leave_orphan_behind(conn, r, "agent-x", "integration", base, pre)
+    landed = git_ops.current_commit(r, ref="integration")
+    assert landed != pre, "fixture bug: no un-gated merge to roll back"
+    r.rename(moved)
+
+    first = integrator.reconcile_orphaned_integrations(conn)
+
+    assert len(first) == 1 and first[0]["action"] == "FAILED"
+    assert _open_rows(conn), (
+        "the orphan row was deleted on a FAILED rollback -- trunk keeps the un-gated "
+        "merge and nothing can ever detect it again"
+    )
+
+    # The repo comes back; the next boot must find the orphan and finish the job.
+    moved.rename(r)
+    second = integrator.reconcile_orphaned_integrations(conn)
+
+    assert len(second) == 1
+    assert second[0]["action"].startswith("reset ")
+    assert git_ops.current_commit(r, ref="integration") == pre
+    assert _open_rows(conn) == [], "a successful reconcile must close the row"
+
+
+def test_a_failed_rollback_still_emits_its_audit_event(conn, tmp_path):
+    """Keeping the row must not cost the audit trail: every attempt is recorded."""
+    _record_start(conn, tmp_path / "gone", "b", "integration", None, "0" * 40)
+
+    integrator.reconcile_orphaned_integrations(conn)
+
+    orphaned = [e for e in events_mod.tail(conn) if e.type == "integrate_orphaned"]
+    assert len(orphaned) == 1
+    payload = json.loads(orphaned[0].payload)
+    assert payload["reconciliation"] == "FAILED"
+    assert payload["error"] is not None
+    assert payload["attempts"] == 1
+
+
+def test_a_permanently_dead_repo_is_abandoned_after_a_bounded_number_of_attempts(
+    conn, tmp_path
+):
+    """Keeping the row forever is its own bug: a repo that is GONE (not transiently
+    unreachable) would be retried on every boot for the life of the DB, hold an
+    `integrate_started` event out of compaction permanently, and sit in `/health`'s
+    orphan count with no way for an operator to clear it. So attempts are counted and
+    bounded; the final one abandons the row LOUDLY."""
+    _record_start(conn, tmp_path / "never-existed", "b", "integration", None, "0" * 40)
+
+    actions = []
+    for _ in range(integrator.MAX_RECONCILE_ATTEMPTS):
+        records = integrator.reconcile_orphaned_integrations(conn)
+        assert len(records) == 1
+        actions.append(records[0]["action"])
+
+    assert actions[:-1] == ["FAILED"] * (integrator.MAX_RECONCILE_ATTEMPTS - 1)
+    assert actions[-1].startswith("ABANDONED")
+    assert str(integrator.MAX_RECONCILE_ATTEMPTS) in actions[-1]
+    assert _open_rows(conn) == [], "the abandoned orphan must stop being retried"
+
+    # And it is never silently forgotten: the last event says it was given up on.
+    orphaned = [e for e in events_mod.tail(conn) if e.type == "integrate_orphaned"]
+    assert len(orphaned) == integrator.MAX_RECONCILE_ATTEMPTS
+    last = json.loads(orphaned[-1].payload)
+    assert last["reconciliation"].startswith("ABANDONED")
+    assert last["attempts"] == integrator.MAX_RECONCILE_ATTEMPTS
+
+
+def test_the_attempt_counter_is_per_orphan_not_global(conn, tmp_path):
+    """Two orphans must not share a budget -- one dead repo cannot starve another's
+    retries."""
+    _record_start(conn, tmp_path / "gone-a", "a", "integration", None, "0" * 40)
+    _record_start(conn, tmp_path / "gone-b", "b", "integration", None, "1" * 40)
+
+    integrator.reconcile_orphaned_integrations(conn)
+
+    rows = _open_rows(conn)
+    assert len(rows) == 2
+    assert [row["reconcile_attempts"] for row in rows] == [1, 1]
+
+
+def test_a_successful_reconcile_does_not_leave_an_attempt_count_behind(conn, tmp_path):
+    """The success path is unchanged: verdict emitted, row gone, first time."""
+    r, base = _make_repo_with_orphan_setup(tmp_path)
+    pre = git_ops.current_commit(r, ref="integration")
+    _leave_orphan_behind(conn, r, "agent-x", "integration", base, pre)
+
+    records = integrator.reconcile_orphaned_integrations(conn)
+
+    assert records[0]["action"].startswith("reset ")
+    assert records[0]["attempts"] == 1
+    assert _open_rows(conn) == []
+
+
+def test_unresolved_orphans_are_countable_for_health_and_doctor(conn, tmp_path):
+    """An orphan we could not roll back means trunk may be carrying an UN-GATED
+    merge right now. That has to be visible to an operator, not just buried in the
+    event log -- so the count is a first-class query."""
+    assert integrator.unresolved_orphan_count(conn) == 0
+
+    _record_start(conn, tmp_path / "gone", "b", "integration", None, "0" * 40)
+    assert integrator.unresolved_orphan_count(conn) == 1
+
+    integrator.reconcile_orphaned_integrations(conn)
+    assert integrator.unresolved_orphan_count(conn) == 1  # kept for retry
+
+    for _ in range(integrator.MAX_RECONCILE_ATTEMPTS - 1):
+        integrator.reconcile_orphaned_integrations(conn)
+    assert integrator.unresolved_orphan_count(conn) == 0  # abandoned
+
+
+def _make_repo_with_orphan_setup(tmp_path, branch="agent-x"):
+    """A repo with a committed, un-merged branch ready to be left half-integrated."""
+    r = tmp_path / "orphan-repo"
+    r.mkdir()
+    _write_repo(r)
+    base = git_ops.init_repo(r)
+    worktree = git_ops.add_worktree(r, branch, base)
+    (worktree / "mod_a.py").write_text(
+        "def helper(x):\n    return 'never gated'\n", encoding="utf-8"
+    )
+    git_ops.commit_all(worktree, f"{branch}: un-gated edit")
+    return r, base

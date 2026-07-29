@@ -233,7 +233,7 @@ def test_init_db_stamps_fresh_db_with_current_schema_version(tmp_path):
         ).fetchone()
         assert row is not None
         assert row["value"] == str(db.SCHEMA_VERSION)
-        assert db.SCHEMA_VERSION == 2
+        assert db.SCHEMA_VERSION == 3
     finally:
         conn.close()
 
@@ -284,7 +284,7 @@ def test_init_db_refuses_legacy_db_with_meta_but_no_version_row(tmp_path):
         db.init_db(dbfile)
 
 
-@pytest.mark.parametrize("stamp", ["1", "3"])
+@pytest.mark.parametrize("stamp", ["1", "2", "4"])
 def test_init_db_refuses_version_mismatch_older_and_newer(tmp_path, stamp):
     """The gate covers both directions: an older stamp AND a newer one (a DB
     written by future code must not be silently downgraded either)."""

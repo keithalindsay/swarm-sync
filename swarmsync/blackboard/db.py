@@ -45,7 +45,12 @@ SCHEMA = SCHEMA_PATH.read_text()
 #   v2 -- relative to the last public (v1) state: the `meta` table itself (WP3.4),
 #         the `open_integrations` crash-recovery projection (WP3.2), and the
 #         `idx_leases_reap` index (WP1.2).
-SCHEMA_VERSION = 2
+#   v3 -- `open_integrations.reconcile_attempts`: startup reconciliation now KEEPS
+#         an orphan row whose rollback failed (deleting it stranded an un-gated
+#         merge on trunk with nothing left that could detect it), so the retry
+#         needs a bounded attempt count. Additive column; a v2 DB is refused and
+#         rotated per the policy below rather than migrated in place.
+SCHEMA_VERSION = 3
 
 
 class SchemaVersionError(RuntimeError):
