@@ -80,6 +80,7 @@ from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
 from swarmsync import config
+from swarmsync import repolock
 from swarmsync.blackboard import db
 from swarmsync import __version__
 from swarmsync.blackboard.models import (
@@ -330,6 +331,28 @@ def create_app(
         # without serving it are unaffected. See `check_single_root`.
         managed_root = check_single_root()
 
+        # ONE server per repo, enforced where BOTH processes can see it: an
+        # `flock` on `<root>/.git/swarmsync.lock`. `check_single_root` refuses two
+        # ROOTS and `bind_managed_root` refuses one DB against two roots -- but
+        # neither sees two `swarmsync-serve` PROCESSES on the same --root with
+        # different ports and different DB files, which is the configuration that
+        # actually corrupts the repo. `integrate_lock` below cannot help: it is an
+        # asyncio.Lock, process-local by construction, so the two servers run
+        # `git merge`/`git reset --hard` on the SAME `integration` working tree
+        # concurrently (`.git/index.lock`, `MERGE_HEAD exists`, trunk left dirty
+        # with a half-applied merge). Same loud-refusal posture as the two errors
+        # above; released in the `finally` so an in-process restart is fine.
+        repo_lock = repolock.RepoLock(managed_root)
+        repo_lock.acquire()
+        app.state.repo_lock = repo_lock
+        try:
+            async with _serving(app, managed_root):
+                yield
+        finally:
+            repo_lock.release()
+
+    @asynccontextmanager
+    async def _serving(app: FastAPI, managed_root: str):
         # U8/WP3.4: bind this DB to its repo. Parcel ids are root-relative, so
         # reusing a DB file against a DIFFERENT root silently mixes two repos'
         # parcel maps (rows overwrite, leases conflate). First boot stores the

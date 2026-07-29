@@ -1,9 +1,14 @@
-# Audit Round 6 — full-spectrum evaluation
+# Audit — full-spectrum adversarial review
 
-Four independent audit passes (correctness/concurrency, security, code quality/architecture,
-usability/DX) run against commit `8beeb49`, every finding verified against source before being
-recorded. Companion document: [`IMPROVEMENT_PLAN.md`](IMPROVEMENT_PLAN.md) turns this into phased,
-subagent-executable work packages.
+**What was reviewed:** the whole of swarm-sync at commit `8beeb49` — source, tests, docs, and the
+demo — by four independent adversarial passes (correctness/concurrency, security, code
+quality/architecture, usability/DX), each finding reproduced against the source before it was
+recorded here, with the ~50% of unverified findings that die on contact reported as non-repro rather
+than "fixed."
+
+Companion document: [`IMPROVEMENT_PLAN.md`](IMPROVEMENT_PLAN.md) turns every finding below into
+phased, individually-revertable work packages, each with an acceptance test that must fail when its
+fix is deleted.
 
 Severity scale: **P0** trunk-destroying / data loss · **P1** serious, reachable in normal use ·
 **P2** moderate / needs unusual-but-real conditions · **P3** minor. Usability findings use
@@ -24,7 +29,7 @@ blocker/major/minor for *adoption* impact.
 | Source / test LOC | 5,460 / 7,472 (ratio 1.37) | statements are only 31% of source lines — doc-heavy by design |
 | Import cycles | none | but one layering inversion (§5.3) |
 | SQL injection / shell injection / auth bypass | **none found** | §4 |
-| Demo | 5/5 PASS in 8.6s from a fresh clone | quickstart caveat in §6.1 |
+| Demo | 5/5 PASS in 8.6s from a fresh clone | quickstart caveat in U1 |
 
 **Overall:** the codebase is unusually careful and unusually honest — every dangerous edge carries a
 written justification, the fail-open policy is deliberate and documented, and five audit rounds have
@@ -270,7 +275,7 @@ as-is is the worst option.
 ### A2 — Layering inversion: pure-SQL `events.py`/`leases.py` homed in `server/`
 `coordinator/integrator.py:88`, `coordinator/reaper.py:55` import `server.events`; `server/app.py:90-91`
 imports `coordinator` — bidirectional package dependency, one import away from a cycle. Both
-modules are pure SQLite domain operations (no FastAPI); ARCHITECTURE.md's own diagram places them
+modules are pure SQLite domain operations (no FastAPI); ../ARCHITECTURE.md's own diagram places them
 *inside the blackboard*. Fix (M, low risk): move both to `blackboard/`, keep re-export shims one
 release; the layering becomes strictly `blackboard ← {classifier, server, coordinator, agent}`.
 

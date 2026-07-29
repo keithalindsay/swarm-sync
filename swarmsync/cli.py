@@ -28,7 +28,7 @@ from typing import Optional, TextIO
 import httpx
 
 import swarmsync
-from swarmsync import __version__, config
+from swarmsync import __version__, config, repolock
 from swarmsync.agent.client import BlackboardClient, BlackboardUnreachable
 from swarmsync.blackboard import parcel_id
 
@@ -403,6 +403,65 @@ def cmd_init_hooks(client: BlackboardClient, args: argparse.Namespace, out: Text
     return 0
 
 
+def _add_repo_lock_check(
+    checks: list[tuple[str, bool, str]],
+    toplevel: Path,
+    health: Optional[dict],
+    url: str,
+) -> None:
+    """Doctor's view of the one-server-per-repo lock (`swarmsync.repolock`).
+
+    Two `swarmsync-serve` processes on one repo corrupt trunk, and the symptom an
+    operator actually hits is indirect: `doctor` says the server is unreachable
+    while a DIFFERENT server, on a port they have forgotten, already owns the
+    repo. So report the lock against what the reachable server (if any) claims:
+
+      * the server we reached IS this repo's server -> it must hold the lock;
+        if it doesn't, it predates this guard (or was started on another root)
+        and a second server could still boot on top of it;
+      * no server here, or one serving a different root -> nobody should hold
+        this repo's lock; if somebody does, name the pid, because that process
+        is the answer to "why can't I reach my server".
+
+    A root with no `.git` directory is not lockable at all (see
+    `repolock.lock_path_for`), so the check is simply omitted there rather than
+    reported as a pass we cannot actually vouch for.
+    """
+    lock_path = repolock.lock_path_for(toplevel)
+    if lock_path is None:
+        return
+    holder = repolock.holder_pid_if_held(toplevel)
+    serves_this_repo = (
+        health is not None and Path(health["root"]).resolve() == toplevel.resolve()
+    )
+    if serves_this_repo:
+        checks.append(
+            (
+                "single server on this repo",
+                holder is not None,
+                f"held by the running server (pid {holder})"
+                if holder is not None
+                else f"the server at {url} serves this repo but holds no lock on "
+                f"{lock_path} — it predates the one-server-per-repo guard, so a "
+                "second `swarmsync-serve` could still boot on this repo and corrupt "
+                "trunk; restart it on this build",
+            )
+        )
+        return
+    checks.append(
+        (
+            "single server on this repo",
+            holder is None,
+            "no other swarm-sync server holds this repo"
+            if holder is None
+            else f"swarm-sync process {holder} already coordinates this repo (holds "
+            f"{lock_path}) but is not the server at {url} — two servers on one repo "
+            "corrupt trunk. Point --url/$SWARMSYNC_URL at the running server's port, "
+            "or stop it",
+        )
+    )
+
+
 def cmd_doctor(client: BlackboardClient, args: argparse.Namespace, out: TextIO) -> int:
     """Diagnose a swarm-sync setup: each check prints pass/fail + a remedy, and
     the exit code is non-zero iff any check failed."""
@@ -463,6 +522,7 @@ def cmd_doctor(client: BlackboardClient, args: argparse.Namespace, out: TextIO) 
                 "(or set SWARMSYNC_ACTIVE=1)",
             )
         )
+        _add_repo_lock_check(checks, toplevel, health, args.url)
         wired = _hooks_wired(toplevel)
         checks.append(
             (

@@ -1,6 +1,6 @@
 # swarm-sync — Design (Pheromesh architecture)
 
-**Author:** Keith Lindsay · **Status:** build-ready prototype spec · **Target:** overnight autonomous build
+**Author:** Keith Lindsay · **Status:** build-ready prototype spec
 
 ## 1. The problem
 
@@ -43,7 +43,7 @@ does and what recently changed* — plus **decaying pheromone trails** so agents
 reality (not raw diffs) and can see who is working where. That is the literal realization of
 "a shared memory that keeps agents in sync on the current state of the code."
 
-### De-risking decisions (per judge advice, baked into this build)
+### De-risking decisions (baked into this build)
 
 - **Granularity is FILE. Symbol-level leasing is PARKED, not a flag.** The classifier emits parcels
   at function/method granularity where the AST is unambiguous, but the *enforced lease granularity*
@@ -205,12 +205,13 @@ acting.
 
 | Endpoint | Purpose |
 |---|---|
+| `GET /health` | Operational snapshot: `{version, root, db_path, active_leases, last_event_seq}` (`blackboard.models.HealthOut`; field names are the wire contract). Read-only and **unauthenticated by design**, like the other GETs, so it can answer "is the server up, and bound to which repo?" without the bearer token an operator may be debugging. `swarmsync status` and `swarmsync doctor` are both built on it; it adds no server state, deriving every field from the existing DB plus the managed-root resolution. |
 | `POST /index` | Run classifier over repo; (re)populate `parcels` + `contracts`. |
 | `GET /parcels` | The live parcel map (id, blast_radius, state_summary, lease status). |
 | `GET /leases` | Active leases. |
 | `POST /intent` | Declare `{agent_id, task, target_parcels}`; emits a `planned` pheromone + event. |
 | `POST /lease` | Atomic CAS acquire `{agent_id, parcel_id, mode, ttl?, intent?, ensure_parcel?}` → `granted\|denied` (§5.2). `ensure_parcel` (hook path only) auto-creates a coarse whole-file parcel when the id is unknown, so a file the classifier never indexed is still coordinated — see §5.1's note on the shared working tree. Such a row carries NULL `content_hash`/byte span until a real `POST /index` fills it in, so **a `parcels` row does not imply a parsed span**. |
-| `POST /heartbeat` | `{agent_id, lease_id}` → bump `heartbeat_at` + `ttl_expires_at`. |
+| `POST /heartbeat` | `{agent_id, lease_id, ttl?}` → bump `heartbeat_at` + `ttl_expires_at`. `ttl` is optional and bounded by the same `gt=0, le=86400` validators as `POST /lease`; omitted, the server's default window is used. The hook keepalive **does** send its own long `ttl`, so that a renewal keeps the long window instead of silently collapsing back to the short default. |
 | `POST /release` | Release a lease. |
 | `GET /contract/{symbol}` | Current frozen signature + version. |
 | `POST /parcel/update` | Agent posts new `content_hash` + `state_summary` on done. |
@@ -227,7 +228,7 @@ the split is *absent entity* vs. *policy refusal* vs. *malformed/forbidden reque
 
 | Shape | Where | Rationale |
 |---|---|---|
-| `404` | `GET /contract/{symbol}` unknown symbol; `POST /parcel/update` unknown parcel. | The named entity does not exist — retrying can't help until the world changes; kept distinct from "you don't hold the lease" so the two failure modes never collapse. |
+| `404` | `GET /contract/{symbol}` unknown symbol; `POST /parcel/update` unknown parcel; **`POST /lease` unknown parcel** (without `ensure_parcel`). | The named entity does not exist — retrying can't help until the world changes; kept distinct from "you don't hold the lease" so the two failure modes never collapse. On `/lease` this is a translation at the wire boundary: the store deliberately raises `sqlite3.IntegrityError` on the `parcels` FK for an id it never emitted, which unhandled would leak as a bare `500` and a stack trace. A parcel id can legitimately vanish between plan time and lease time (`parcel_retired`, WP3.5), so an in-flight agent re-leasing a retired id lands here — a normal coordination outcome, not a fault. The `ensure_parcel=True` auto-create-and-grant path is untouched by this. |
 | `200` + refusal body | `POST /lease` deny → `{granted: false, reason, holder?, holder_ttl_expires_at?}`; `POST /parcel/update` without the write lease → `{ok: false, reason}`; `POST /heartbeat` / `POST /release` on a missing or foreign lease → `{ok: false}`. | Policy refusals are *normal coordination outcomes*, not errors: the request was well-formed and understood, the blackboard's answer is simply "no" — callers branch on the body (back off, name the holder), never on catching an HTTP error. Heartbeat/release carry no `reason` (a bare boolean suffices: the only cause is "not your active lease"); documented as-is, not reconciled — adding one would be additive, not a fix. |
 | `422` | Any malformed body/param (pydantic bounds: `ttl ≤ 0`, out-of-range `limit`/`tail`, `since`+`tail` together). | The request itself is wrong — loud, before any state is touched, so a caller never mistakes a clamped/ignored parameter for an answered question. |
 | `401` / `403` | `401`: missing/bad bearer token on mutating routes when `SWARMSYNC_TOKEN` is set. `403`: `POST /index` / `POST /integrate` path outside the managed roots. | Access control, not coordination: who may talk to the blackboard at all, and which filesystem paths it may touch. |
@@ -267,25 +268,74 @@ one file" is **structurally impossible**, and each agent gets an independent bui
 >   agents, not a sandbox.
 
 ### 5.2 Logical mutual exclusion — atomic CAS lease (prevention)
-Acquire is a single SQLite transaction that inserts a lease **only if no conflicting active,
-un-expired lease exists**:
+
+**There are two grant paths, not one**, and both are load-bearing. `acquire`
+(`blackboard/leases.py`) first tries to *refresh* a lease the caller already holds, and only if that
+misses does it run the compare-and-swap insert. This is the shipped SQL, verbatim.
+
+**Path 1 — idempotent refresh.** A single UPDATE against the caller's own live, same-mode lease:
 
 ```sql
-INSERT INTO leases (parcel_id, agent_id, mode, acquired_at, ttl_expires_at, heartbeat_at, status)
-SELECT :parcel, :agent, :mode, :now, :now + :ttl, :now, 'active'
-WHERE NOT EXISTS (
-  SELECT 1 FROM leases l
-  WHERE l.parcel_id = :parcel
-    AND l.status = 'active'
-    AND l.ttl_expires_at > :now
-    AND (l.mode IN ('write','exclusive') OR :mode IN ('write','exclusive'))
-);
+UPDATE leases
+SET heartbeat_at = <sqlite_now>,
+    ttl_expires_at = <sqlite_now> + :ttl,
+    intent = COALESCE(:intent, intent)
+WHERE parcel_id = :parcel_id AND agent_id = :agent_id AND mode = :mode
+  AND status = 'active' AND ttl_expires_at > <sqlite_now>
+RETURNING id;
 ```
-`changes() == 1` → granted; `0` → denied (another agent holds it). Read-leases are shared; `write` and
-`exclusive` each exclude every other lease on that parcel — and the predicate treats the two as
-**indistinguishable**, so `exclusive` buys no exclusion beyond `write` today. This
-is the safety net that makes trusting the planner's predicted touch-sets acceptable: a misprediction
-that double-targets a parcel simply loses the race and serializes.
+
+Any row returned → **granted**, carrying the *existing* `lease_id`. (`<sqlite_now>` is SQLite's own
+clock, `((julianday('now') - 2440587.5) * 86400.0)`, not the Python-bound `:now` — a stale caller
+clock must never revive a lease that lapsed while the statement waited to serialize.)
+
+**Path 2 — the CAS insert**, reached only when path 1 matched nothing:
+
+```sql
+INSERT INTO leases
+    (parcel_id, agent_id, mode, acquired_at, ttl_expires_at, heartbeat_at, intent, status)
+SELECT :parcel_id, :agent_id, :mode, :now, :ttl_expires_at, :now, :intent, 'active'
+WHERE NOT EXISTS (
+    SELECT 1 FROM leases l
+    WHERE l.parcel_id = :parcel_id
+      AND l.status = 'active'
+      AND l.ttl_expires_at > :now
+      AND (l.mode IN ('write', 'exclusive') OR :mode IN ('write', 'exclusive'))
+      AND NOT (l.agent_id = :agent_id AND l.mode = :mode)
+)
+RETURNING id;
+```
+
+A row inserted (`rowcount == 1`) → granted; `0` → denied, because a *conflicting* lease is active.
+`RETURNING id` rather than `cur.lastrowid`: the latter is a per-connection value and two threads
+sharing the broker's connection could read each other's id.
+
+**The idempotency contract.** A repeat request for the same `(parcel_id, agent_id, mode)` is
+**granted idempotently** — path 1 refreshes and returns the id already held, so N re-acquires leave
+exactly one row and one `lease_id` the caller can heartbeat and release. This is not a convenience:
+Claude Code dispatches batched parallel `Edit` tool calls from *one* agent, so two prechecks can both
+find no lease and both `POST /lease`. Without the self-exemption clause `NOT (l.agent_id = :agent_id
+AND l.mode = :mode)` in the CAS, the second request would match the first's just-granted write lease
+and deny the agent a parcel it already holds — self-defeating for exactly the pattern the lock exists
+to support. The exemption lives *inside* the atomic statement, so it identifies the self-holder with
+no TOCTOU window, and a **different** agent (or the same agent in a conflicting mode) is still
+denied. Mutual exclusion between distinct agents is fully intact.
+
+The two statements are TOCTOU-safe together: if the UPDATE misses and another agent's conflicting
+lease lands in the gap, the CAS's own `NOT EXISTS` sees it and cleanly denies. The grant *decision*
+is always single-statement-atomic.
+
+Read-leases are shared; `write` and `exclusive` each exclude every other lease on that parcel — and
+the predicate treats the two as **indistinguishable**, so `exclusive` buys no exclusion beyond
+`write` today. An expired lease (`ttl_expires_at <= :now`) is treated as not-active by the same
+WHERE clause, so an acquire against an only-expired holder succeeds without waiting for the reaper —
+lazy expiry. All of this is the safety net that makes trusting the planner's predicted touch-sets
+acceptable: a misprediction that double-targets a parcel simply loses the race and serializes.
+
+Two policy denials sit in front of both paths and return `granted=false` without touching either
+statement: a per-agent active-lease cap (`SWARMSYNC_MAX_LEASES_PER_AGENT`, default 256) checked
+*after* the refresh path so renewing a lease you already hold can never be blocked by it, and, on the
+`ensure_parcel=True` path only, parcel-id shape validation.
 
 **The conflict rule is `l.parcel_id = :parcel_id` — a string match** (`blackboard/leases.py::acquire`).
 The lease store has no notion of one parcel *containing* another. That is sound here only because
@@ -337,8 +387,21 @@ Merges are serialized through one integrator (`coordinator/integrator.py`). For 
    textual conflict is treated as a hard signal of touch-set misprediction → reject + re-plan.
 2. Run **pytest** restricted to tests reachable from the changed parcels (impact selection; full-suite
    fallback if selection is uncertain). Green → land, emit `merged`, re-index the touched files
-   (updates `content_hash`, `blast_radius`, regenerates `state_summary`). Red → reject, emit
-   `merge_rejected` with logs, leave trunk untouched, bounce the branch back to its agent.
+   (updates `content_hash`, `blast_radius`, regenerates `state_summary`).
+
+**On red, the gate does not "leave trunk untouched" — it merges first and undoes.** The order is:
+record the pre-merge sha, `git merge --no-ff`, *then* run the tests, and on red
+`git reset --hard <pre_merge_sha>` back to that recorded sha, emit `merge_rejected` with the logs,
+and bounce the branch to its agent. Trunk ends **byte-identical to where it started**, but it was
+genuinely mutated in between — the property is *restored*, not *preserved*. That distinction is the
+whole reason §7a's crash-recovery machinery exists: because `integrate` mutates trunk before it
+knows the verdict, a SIGKILL between the merge and the reset would otherwise strand a red merge on
+trunk, so the integrator emits `integrate_started` (carrying the sha to roll back to) *before*
+merging and a terminal `merged`/`merge_rejected` after, and startup reconciliation finishes the job
+no in-process handler could. See **§7a, "Crash recovery."**
+
+The guarantee this system actually offers is therefore: *every state of trunk an observer can
+witness after a completed integrate is test-green*, not *a failing branch never reaches trunk*.
 
 ### 5.5 Optimistic re-check
 At integrate time the integrator re-verifies the branch's declared read-dependencies against the

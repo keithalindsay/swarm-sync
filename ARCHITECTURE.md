@@ -1,7 +1,7 @@
 # Architecture — how swarm-sync works
 
 This is the doc to read if you want to **understand or improve** swarm-sync, not just run it. The
-[README](README.md) is the usage guide; [`DESIGN.md`](DESIGN.md) is the exhaustive build spec with
+[README](README.md) is the usage guide; [`docs/DESIGN.md`](docs/DESIGN.md) is the exhaustive build spec with
 every caveat and edge case spelled out. This doc sits between them: the mental model in plain
 language, a walkthrough of one edit end to end, a map from each concept to the code that implements
 it, and an honest list of where the interesting problems still live.
@@ -9,6 +9,19 @@ it, and an honest list of where the interesting problems still live.
 New to the vocabulary (parcel, lease, blackboard, pheromone)? The README's
 [glossary](README.md#the-words-this-readme-uses) defines every term in one line each. This doc
 assumes you've skimmed it.
+
+### Reading the shorthand in the code
+
+Comments, docstrings, and commit messages throughout the repo cite findings and work packages by id.
+Three prefixes cover all of them:
+
+- **`WP<phase>.<n>`** — a work package from [`docs/IMPROVEMENT_PLAN.md`](docs/IMPROVEMENT_PLAN.md)
+  (e.g. `WP4.3` = Phase 4, package 3). That document is the execution plan; the code cites the WP
+  that changed it.
+- **`C<n>` / `S<n>` / `A<n>` / `U<n>`** — a finding in [`docs/AUDIT.md`](docs/AUDIT.md): **c**orrectness,
+  **s**ecurity, **a**rchitecture, **u**sability, respectively (e.g. `C17`, `S1`, `A1`, `U9`).
+- **`P0`–`P3`** — the finding's severity: P0 trunk-destroying or data-losing, P1 serious and reachable
+  in normal use, P2 moderate, P3 minor. A pair like `S1/P2` is finding-then-severity.
 
 ---
 
@@ -86,7 +99,7 @@ compares parcel ids by string equality and has no notion of one parcel (a functi
 another (its file), so it would hand out both claims and let two agents collide. File-level locking
 is safe *by construction*: every id is the same shape, so string equality is exactly what you want.
 The full reasoning and a staged revival plan are in
-[`SYMBOL_MODE_DESIGN.md`](SYMBOL_MODE_DESIGN.md).
+[`docs/SYMBOL_MODE_DESIGN.md`](docs/SYMBOL_MODE_DESIGN.md).
 
 ---
 
@@ -167,7 +180,7 @@ swarm-sync coordinates agents two ways, and a contributor must not confuse them:
   managed root (`swarmsync-serve --root`) must **be** that git toplevel. Serving a *subdirectory*
   of a larger git repo as the managed root is a broker-path-only configuration today — the hook
   would key ids off the toplevel and mint parcels the server doesn't recognize. (Teaching the hook
-  to discover the server's root at session start is the planned lift; see IMPROVEMENT_PLAN Phase 5.)
+  to discover the server's root at session start is the planned lift; see [`docs/IMPROVEMENT_PLAN.md`](docs/IMPROVEMENT_PLAN.md) Phase 5.)
 
 ### Hook coordination identity has a Claude Code version floor
 
@@ -194,7 +207,7 @@ These are documented honestly rather than hidden — each is a genuine limitatio
 which makes them the best entry points for improving the project.
 
 - **Symbol-granularity leasing** — parked, not merely missing. The payoff and the full staged revival
-  plan are in [`SYMBOL_MODE_DESIGN.md`](SYMBOL_MODE_DESIGN.md). The blocker: the lease conflict rule
+  plan are in [`docs/SYMBOL_MODE_DESIGN.md`](docs/SYMBOL_MODE_DESIGN.md). The blocker: the lease conflict rule
   in `blackboard/leases.py::acquire` is a string match with no containment awareness. Teaching it that
   `m.py::alpha` lives inside `m.py::<module>` is the crux.
 - **`exclusive` buys nothing over `write` today** — the CAS predicate treats the two identically
@@ -225,7 +238,7 @@ unless you set `SWARMSYNC_TOKEN`.
 
 ## Further reading
 
-- [`DESIGN.md`](DESIGN.md) — the full spec: schema, every endpoint, all five test case demos, the
+- [`docs/DESIGN.md`](docs/DESIGN.md) — the full spec: schema, every endpoint, all five test case demos, the
   complete failure-handling table, and the operational surface (env vars, launchers).
-- [`SYMBOL_MODE_DESIGN.md`](SYMBOL_MODE_DESIGN.md) — why per-symbol leasing is parked and how it
+- [`docs/SYMBOL_MODE_DESIGN.md`](docs/SYMBOL_MODE_DESIGN.md) — why per-symbol leasing is parked and how it
   would come back.

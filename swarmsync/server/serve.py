@@ -29,7 +29,7 @@ from typing import Optional
 
 import uvicorn
 
-from swarmsync import config
+from swarmsync import config, repolock
 from swarmsync.server.app import MultiRootError, check_single_root, create_app
 from swarmsync.blackboard.leases import _NOW_SQL
 
@@ -158,6 +158,23 @@ def main(argv: Optional[list[str]] = None) -> None:
         root = check_single_root()
     except MultiRootError as exc:
         raise SystemExit(f"swarm-sync: {exc}") from None
+
+    # Pre-flight the one-server-per-repo lock so a repo that is already served
+    # fails HERE, with the same readable SystemExit MultiRootError gets, instead
+    # of surfacing as a `RepoLockHeldError` traceback out of uvicorn's startup.
+    # The authoritative acquire still happens in the app's lifespan (it must be
+    # held for the server's whole life, and TestClient-driven servers need it
+    # too); this probe only buys the better message. The small window between the
+    # probe and the acquire is harmless -- the acquire refuses regardless.
+    holder = repolock.holder_pid_if_held(root)
+    if holder is not None:
+        raise SystemExit(
+            f"swarm-sync: refusing to start -- {root} is already coordinated by "
+            f"swarm-sync process {holder} (it holds {repolock.lock_path_for(root)}).\n"
+            "Two servers on one repo run `git merge`/`git reset --hard` against the "
+            "same working tree concurrently and leave trunk dirty with a half-applied "
+            "merge. Point $SWARMSYNC_URL at the running server, or stop it first."
+        )
 
     print(f"swarm-sync: managed root: {root}", flush=True)
     print(

@@ -9,12 +9,51 @@
 > **blackboard** — a live SQLite representation of the current state of the code. Coordination is
 > *stigmergic*: agents read and write the environment, never each other.
 
-This is the **Pheromesh** architecture (the name is explained below). Three docs, by what you want:
+This is the **Pheromesh** architecture (the name is explained below).
+
+---
+
+## How this was built
+
+swarm-sync was built in five days by a swarm of Claude Code agents, coordinated by an earlier
+version of swarm-sync itself. I did not hand-write the 22,000 lines, and the commit trailers say so.
+
+What I did is the part that decides whether generated code is trustworthy: the design spec, six
+rounds of adversarial audit, the phased improvement plan, and the two rules the campaign ran under —
+*a fix without a test that fails when you delete the fix is not a fix*, and *roughly half of
+unverified findings die on contact, so reproduce before you fix and report the non-repro instead*.
+
+The receipts are in the repo. [`docs/AUDIT.md`](docs/AUDIT.md) is the review that found the P0 in
+crash-recovery reconciliation. [`docs/IMPROVEMENT_PLAN.md`](docs/IMPROVEMENT_PLAN.md) is how it got
+scheduled and closed. [`docs/SYMBOL_MODE_DESIGN.md`](docs/SYMBOL_MODE_DESIGN.md) is a feature I
+designed, measured, and decided not to build.
+
+---
+
+## Status
+
+A working prototype and a local developer tool — not a hosted service. The engineering is
+deliberately thorough: **540 tests** (run 3× with zero flakes), `ruff` + `mypy` clean, and five
+review-gated hardening phases — correctness, resource bounds, architecture consolidation, and an
+operator surface (`swarmsync status`/`holds`/`free`/`doctor`). Every fix carries a test that fails
+when the fix is removed, and the architecture pass was adversarially reviewed before it merged.
+
+Scope is intentionally tight: Python target (the classifier is stdlib `ast`; a tree-sitter backend
+is a documented extension point), deterministic scripted agents in the demo (a real Claude Agent SDK
+worker is a drop-in for the mutator), a serial integrator, and no TUI. The one designed-but-parked
+capability — per-symbol locking — is documented with its revival plan in
+[`docs/SYMBOL_MODE_DESIGN.md`](docs/SYMBOL_MODE_DESIGN.md).
+
+---
+
+## Documentation
 
 - **Use it** → this README.
-- **Understand or improve it** → [`ARCHITECTURE.md`](ARCHITECTURE.md) — how the pieces work, in plain
-  language, and where each lives in the code.
-- **The full build spec** → [`DESIGN.md`](DESIGN.md).
+- **Understand or improve it** → [`ARCHITECTURE.md`](ARCHITECTURE.md) — how the pieces work, in plain language, and where each lives in the code.
+- **The full build spec** → [`docs/DESIGN.md`](docs/DESIGN.md) — schema, every endpoint, the failure table, the operational contract.
+- **Every knob** → [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) — env vars, launcher and CLI flags, the raw hook block.
+- **The adversarial review** → [`docs/AUDIT.md`](docs/AUDIT.md), scheduled and closed by [`docs/IMPROVEMENT_PLAN.md`](docs/IMPROVEMENT_PLAN.md).
+- **The feature that wasn't built** → [`docs/SYMBOL_MODE_DESIGN.md`](docs/SYMBOL_MODE_DESIGN.md) — why per-symbol leasing is parked, and its staged revival plan.
 
 ---
 
@@ -72,24 +111,30 @@ the second waits. Parallelism comes from working on *different* files. (More in
 
 ## Try it in 2 minutes
 
-**Requires Python 3.11+.** Check first — on 3.10 or older, `pip install` backtracks for a long time
-instead of telling you the version is the problem:
-
-```bash
-python3 --version            # must be 3.11 or newer
-```
+**Requires Python 3.11+**, and the preflight below enforces it as a command rather than a comment.
+Skip it and, on Python 3.10 or older, `pip install` never mentions the version: it disappears into
+resolver backtracking, downloads 100+ `ruff` wheels, prints nothing for ~8 minutes, and then fails.
+`requires-python` does not gate the `pip install -e` path, so prose cannot do this job.
 
 ```bash
 git clone https://github.com/keithalindsay/swarm-sync.git
 cd swarm-sync
+```
 
-python3 -m venv .venv && source .venv/bin/activate
-# (use python3 to create the venv — most distros ship no bare `python`;
-#  inside the venv, `python` then exists and is your 3.11+.)
-pip install -e ".[dev]"
+```bash
+# Preflight + venv in one step: on 3.10 this fails in a second with a real message.
+python3.11 -m venv .venv || { echo "swarm-sync needs Python 3.11+; found $(python3 -V 2>&1)"; exit 1; }
+source .venv/bin/activate
+
+# --only-binary=:all: refuses source distributions outright, so pip cannot vanish
+# into backtracking — a missing wheel becomes an immediate, legible error instead.
+pip install --only-binary=:all: -e ".[dev]"
 
 python demo/run_demo.py      # the whole thing, standalone
 ```
+
+(Inside the venv, `python` exists and is your 3.11+ — most distros ship no bare `python` outside one.
+Any newer interpreter works: substitute `python3.12`/`python3.13` for `python3.11` above.)
 
 The demo boots a blackboard, indexes a sample repo, and runs a 3-agent swarm through five scenarios.
 You should see:
@@ -161,40 +206,21 @@ swarm-sync: payments.py is leased by agent-a (~280s left on the current hold; th
 
 ### Setup
 
-**Quick path:** from your repo, run `swarmsync init-hooks` — it writes the hook block below into
-`<repo>/.claude/settings.json` (idempotently; `--dry-run` to preview, `--global` for `~/.claude`) and
-drops the `.swarmsync-active` marker to turn coordination on. Then `swarmsync doctor` confirms the
-whole setup. The rest of this section is what those two commands do, by hand.
+**1 — Wire the hooks.** From your repo root, run `swarmsync init-hooks`. It writes the hook block
+(idempotently) into `<cwd>/.claude/settings.json` — or `~/.claude/settings.json` with `--global`, and
+`--dry-run` previews without touching anything — and drops the `.swarmsync-active` marker at the
+repo's git toplevel to turn coordination on. Run it from the repo root so the two land together.
 
-**1 — Wire the hooks.** Add this to `~/.claude/settings.json` (global) or
-`<project>/.claude/settings.json` (project-scoped), pointing the `command` paths at your actual
-swarm-sync checkout:
-
-```json
-{
-  "hooks": {
-    "PreToolUse": [
-      { "matcher": "Edit|Write|MultiEdit|NotebookEdit",
-        "hooks": [ { "type": "command", "command": "/path/to/swarm-sync/scripts/swarmsync-hook-guard precheck", "timeout": 10 } ] }
-    ],
-    "PostToolUse": [
-      { "matcher": "Edit|Write|MultiEdit|NotebookEdit",
-        "hooks": [ { "type": "command", "command": "/path/to/swarm-sync/scripts/swarmsync-hook-guard postupdate", "timeout": 10 } ] }
-    ],
-    "SubagentStop": [
-      { "hooks": [ { "type": "command", "command": "/path/to/swarm-sync/scripts/swarmsync-hook-guard release", "timeout": 10 } ] }
-    ],
-    "SessionStart": [
-      { "hooks": [ { "type": "command", "command": "/path/to/swarm-sync/scripts/swarmsync-hook-guard session-start", "timeout": 15 } ] }
-    ]
-  }
-}
+```bash
+swarmsync init-hooks --dry-run     # see exactly what it would write
+swarmsync init-hooks               # do it
 ```
 
-Wire `scripts/swarmsync-hook-guard`, **not** `swarmsync-hook` directly. The guard is a zero-overhead
-shim: when swarm-sync isn't active for a repo (step 3) it exits `0` immediately without even starting
-Python, so normal, non-coordinated editing pays nothing. It only launches the real adapter when a
-session is active.
+The block wires `scripts/swarmsync-hook-guard`, **not** `swarmsync-hook` directly. The guard is a
+zero-overhead shim: when swarm-sync isn't active for a repo (step 3) it exits `0` immediately without
+even starting Python, so normal, non-coordinated editing pays nothing. It only launches the real
+adapter when a session is active. The literal JSON, for anyone who prefers to paste it by hand, is in
+[`docs/CONFIGURATION.md`](docs/CONFIGURATION.md#the-claude-code-hook-block).
 
 **2 — Start the blackboard server**, pointed at the repo you're coordinating:
 
@@ -216,8 +242,11 @@ rm    /path/to/your/repo/.swarmsync-active     # off
 (Or set `SWARMSYNC_ACTIVE=1` in the environment — handy for CI. When neither is set, the hooks are a
 no-op and every edit is allowed, so installing the hooks never interferes with ordinary work.)
 
-**4 — Run your agents.** That's it. Edits to free files proceed silently; edits to a file another
-agent holds are denied with the message above until it's released.
+**4 — Confirm, then run your agents.** `swarmsync doctor` checks the whole setup end to end (server
+reachable, root matches the cwd's git toplevel, marker present and fresh, hooks wired, DB writable,
+version match) and prints a remedy for each check that fails. Then that's it: edits to free files
+proceed silently; edits to a file another agent holds are denied with the message above until it's
+released.
 
 ### Operating a session — the `swarmsync` CLI
 
@@ -233,8 +262,14 @@ swarmsync doctor              # diagnose the setup; each check prints a fix if i
 ```
 
 `swarmsync free foo.py && …` gates work in one line — the deny message an agent hits points it right
-back here (`swarmsync holds`). For the raw API, the server also serves interactive Swagger docs at
-`GET http://127.0.0.1:8787/docs`.
+back here (`swarmsync holds`). Two global flags come before the subcommand: `--url` (default
+`$SWARMSYNC_URL`) and `--timeout` (default 8s); `events` also takes `-n N` for how many to show.
+
+For the raw API, the server serves interactive Swagger docs at `GET http://127.0.0.1:8787/docs`, and
+`GET /health` is the single unauthenticated read that `status` and `doctor` are both built on — it
+returns `{version, root, db_path, active_leases, last_event_seq}`, which is everything you need to
+answer "is it up, and which repo is it bound to?" in one request. Full flag reference:
+[`docs/CONFIGURATION.md`](docs/CONFIGURATION.md).
 
 ### Troubleshooting
 
@@ -260,27 +295,15 @@ both console scripts run the same `main`). Same defaults everywhere: port **8787
 clock check. Earlier versions shipped a second launcher on port 8000 with different defaults;
 following the wrong one was a silent fail-open, so it's gone.
 
-## Configuration (environment variables)
+## Configuration
 
-Everything is optional — unset knobs use the defaults below, and a garbage value falls back to the
-default rather than crashing (a typo must never take the blackboard down or silently disable a
-lease). All reads go through [`swarmsync/config.py`](swarmsync/config.py), the one module allowed to
-touch the environment.
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `SWARMSYNC_ACTIVE` | unset (off) | Hook opt-in: exactly `1` activates coordination for a session regardless of marker files (the `.swarmsync-active` marker is the per-repo alternative). |
-| `SWARMSYNC_URL` | `http://127.0.0.1:8787` | Blackboard base URL the hook adapter talks to. Must match where `swarmsync-serve` is listening. |
-| `SWARMSYNC_TOKEN` | unset (no auth) | Bearer token required on every mutating route when set; the hook sends it automatically. |
-| `SWARMSYNC_ROOTS` | launch cwd | Managed-root allow-list for `/index`/`/integrate` (403 outside it). Exactly **one** root; `--root` sets it for you. |
-| `SWARMSYNC_DB` | `swarmsync.db` | Default SQLite path for the launcher's `--db` (the flag wins). `SWARM_SYNC_DB` is honored as a deprecated alias, with a stderr warning. |
-| `SWARMSYNC_LEASE_TTL` | `300` (seconds) | Lease TTL the hook acquires/renews with. Zero/negative/over-ceiling values are refused loudly and the default used — a typo must not disable lease protection. |
-| `SWARMSYNC_GATE_TIMEOUT` | `600` (seconds) | Wall-clock ceiling on the integrator's pytest gate; also widens the agent client's `/integrate` HTTP timeout to match. |
-| `SWARMSYNC_MAX_LEASES_PER_AGENT` | `256` | Cap on active leases one agent id may hold (bounds `ensure_parcel` abuse). |
-| `SWARMSYNC_MAX_BODY_BYTES` | `10485760` (10 MiB) | Request bodies declaring more than this are rejected 413 before buffering. |
-| `SWARMSYNC_EVENTS_COMPACT_INTERVAL` | `60` (seconds) | How often the background reaper runs an events-compaction pass. |
-| `SWARMSYNC_EVENTS_HEARTBEAT_MAX_AGE` | `3600` (1 hour) | Retention window for heartbeat events — the keepalive traffic that dominates log growth. |
-| `SWARMSYNC_EVENTS_MAX_AGE` | `604800` (7 days) | Retention horizon for any event (still-open integrate audit rows survive regardless). |
+Every knob is optional and every default is sane, so nothing here is required to run swarm-sync. The
+full reference — all twelve `SWARMSYNC_*` environment variables, `swarmsync-serve`'s flags, the
+`swarmsync` CLI's flags, and the raw Claude Code hook block — is in
+[`docs/CONFIGURATION.md`](docs/CONFIGURATION.md). Two properties hold across all of it: a garbage
+value falls back to the default rather than crashing (a typo must never take the blackboard down or
+silently disable a lease), and every read goes through
+[`swarmsync/config.py`](swarmsync/config.py), the one module allowed to touch the environment.
 
 ---
 
@@ -304,7 +327,7 @@ The classifier still indexes parcels at function/class granularity, and that isn
 blast radius and the frozen-contract surface are built on those symbol parcels. What is *not*
 available is symbol granularity as a **lease/scheduling** mode: requesting it raises an error rather
 than appearing to work. That's a deliberate park, with the reasoning and a revival plan in
-[`SYMBOL_MODE_DESIGN.md`](SYMBOL_MODE_DESIGN.md) — the short version is that per-function locking is
+[`docs/SYMBOL_MODE_DESIGN.md`](docs/SYMBOL_MODE_DESIGN.md) — the short version is that per-function locking is
 unsafe with today's lease store, only ever workable on the broker path (never the hook path), and
 buys narrower concurrency than it sounds since any edit touching an import escalates to the whole
 file anyway. File-level locking is safe *by construction*.
@@ -333,22 +356,6 @@ network you don't control.
   an agent that writes through `Bash` (`sed -i`, `cat >`, `patch`, `git checkout`) bypasses the lease
   check. Coordination is a cooperative protocol among well-behaved agents, not a sandbox that
   constrains a determined one.
-
----
-
-## Status
-
-A working prototype and a local developer tool — not a hosted service. The engineering is
-deliberately thorough: **538 tests** (run 3× with zero flakes), `ruff` + `mypy` clean, and five
-review-gated hardening phases — correctness, resource bounds, architecture consolidation, and an
-operator surface (`swarmsync status`/`holds`/`free`/`doctor`). Every fix carries a test that fails
-when the fix is removed, and the architecture pass was adversarially reviewed before it merged.
-
-Scope is intentionally tight: Python target (the classifier is stdlib `ast`; a tree-sitter backend
-is a documented extension point), deterministic scripted agents in the demo (a real Claude Agent SDK
-worker is a drop-in for the mutator), a serial integrator, and no TUI. The one designed-but-parked
-capability — per-symbol locking — is documented with its revival plan in
-[`SYMBOL_MODE_DESIGN.md`](SYMBOL_MODE_DESIGN.md).
 
 ## License
 

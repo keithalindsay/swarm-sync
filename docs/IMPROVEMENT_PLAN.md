@@ -1,9 +1,9 @@
-# Improvement Plan — phased work packages for expert subagents
+# Improvement Plan — phased work packages
 
-Companion to [`AUDIT_R6.md`](AUDIT_R6.md), which holds the full findings (C = correctness,
+Companion to [`AUDIT.md`](AUDIT.md), which holds the full findings (C = correctness,
 S = security, A = architecture, U = usability). This document is the execution plan: six phases,
-each a set of work packages (WPs) sized for one expert subagent, with explicit file footprints so
-disjoint WPs can run in parallel — under swarm-sync itself, if you like the symmetry.
+each a set of work packages (WPs) with explicit file footprints so disjoint WPs can run in
+parallel — under swarm-sync itself, if you like the symmetry.
 
 ## Ground rules (binding on every WP)
 
@@ -362,7 +362,7 @@ clean.
 
 ## Phase 6 — Strategic functionality
 
-*Do these with Phase 5's observability in place — the contract question (AUDIT_R6 §6) should be
+*Do these with Phase 5's observability in place — the contract question (AUDIT §6) should be
 answered by watching real sessions, not by argument. Sequenced, not parallel: each changes the
 ground the next stands on.*
 
@@ -375,7 +375,7 @@ ground the next stands on.*
 **Acceptance:** end-to-end: two agents, conflicting-adjacent edits, loser rebases and lands; test
 for bounded-attempts exhaustion. Effort L — one subagent, but budget accordingly.
 
-### WP6.2 — Answer the contract question (AUDIT_R6 §6, ROUND5 P1-7/8/9)
+### WP6.2 — Answer the contract question (AUDIT §6, ROUND5 P1-7/8/9)
 **Deliverable:** a decision memo (in-repo), then the implementing WPs it spawns.
 - Inputs: WP4.6's now-live `needs_rebase` behavior in real sessions; `swarmsync status` data on
   how often contracts would have fired; the SYMBOL_MODE_DESIGN staged plan; ROUND5's warning that
