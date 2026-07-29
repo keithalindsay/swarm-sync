@@ -33,7 +33,7 @@ designed, measured, and decided not to build.
 ## Status
 
 A working prototype and a local developer tool — not a hosted service. The engineering is
-deliberately thorough: **574 tests** (run 3× with zero flakes), `ruff` + `mypy` clean, and five
+deliberately thorough: **578 tests** (run 3× with zero flakes), `ruff` + `mypy` clean, and five
 review-gated hardening phases — correctness, resource bounds, architecture consolidation, and an
 operator surface (`swarmsync status`/`holds`/`free`/`doctor`). Every fix carries a test that fails
 when the fix is removed, and the architecture pass was adversarially reviewed before it merged.
@@ -283,6 +283,16 @@ they're worth knowing before they bite:
   coordination at all**, silently. The fix is always: pass `--root` explicitly and confirm the
   startup line. One server coordinates **one** repo; for a second repo, run a second server on
   another port.
+- **Your session does not have to run inside the repo it edits.** Coordination keys on the
+  repo containing the **file being edited**, not on the session's `cwd`, so running Claude
+  Code from a workspace root, a parent directory, or another project still coordinates
+  edits into a marked repo. This was not always true: keying on `cwd` meant a subagent —
+  which inherits its parent session's `cwd` — silently bypassed the fabric entirely
+  whenever that `cwd` sat outside the repo. Found by dogfooding, with three concurrent
+  agents editing a coordinated repo while the blackboard recorded **0 leases and 0
+  events**, `swarmsync doctor` reported all eight checks green, and stderr stayed empty.
+  Fixed and pinned by regression tests; noted here because "does my session have to be
+  *in* the repo?" is a fair question and the answer is now no.
 - **The hook talks to port 8787 by default.** The adapter's default `SWARMSYNC_URL` is
   `http://127.0.0.1:8787`, matching the launcher's default port — so a stock `swarmsync-serve` and a
   stock hook find each other with no configuration. If you serve on a different `--port` (or host),

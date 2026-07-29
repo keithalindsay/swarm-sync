@@ -676,17 +676,59 @@ def _repo_root(payload: Mapping[str, Any]) -> Path:
     `a.py::<module>`, so `ensure_parcel=True` auto-creates a GHOST row and the one file
     ends up with TWO independent write leases -- the exact collision the lease prevents.
 
-    So we walk UP from cwd to the git toplevel (the dir containing `.git`, a directory for
-    a normal checkout or a file for a worktree/submodule) and resolve against THAT. With no
-    `.git` anywhere up the tree we keep the old cwd-based behavior -- there is no root to
-    discover, so cwd is the best (and unchanged) answer.
+    So we walk UP to the git toplevel (the dir containing `.git`, a directory for a normal
+    checkout or a file for a worktree/submodule) and resolve against THAT.
+
+    **We walk up from the EDIT TARGET, not from cwd.** Keying on cwd assumes the session
+    is running inside the repo it is editing, and a Claude Code subagent inherits its
+    parent session's cwd -- which is routinely a workspace root, a parent directory, or an
+    entirely different project. When cwd sits outside the coordinated repo, walking up from
+    it finds either no `.git` at all or the WRONG repo's toplevel; `_is_active` then finds
+    no marker there and `_dispatch` returns a silent, zero-network-call ALLOW. Every edit
+    goes through ungated, with a live lease held by another agent, and nothing says so:
+    stderr stays empty and `swarmsync doctor` reports every check green, because from the
+    server's side nothing IS misconfigured.
+
+    Measured before the fix, holding the file, the lease and everything else constant and
+    varying only cwd:
+
+        process=repo     payload=repo     -> DENY  (correct)
+        process=outside  payload=repo     -> DENY  (correct)
+        process=repo     payload=outside  -> silent ALLOW
+        process=outside  payload=outside  -> silent ALLOW
+
+    The payload `cwd` was the sole determinant; the process cwd never mattered. Three
+    concurrent agents then edited a coordinated repo with 0 leases and 0 events recorded.
+
+    The edit target is the only input that actually identifies the tree being mutated, so
+    it is the one to key on. `scripts/swarmsync-hook-guard` already walks up from the
+    target for its marker check; this makes the adapter agree with the guard that launched
+    it. cwd remains the fallback for payloads with no edit target at all (`release`,
+    `session-start`), and for a target outside any checkout -- there is no root to
+    discover there, so cwd is the best (and unchanged) answer.
     """
+    target = _tool_file_path(payload.get("tool_input") or {})
+    if target:
+        target_root = _git_toplevel(Path(target).resolve().parent)
+        if target_root is not None:
+            return target_root
+
     cwd = payload.get("cwd") or os.getcwd()
     start = Path(cwd).resolve()
+    return _git_toplevel(start) or start
+
+
+def _git_toplevel(start: Path) -> Optional[Path]:
+    """The nearest enclosing dir containing `.git`, or None.
+
+    `.git` is a directory in a normal checkout and a FILE in a worktree or submodule, so
+    this tests existence rather than is_dir -- swarm-sync runs agents in worktrees, where
+    an is_dir check would silently fail to find the root it created.
+    """
     for candidate in (start, *start.parents):
         if (candidate / ".git").exists():
             return candidate
-    return start
+    return None
 
 
 # --- C10 two-tier fail policy: last-successful-contact marker ---------------------

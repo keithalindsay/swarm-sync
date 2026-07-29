@@ -1115,6 +1115,105 @@ def test_repo_root_without_git_keeps_cwd_behavior(tmp_path):
     assert adapter._repo_root({"cwd": str(sub)}) == sub.resolve()
 
 
+def test_repo_root_comes_from_the_edit_target_not_the_session_cwd(tmp_path):
+    """A session running OUTSIDE the repo it is editing must still resolve that repo.
+
+    Keying on cwd assumes the session lives inside the repo it edits. A Claude Code
+    subagent inherits its parent's cwd, which is routinely a workspace root or another
+    project entirely -- so the assumption fails in the most ordinary setup there is."""
+    repo = tmp_path / "coordinated"
+    (repo / "pkg").mkdir(parents=True)
+    (repo / ".git").mkdir()
+    (repo / "pkg" / "a.py").write_text("x = 1\n", encoding="utf-8")
+
+    outside = tmp_path / "somewhere_else"
+    outside.mkdir()
+
+    payload = _payload("Edit", file_path=str(repo / "pkg" / "a.py"), cwd=str(outside))
+    assert adapter._repo_root(payload) == repo.resolve()
+
+
+def test_repo_root_falls_back_to_cwd_when_there_is_no_edit_target(tmp_path):
+    """`release` and `session-start` carry no file path. cwd stays the answer for them."""
+    repo = tmp_path / "coordinated"
+    (repo / ".git").mkdir(parents=True)
+    assert adapter._repo_root({"cwd": str(repo)}) == repo.resolve()
+    assert adapter._repo_root({"cwd": str(repo), "tool_input": {}}) == repo.resolve()
+
+
+def test_repo_root_falls_back_to_cwd_when_the_target_is_outside_any_checkout(tmp_path):
+    """A scratchpad write has no repo to discover -- cwd remains the best answer, and
+    the fallback must not resolve to the filesystem root."""
+    repo = tmp_path / "coordinated"
+    (repo / ".git").mkdir(parents=True)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    (scratch / "note.txt").write_text("tmp\n", encoding="utf-8")
+
+    payload = _payload("Write", file_path=str(scratch / "note.txt"), cwd=str(repo))
+    assert adapter._repo_root(payload) == repo.resolve()
+
+
+def test_an_agent_outside_the_repo_is_still_denied_a_held_file(monkeypatch, tmp_path):
+    """REGRESSION -- the production failure, end to end.
+
+    Found by running three concurrent agents against a real repo: swarm-sync recorded
+    0 leases and 0 events while they modified four shared files. The agents' cwd was the
+    parent session's workspace, so `_repo_root` walked up from there, `_is_active` found
+    no marker, and `_dispatch` returned a silent zero-network-call ALLOW.
+
+    What made it dangerous rather than merely wrong: stderr stayed empty, and
+    `swarmsync doctor` reported all eight checks green throughout -- from the server's
+    side nothing WAS misconfigured. Neither of the two fail-open modes the README
+    documents (wrong managed root, wrong port) covers it.
+
+    Holding the file, the lease and everything else constant, only cwd varying:
+        process=repo     payload=repo     -> DENY
+        process=outside  payload=repo     -> DENY
+        process=repo     payload=outside  -> silent ALLOW   <- this test
+        process=outside  payload=outside  -> silent ALLOW   <- this test
+    """
+    monkeypatch.setenv("SWARMSYNC_ACTIVE", "1")
+    repo = tmp_path / "coordinated"
+    (repo / "pkg").mkdir(parents=True)
+    (repo / ".git").mkdir()
+    (repo / "pkg" / "a.py").write_text("x = 1\n", encoding="utf-8")
+
+    outside = tmp_path / "workspace_root"
+    outside.mkdir()
+
+    app = create_app(tmp_path / "bb.db")
+    with TestClient(app) as c:
+        factory = _http_factory(c)
+
+        # Agent A takes the lease from inside the repo.
+        code_a, out_a, _ = _run(
+            "precheck",
+            _payload("Edit", file_path=str(repo / "pkg" / "a.py"), cwd=str(repo), agent_id="A"),
+            http_factory=factory,
+        )
+        assert (code_a, out_a) == (0, "")
+
+        # Agent B edits the SAME file with a cwd outside the repo entirely.
+        code_b, out_b, _ = _run(
+            "precheck",
+            _payload(
+                "Edit", file_path=str(repo / "pkg" / "a.py"), cwd=str(outside), agent_id="B"
+            ),
+            http_factory=factory,
+        )
+        assert code_b == 0
+        assert out_b != "", (
+            "an agent whose cwd is outside the repo edited a LEASED file with no "
+            "coordination at all -- silently"
+        )
+        assert json.loads(out_b)["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+        held = c.get("/leases").json()
+        assert len(held) == 1, f"one physical file took {len(held)} leases: {held}"
+        assert held[0]["agent_id"] == "A"
+
+
 # =====================================================================================
 # WP2.3 -- timeout inversion + fail-closed under active coordination (C10)
 # =====================================================================================
