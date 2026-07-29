@@ -43,11 +43,12 @@ CLOCK_SKEW_TOLERANCE_SECONDS = 2.0
 def assert_clock_agreement() -> None:
     """Refuse to start if SQLite's clock disagrees with Python's (C13).
 
-    The heartbeat liveness predicate (`server.leases.heartbeat`) is evaluated on
-    SQLite's OWN clock -- `julianday('now')`, via `_NOW_SQL` -- atomically with the
-    SET, precisely so a slow/preempted statement can't revive a lapsed lease. But
-    `acquire` and the reaper stamp/compare `ttl_expires_at` using Python's
-    `time.time()`. Those two clocks are an UNSTATED invariant: if they disagree, a
+    Every liveness predicate in `blackboard.leases` is evaluated on SQLite's OWN
+    clock -- `julianday('now')`, via `_NOW_SQL` -- atomically with the statement
+    that uses it, precisely so a slow/preempted statement can't revive a lapsed
+    lease or mint an already-expired one. But the reaper still compares
+    `ttl_expires_at` against a Python `time.time()`, and `GET /leases`/`/parcels`/
+    `/health` filter on one too. Those two clocks are an UNSTATED invariant: if they disagree, a
     lease can look alive to one path and expired to the other, reopening the exact
     double-lease this system exists to prevent -- and nothing else checks it. So
     check it once, loudly, at startup, and name the problem if it fails.

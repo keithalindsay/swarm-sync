@@ -10,8 +10,35 @@ readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "Keith Lindsay" }]
 requires-python = ">=3.11"
+keywords = [
+    "ai-agents",
+    "multi-agent",
+    "coordination",
+    "stigmergy",
+    "claude-code",
+    "code-analysis",
+    "distributed-locking",
+    "developer-tools",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Software Development :: Version Control :: Git",
+    "Topic :: Utilities",
+    "Typing :: Typed",
+]
 
-# Deliberately dependency-light so the overnight build is reproducible.
+# Deliberately dependency-light so the build is reproducible.
 # Classifier uses the stdlib `ast` module (no tree-sitter needed for the Python target).
 dependencies = [
     "fastapi>=0.110",
@@ -19,6 +46,14 @@ dependencies = [
     "httpx>=0.27",       # thin agent client + FastAPI TestClient
     "pydantic>=2.6",
 ]
+
+[project.urls]
+Homepage = "https://github.com/keithalindsay/swarm-sync"
+Repository = "https://github.com/keithalindsay/swarm-sync"
+Documentation = "https://github.com/keithalindsay/swarm-sync/blob/master/README.md"
+Architecture = "https://github.com/keithalindsay/swarm-sync/blob/master/ARCHITECTURE.md"
+Design = "https://github.com/keithalindsay/swarm-sync/blob/master/docs/DESIGN.md"
+Issues = "https://github.com/keithalindsay/swarm-sync/issues"
 
 [project.optional-dependencies]
 dev = [

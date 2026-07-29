@@ -202,8 +202,10 @@ def acquire(
     if mode not in ("read", "write", "exclusive"):
         raise ValueError(f"unrecognized lease mode: {mode!r}")
 
-    now = time.time()
-    ttl_expires_at = now + ttl
+    # NOTE (C13): there is deliberately NO `now = time.time()` here any more. Every
+    # timestamp this function writes or compares is now taken from SQLITE's clock, in
+    # the statement that uses it -- see the CAS INSERT below for why. Event `ts`
+    # values are left to `emit`, which reads the clock at ITS own execution.
 
     # WP3.3 A2: shape-validate the id BEFORE the auto-create can mint a row for it.
     # Scoped to `ensure_parcel` -- without it, an unknown id fails on the parcels FK
@@ -259,7 +261,6 @@ def acquire(
             "lease_granted",
             agent_id,
             {"parcel_id": parcel_id, "lease_id": lease_id, "mode": mode},
-            ts=now,
         )
         return LeaseResult(granted=True, lease_id=lease_id)
 
@@ -305,29 +306,51 @@ def acquire(
     # wrong row -- ownership-scoped and hence "safe" but leaving the real
     # lease stuck active forever). `RETURNING id` reads the id straight off
     # this statement's own result set, immune to that race.
+    #
+    # C13 (the LAST Python-clock site in this module): every timestamp below is
+    # SQLite's own (`_NOW_SQL`), evaluated when the statement serializes -- never a
+    # `time.time()` bound at function entry. Between that entry and this INSERT sit up
+    # to THREE blockable statements (the refresh UPDATE, the quota COUNT, and
+    # `_ensure_parcel`'s INSERT), each of which can wait out the full 5s
+    # `busy_timeout` under WAL's single-writer rule. Stamping `acquired_at` /
+    # `heartbeat_at` / `ttl_expires_at` from the stale reading MINTED AN ALREADY-DEAD
+    # LEASE: measured at `hold=2.0s ttl=1.0s`, `acquire` returned `granted=True` for a
+    # row with -1.03s of life left. The CAS then treats that born-dead row as
+    # non-blocking, so the next agent is granted the SAME parcel -- two writers, both
+    # told they hold the lock, which is the one outcome this module exists to prevent.
+    # `{_NOW_SQL} + :ttl` cannot land in the past for any positive ttl, however long
+    # the statement waited.
+    #
+    # The conflict predicate's `l.ttl_expires_at > {_NOW_SQL}` is the same correction
+    # applied to the other side. A stale `:now` there fails SAFE (it sees a lapsed
+    # holder as still live and denies), but it denies over a lease that is already dead
+    # by the time the statement runs -- contradicting this module's documented lazy
+    # expiry ("an acquire against an only-expired holder succeeds without a separate
+    # reap step") with a stall no agent can explain. It now matches the deny-reason
+    # lookup below, `heartbeat`, `reap_once` and the refresh UPDATE above: ONE clock,
+    # SQLite's, for every liveness question in the system.
     cur = conn.execute(
-        """
+        f"""
         INSERT INTO leases
             (parcel_id, agent_id, mode, acquired_at, ttl_expires_at, heartbeat_at,
              intent, status)
-        SELECT :parcel_id, :agent_id, :mode, :now, :ttl_expires_at, :now,
+        SELECT :parcel_id, :agent_id, :mode, {_NOW_SQL}, {_NOW_SQL} + :ttl, {_NOW_SQL},
                :intent, 'active'
         WHERE NOT EXISTS (
             SELECT 1 FROM leases l
             WHERE l.parcel_id = :parcel_id
               AND l.status = 'active'
-              AND l.ttl_expires_at > :now
+              AND l.ttl_expires_at > {_NOW_SQL}
               AND (l.mode IN ('write', 'exclusive') OR :mode IN ('write', 'exclusive'))
               AND NOT (l.agent_id = :agent_id AND l.mode = :mode)
         )
         RETURNING id
-        """,
+        """,  # noqa: S608 - _NOW_SQL is a module constant, never caller input
         {
             "parcel_id": parcel_id,
             "agent_id": agent_id,
             "mode": mode,
-            "now": now,
-            "ttl_expires_at": ttl_expires_at,
+            "ttl": ttl,
             "intent": intent,
         },
     )
@@ -340,7 +363,6 @@ def acquire(
             "lease_granted",
             agent_id,
             {"parcel_id": parcel_id, "lease_id": lease_id, "mode": mode},
-            ts=now,
         )
         return LeaseResult(granted=True, lease_id=lease_id)
 
@@ -349,7 +371,6 @@ def acquire(
         "lease_denied",
         agent_id,
         {"parcel_id": parcel_id, "mode": mode},
-        ts=now,
     )
 
     # Name the holder that best explains the denial so the caller (the hook adapter)
@@ -439,10 +460,11 @@ def heartbeat(
     # the parcel, a stale `:now` still satisfies the predicate and revives the dead
     # lease -- reopening the double-lease with extra steps.
     #
-    # heartbeat is the ONLY one of the four predicates where clock staleness points the
-    # unsafe way: a stale `now` in acquire's `l.ttl_expires_at > :now` sees a conflict
-    # as MORE live (denies -> fails safe), and a stale `now` in reap_once's
-    # `ttl_expires_at <= :now` reaps FEWER rows (fails safe). Here it revives. `ttl` is
+    # Since the C13 sweep, EVERY liveness predicate in this module -- this one, the
+    # refresh UPDATE and CAS in `acquire`, and the deny-reason lookup -- reads the same
+    # SQLite clock, so none of them can be raced by a lock wait. (`reap_once` still
+    # takes a Python `now`, deliberately: it accepts an explicit one as a parameter,
+    # and a stale value there reaps FEWER rows, which fails safe.) `ttl` is
     # a caller-supplied, unvalidated knob (POST /lease {"ttl":...}, run_agent(lease_ttl=)),
     # so a deployment that shortens it toward request latency would reopen this in full.
     cur = conn.execute(

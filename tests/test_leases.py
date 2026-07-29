@@ -896,3 +896,130 @@ def test_other_agent_deny_reason_is_unchanged_by_the_self_wording(conn):
     assert r.holder == "agent-A"
     assert "held by 'agent-A'" in r.reason
     assert "your own" not in r.reason
+
+
+# --- C13, the last Python-clock site: acquire's CAS INSERT -------------------------
+# Every other liveness predicate in this module already evaluates on SQLITE's clock
+# (`_NOW_SQL`) precisely because a Python `time.time()` bound at function entry
+# answers "what time was it when I looked", and the statement can serialize
+# arbitrarily later. `acquire` binds `now` at entry and then has up to THREE blockable
+# statements ahead of the CAS INSERT (the refresh UPDATE, the quota COUNT, the
+# `_ensure_parcel` INSERT), each able to wait out the full 5s `busy_timeout`. The CAS
+# then stamped `acquired_at`/`heartbeat_at`/`ttl_expires_at` from that stale clock.
+#
+# These two tests create the wait with a REAL SQLite writer -- another connection
+# holding `BEGIN IMMEDIATE` -- because that is the actual mechanism (WAL allows one
+# writer; the loser waits on busy_timeout). No clock is patched: the bug is about the
+# gap between two real clock readings, so faking one would test nothing.
+
+
+def _hold_the_write_lock_for(db_path, seconds, ready):
+    """Occupy SQLite's single WAL write slot for `seconds`, then release.
+
+    Returns the thread. Any writer on another connection blocks for the duration
+    (up to `busy_timeout`) -- exactly the stall `acquire` must tolerate.
+    """
+    import threading
+
+    def hold():
+        blocker = db.connect(db_path)
+        try:
+            blocker.execute("BEGIN IMMEDIATE")
+            blocker.execute(
+                "INSERT INTO events (agent_id, type, payload, ts) "
+                "VALUES (NULL, 'heartbeat', NULL, 0)"
+            )
+            ready.set()
+            time.sleep(seconds)
+            blocker.execute("COMMIT")
+        finally:
+            blocker.close()
+
+    t = threading.Thread(target=hold)
+    t.start()
+    return t
+
+
+def test_acquire_never_mints_an_already_expired_lease(tmp_path):
+    """REPRODUCED: `hold=2.0s ttl=1.0s` granted a lease with NEGATIVE remaining life.
+
+    The grant is real (a row, `granted=True`, a `lease_granted` event) but the row is
+    born dead: `ttl_expires_at` is in the past, so the very next acquire's CAS treats
+    it as non-blocking and hands the SAME parcel to a second agent. Two writers, both
+    told they hold the lock -- the precise failure this module exists to prevent.
+    """
+    import threading
+
+    db_path = tmp_path / "blackboard.db"
+    conn = db.init_db(db_path)
+    parcel_id = _make_parcel(conn)
+
+    ready = threading.Event()
+    blocker = _hold_the_write_lock_for(db_path, 2.0, ready)
+    ready.wait(timeout=5)
+
+    acquirer = db.connect(db_path)
+    try:
+        result = leases.acquire(acquirer, parcel_id, "agent-A", mode="write", ttl=1.0)
+        assert result.granted is True
+
+        row = acquirer.execute(
+            "SELECT acquired_at, heartbeat_at, ttl_expires_at FROM leases WHERE id = ?",
+            (result.lease_id,),
+        ).fetchone()
+        remaining = row["ttl_expires_at"] - time.time()
+        assert remaining > 0, (
+            f"acquire granted a lease that was ALREADY EXPIRED by "
+            f"{-remaining:.2f}s -- stamped from a clock read before the "
+            "statement waited on busy_timeout"
+        )
+        # The stamps must describe the grant, not the function call.
+        assert row["acquired_at"] <= time.time()
+        assert row["acquired_at"] > time.time() - 1.0
+
+        # The consequence, stated directly: nobody else may take this parcel.
+        second = leases.acquire(acquirer, parcel_id, "agent-B", mode="write", ttl=1.0)
+        assert second.granted is False, (
+            "a second agent was granted the same parcel because the first lease "
+            "was born expired"
+        )
+    finally:
+        acquirer.close()
+        blocker.join(timeout=10)
+        conn.close()
+
+
+def test_acquire_is_not_denied_by_a_holder_that_expired_while_it_waited(tmp_path):
+    """The CAS's conflict predicate must judge the HOLDER on SQLite's clock too.
+
+    With a Python `:now` bound at entry, a holder whose lease lapsed during the wait
+    still satisfies `l.ttl_expires_at > :now`, so the incoming acquire is denied over
+    a lease that is already dead by the time the statement runs. It fails safe (a
+    spurious deny, not a double grant) but it is a stall an agent cannot explain, and
+    it contradicts the lazy-expiry contract this module documents: "an acquire against
+    an only-expired holder succeeds without a separate reap step".
+    """
+    import threading
+
+    db_path = tmp_path / "blackboard.db"
+    conn = db.init_db(db_path)
+    parcel_id = _make_parcel(conn)
+
+    assert leases.acquire(conn, parcel_id, "agent-A", mode="write", ttl=1.0).granted
+
+    ready = threading.Event()
+    blocker = _hold_the_write_lock_for(db_path, 2.0, ready)
+    ready.wait(timeout=5)
+
+    acquirer = db.connect(db_path)
+    try:
+        # Blocks ~2s; by the time the CAS runs, agent-A's 1.0s lease is long dead.
+        result = leases.acquire(acquirer, parcel_id, "agent-B", mode="write", ttl=30.0)
+        assert result.granted is True, (
+            "denied over a holder that had already expired when the statement ran: "
+            f"{result.reason}"
+        )
+    finally:
+        acquirer.close()
+        blocker.join(timeout=10)
+        conn.close()

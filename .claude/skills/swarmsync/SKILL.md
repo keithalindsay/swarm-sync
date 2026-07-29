@@ -88,6 +88,6 @@ All read-only, over the same HTTP the hooks use (default `$SWARMSYNC_URL`):
 
 ## Reference
 
-Architecture and internals: `<swarm-sync>/DESIGN.md` and `<swarm-sync>/ARCHITECTURE.md`. The
+Architecture and internals: `<swarm-sync>/docs/DESIGN.md` and `<swarm-sync>/ARCHITECTURE.md`. The
 lease/collision model, the classifier, the integrator, and the crash-recovery reaper are all
 documented there; the server also serves interactive Swagger docs at `GET <SWARMSYNC_URL>/docs`.
