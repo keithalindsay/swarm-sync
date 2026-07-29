@@ -1115,6 +1115,43 @@ def test_repo_root_without_git_keeps_cwd_behavior(tmp_path):
     assert adapter._repo_root({"cwd": str(sub)}) == sub.resolve()
 
 
+def test_a_hook_denial_reaches_the_event_log(monkeypatch, tmp_path):
+    """REGRESSION -- contention has to be auditable on the path that produces it.
+
+    `precheck` used to read `GET /leases` and return a denial from what it said. A
+    read emits nothing, so a denial decided that way never reached `events`. Measured
+    over a real three-agent run: 356 events, 35 grants, and **0 denials logged**
+    while the agents reported 8 of them. `swarmsync events` could not answer "how
+    much did my swarm contend, and on which files" for the Claude Code hook -- the
+    primary integration, and the only one most users will ever touch.
+
+    Losing an acquire emits `lease_denied`. Declining to attempt one emits nothing.
+    """
+    monkeypatch.setenv("SWARMSYNC_ACTIVE", "1")
+    repo = tmp_path / "myrepo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "a.py").write_text("x = 1\n", encoding="utf-8")
+
+    app = create_app(tmp_path / "bb.db")
+    with TestClient(app) as c:
+        factory = _http_factory(c)
+        payload_a = _payload("Edit", file_path=str(repo / "a.py"), cwd=str(repo), agent_id="A")
+        payload_b = _payload("Edit", file_path=str(repo / "a.py"), cwd=str(repo), agent_id="B")
+
+        assert _run("precheck", payload_a, http_factory=factory)[1] == "", "A should hold it"
+        code_b, out_b, _ = _run("precheck", payload_b, http_factory=factory)
+        assert code_b == 0
+        assert json.loads(out_b)["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+        events = c.get("/events?since=0").json()
+        denials = [e for e in events if "denied" in str(e.get("type"))]
+        assert denials, (
+            "a hook denial left no trace in the event log -- contention is "
+            f"unauditable. types seen: {sorted({str(e.get('type')) for e in events})}"
+        )
+        assert any(e.get("agent_id") == "B" for e in denials)
+
+
 def test_repo_root_comes_from_the_edit_target_not_the_session_cwd(tmp_path):
     """A session running OUTSIDE the repo it is editing must still resolve that repo.
 
@@ -1409,10 +1446,18 @@ class _DenyingAcquireClient:
         }
 
 
-def test_race_deny_consumes_acquire_result_without_second_leases_roundtrip(repo):
-    """WP2.4: on a lost acquire race the deny names the holder + TTL straight from the
-    acquire `LeaseResult` -- no second `/leases` read. Pre-fix this path re-read leases()
-    to name the winner (leases_calls == 2)."""
+def test_deny_consumes_the_acquire_result_and_reads_leases_not_at_all(repo):
+    """The deny names the holder + TTL straight from the acquire `LeaseResult`.
+
+    WP2.4 removed a SECOND `/leases` read from this path (it had been 2). The count
+    is now ZERO: precheck no longer reads before it acquires at all, because deciding
+    a denial from a read emits no event and made hook-path contention invisible --
+    `swarmsync events` reported 0 denials across a three-agent run that hit 8.
+
+    Pinned at exactly 0 rather than `<= 1` on purpose. A regression to read-first
+    would still satisfy "no second round-trip" while silently restoring the
+    observability hole this count is really guarding.
+    """
     client = _DenyingAcquireClient()
     result = adapter.cmd_precheck(
         "Edit", {"file_path": str(repo / "mod_a.py")}, client, repo, "agent-1"
@@ -1422,7 +1467,10 @@ def test_race_deny_consumes_acquire_result_without_second_leases_roundtrip(repo)
     assert "agent-Z" in reason
     assert "left on the current hold" in reason
     assert "renews while its holder stays active" in reason
-    assert client.leases_calls == 1, "deny path did a second /leases round-trip"
+    assert client.leases_calls == 0, (
+        "precheck read /leases before acquiring; a denial decided from a read emits "
+        "no lease_denied event and is invisible to `swarmsync events`"
+    )
 
 
 # --- WP3.5 (C6-interim): a deleted file gets an honest tombstone, not a stale hash --

@@ -419,19 +419,21 @@ def cmd_precheck(
         return None
     parcel_id = _parcel_id(relpath)
 
-    lease = _find_lease(client.leases(), parcel_id)
-    if lease is not None:
-        owner = lease.get("agent_id") or "another agent"
-        if owner == agent_id:
-            # KEEPALIVE: the hook is stateless across invocations, so the lease
-            # id is re-read here rather than remembered; bumping its TTL on every
-            # precheck keeps the "one-agent-per-file" lease alive across the think
-            # time between successive edits instead of letting the 30s server TTL
-            # expire it out from under a still-active agent.
-            _keepalive(client, agent_id, lease)
-            return None
-        return _deny_response(relpath, owner, lease.get("ttl_expires_at"))
-
+    # ONE acquire, no read-first. The acquire is the whole decision: the server
+    # refreshes the caller's OWN active same-mode lease rather than inserting a
+    # duplicate (`leases.acquire`, WP3.3 C1), so a repeat edit of a file this agent
+    # already holds comes back granted and keeps its TTL alive across think time --
+    # which is exactly what the old read-then-heartbeat branch was doing by hand.
+    #
+    # Reading `GET /leases` first and returning a deny from what it said made
+    # hook-path denials INVISIBLE. A read emits nothing, so `swarmsync events` showed
+    # 0 denials across a three-agent run that hit 8 of them, and "how much did my
+    # swarm contend, and on which files" -- the first question anyone asks of a
+    # coordination tool -- was unanswerable on the primary integration path. Losing
+    # the acquire emits `lease_denied`; deciding not to attempt it emits nothing.
+    #
+    # It is also cheaper: one POST here against a GET plus a heartbeat POST before.
+    #
     # `ensure_parcel=True`: this hook is handed whatever real file the agent is
     # editing -- `.ts`, `.yaml`, `package.json`, or a `.py` created since the last
     # index -- none of which the classifier (which only walks `*.py`) has emitted a
@@ -444,8 +446,7 @@ def cmd_precheck(
     if result.get("granted"):
         return None
 
-    # Lost the acquire race against another agent between our read above and this
-    # acquire. WP2.4: the server's deny `LeaseResult` already carries `holder` and
+    # WP2.4: the server's deny `LeaseResult` already carries `holder` and
     # `holder_ttl_expires_at`, so name the winner (and its TTL) straight from the
     # acquire response -- no second `GET /leases` round-trip. Fall back to a generic
     # phrase only if the server somehow reported no single holder (e.g. a race that
