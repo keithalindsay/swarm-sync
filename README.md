@@ -38,6 +38,14 @@ review-gated hardening phases — correctness, resource bounds, architecture con
 operator surface (`swarmsync status`/`holds`/`free`/`doctor`). Every fix carries a test that fails
 when the fix is removed, and the architecture pass was adversarially reviewed before it merged.
 
+Separately, **38 scale tests** under [`tests/scale/`](tests/scale/) drive the broker against a real
+34-module, 10k-line repository with its own 252-test suite, rather than the 96-line `sample_repo` the
+demo uses. They are excluded from the count above because they are slow (~58 s: they clone a repo,
+index 567 parcels, and run real pytest gates) and because they are honest about what that costs — in
+one of three full-suite runs with them included, `test_demo.py` timed out under the added contention.
+One flake in three runs is not "zero flakes," so it is reported here rather than averaged away. Run
+them with `pytest tests/scale/`; what they found is in the note under *How it works*.
+
 Scope is intentionally tight: Python target (the classifier is stdlib `ast`; a tree-sitter backend
 is a documented extension point), deterministic scripted agents in the demo (a real Claude Agent SDK
 worker is a drop-in for the mutator), a serial integrator, and no TUI. The one designed-but-parked
@@ -171,16 +179,30 @@ A **blackboard** (SQLite in WAL mode) holds the parcel map, leases, contracts, d
 trails, and an append-only event log. Each agent declares intent, acquires an **atomic write-lease**
 on a file, edits inside its **own git worktree**, heartbeats, then submits its branch to a **serial,
 test-gated integrator** that merges, runs `pytest`, and re-indexes — rolling the merge back if the
-tests go red, so trunk is never poisoned. A **TTL reaper** reclaims the leases of agents that crash.
+tests go red, so a break never *survives* on trunk. A **TTL reaper** reclaims the leases of agents
+that crash.
+
+> **Read that ordering literally: the merge lands, then the gate runs.** For the duration of the
+> pytest run, trunk's HEAD — and trunk's checkout on disk — carry the unverified merge; a red verdict
+> then `reset --hard`s it away, leaving trunk byte-identical and the bad commit reachable only from
+> the reflog, never as an ancestor. Measured on a 34-module repo the window was **14–20 s**, bounded
+> above only by `SWARMSYNC_GATE_TIMEOUT` (default 600 s). This is why
+> `reconcile_orphaned_integrations` exists: the window can outlive a crash.
+>
+> An earlier version of this sentence said "so trunk is never poisoned." That was false, and the
+> falsification is pinned by a test
+> ([`tests/scale/test_trunk_integrity.py`](tests/scale/test_trunk_integrity.py)) that asserts the
+> measured reality and will fail if anyone ever moves the gate ahead of the merge — which is the
+> correct signal to rewrite this paragraph. The guarantees table below was always accurate.
 
 ```mermaid
 flowchart LR
     A[agent] -->|1 declare intent + acquire write-lease| BB[(blackboard<br/>SQLite WAL)]
     A -->|2 edit in a private git worktree| WT[worktree]
     WT -->|3 submit branch| INT[serial test-gated integrator]
-    INT -->|merge, run pytest, re-index| Q{tests green?}
-    Q -->|yes| TR[(trunk stays green)]
-    Q -->|no| RB[roll the merge back]
+    INT -->|merge FIRST, then run pytest| Q{tests green?}
+    Q -->|yes| TR[(re-index; the merge stays)]
+    Q -->|no| RB[reset --hard: trunk byte-identical again]
     RP[TTL reaper] -.->|reclaims leases of dead agents| BB
 ```
 

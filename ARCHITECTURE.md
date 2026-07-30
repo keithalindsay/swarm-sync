@@ -127,6 +127,15 @@ End to end, what happens when an agent changes some code (the broker-driven path
    and: green → land it, re-index the touched files, regenerate their `state_summary`, emit `merged`;
    red → reject, roll trunk back, bounce the branch to its agent with the logs. Trunk is never left
    broken. → `coordinator/integrator.py`
+
+   **Note the ordering: the merge happens first, the tests second.** So while the gate runs, trunk's
+   HEAD and its checkout on disk carry an unverified merge; a red verdict then `reset --hard`s it
+   away, leaving trunk byte-identical and the bad commit reachable only from the reflog, never as an
+   ancestor. Measured on a 34-module repo the window was 14–20 s, bounded above only by
+   `SWARMSYNC_GATE_TIMEOUT` (default 600 s). Trunk is never left broken; it is briefly *unverified*,
+   and those are different claims. `reconcile_orphaned_integrations` exists because a crash inside
+   this window can strand an un-gated merge — see the note in the README under *How it works*, and
+   `tests/scale/test_trunk_integrity.py`, which measures it.
 8. **Release.** The lease is released; the file is immediately acquirable again.
 
 If the agent dies anywhere in 4–6, the reaper reclaims the lease after the TTL and the task is

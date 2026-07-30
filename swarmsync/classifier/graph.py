@@ -255,8 +255,42 @@ def build_graph(parcels: list[Parcel], root: StrPath) -> DepGraph:
                         local_names[local_name] = ("symbol", target_id)
                         graph.add_edge(this_module_id, target_id, f)
                     else:
-                        local_names[local_name] = ("module", target_file)
-                        graph.add_edge(this_module_id, module_parcel_id[target_file], f)
+                        # `from <pkg> import <submodule>` -- the imported name is not a
+                        # SYMBOL in the package's `__init__`, it is a MODULE in its own
+                        # right. Falling straight through to the package edge attributed
+                        # the dependency to `__init__.py` and lost the real one, which
+                        # INVERTED blast_radius between the two files. Measured on a
+                        # 34-module repo before this fix: `codelearner/__init__.py` (98
+                        # bytes: a docstring and `__version__`) scored the repo's HIGHEST
+                        # blast_radius at 279 with 11 dependent test files, while
+                        # `db.py`, its most-imported module, scored 3 with ZERO -- so its
+                        # contracts never froze and signature changes to it announced to
+                        # nobody. Reverse-dependents were lost on 8 of 34 modules.
+                        #
+                        # This is not only the impact-test selector's problem:
+                        # `classifier/store.run_index` computes `blast_radius` from this
+                        # same graph and `FREEZE_THRESHOLD` decides the frozen-contract
+                        # surface from that, so a mis-attributed edge silently disables
+                        # contract detection for a very common import form.
+                        sub_dotted = f"{dotted}.{alias.name}" if dotted else alias.name
+                        submodule_file = file_by_dotted.get(sub_dotted)
+                        if submodule_file is not None:
+                            local_names[local_name] = ("module", submodule_file)
+                            graph.add_edge(
+                                this_module_id, module_parcel_id[submodule_file], f
+                            )
+                            # Keep the package edge as well. Importing FROM a package
+                            # really does execute its `__init__`, so that dependency is
+                            # genuine -- it was never the wrong edge, only an incomplete
+                            # answer standing in for the missing one.
+                            graph.add_edge(
+                                this_module_id, module_parcel_id[target_file], f
+                            )
+                        else:
+                            local_names[local_name] = ("module", target_file)
+                            graph.add_edge(
+                                this_module_id, module_parcel_id[target_file], f
+                            )
 
         _link_call_edges(tree, f, graph, local_names, top_level_symbols, module_parcel_id)
 

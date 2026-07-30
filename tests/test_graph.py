@@ -442,3 +442,105 @@ def test_function_signature_kwonly_rendering_via_build_graph(tmp_path):
     graph = build_graph(parcels, tmp_path)
     sig, _hashed = graph.signatures["s.py::f"]
     assert sig == "f(a, *args, c, **kw)"
+
+
+# --- `from <pkg> import <submodule>`: the edge must land on the SUBMODULE ----------
+
+
+def _pkg_repo(tmp_path, importer_body: str):
+    """A package whose `__init__` is inert, plus a real submodule and an importer.
+
+    `pkg/__init__.py` deliberately defines nothing. That is the shape that made the
+    bug visible: an empty package file cannot be a genuine dependency target, so any
+    reverse-dependency credited to it instead of to `pkg/dep.py` is misattributed.
+    """
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text('"""Inert."""\n', encoding="utf-8")
+    (tmp_path / "pkg" / "dep.py").write_text(
+        textwrap.dedent(
+            """\
+            def work(x):
+                return x + 1
+            """
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "app.py").write_text(textwrap.dedent(importer_body), encoding="utf-8")
+    parcels = index_repo(tmp_path)
+    return parcels, build_graph(parcels, tmp_path)
+
+
+def _dependent_files(graph, parcels, path: str) -> set[str]:
+    """Transitive reverse-dependent FILES of everything defined in `path`."""
+    seen: set[str] = set()
+    queue = [p.id for p in parcels if p.path == path]
+    while queue:
+        for dependent in graph.reverse_edges.get(queue.pop(), set()):
+            if dependent not in seen:
+                seen.add(dependent)
+                queue.append(dependent)
+    return {graph.parcels_by_id[d].path for d in seen if d in graph.parcels_by_id}
+
+
+def test_from_package_import_submodule_depends_on_the_submodule(tmp_path):
+    """REGRESSION. `from pkg import dep` must record a dependency on `pkg/dep.py`.
+
+    Before the fix, `dep` was looked up as a SYMBOL of `pkg/__init__.py`; not finding
+    one, the edge fell through to the package and the real dependency vanished. The
+    consequence was not confined to import bookkeeping: `classifier/store.run_index`
+    derives `blast_radius` from this graph and `FREEZE_THRESHOLD` derives the
+    frozen-contract surface from that, so a module imported this way scored ~0, never
+    froze, and signature changes to it were announced to nobody.
+
+    Measured on a 34-module repo before the fix: `__init__.py` (98 bytes) held the
+    repo's HIGHEST blast_radius at 279 with 11 dependent test files, while its
+    most-imported module scored 3 with zero. Reverse-dependents were lost on 8 of 34
+    modules.
+    """
+    parcels, graph = _pkg_repo(
+        tmp_path,
+        """\
+        from pkg import dep
+
+
+        def run():
+            return dep.work(1)
+        """,
+    )
+    assert "app.py" in _dependent_files(graph, parcels, "pkg/dep.py")
+
+
+def test_from_package_import_submodule_still_depends_on_the_package(tmp_path):
+    """The package edge is kept, not replaced. Importing FROM a package really does
+    execute its `__init__`, so that dependency is genuine -- the old behaviour was an
+    incomplete answer, not a wrong one, and dropping it would trade one missing edge
+    for another."""
+    parcels, graph = _pkg_repo(
+        tmp_path,
+        """\
+        from pkg import dep
+
+
+        def run():
+            return dep.work(1)
+        """,
+    )
+    assert "app.py" in _dependent_files(graph, parcels, "pkg/__init__.py")
+
+
+def test_import_form_is_the_only_variable(tmp_path):
+    """Discrimination control: `from pkg.dep import work` always worked. If this and
+    the submodule test above ever disagree, the import FORM is what differs -- which
+    is what pins the diagnosis to `ast.ImportFrom` rather than to something about the
+    fixture."""
+    parcels, graph = _pkg_repo(
+        tmp_path,
+        """\
+        from pkg.dep import work
+
+
+        def run():
+            return work(1)
+        """,
+    )
+    assert "app.py" in _dependent_files(graph, parcels, "pkg/dep.py")
