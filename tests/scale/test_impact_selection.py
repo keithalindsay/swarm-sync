@@ -5,8 +5,8 @@ frozen contracts, 252 tests) rather than on `sample_repo`'s 195 lines?
 WHAT THIS FILE MEASURED (numbers from this machine, 2026-07-29)
 ==============================================================
 
-READ THIS FIRST -- ONE OF THE TWO DEFECTS BELOW IS NOW FIXED
------------------------------------------------------------
+READ THIS FIRST -- BOTH DEFECTS BELOW ARE NOW FIXED
+---------------------------------------------------
 These tests were written against a tree where BOTH defects were live, and the
 prose below describes what was originally measured. Since then:
 
@@ -18,10 +18,19 @@ prose below describes what was originally measured. Since then:
   `FREEZE_THRESHOLD` (`db.py`'s blast_radius went 3 -> 279). The three tests that
   used to CHARACTERIZE this defect have been inverted into REGRESSION GUARDS --
   they now fail if it comes back, and their messages say "DEFECT 1 HAS REGRESSED".
-* **DEFECT 2 IS STILL OPEN.** It remains reproduced below, and it still loses
-  dependents on 10 modules of the real repo -- including **4 test files** for
-  `codelearner/__init__.py`, which is a live, gate-relevant loss masked only by
-  the substring backstop.
+* **DEFECT 2 IS ALSO FIXED** (`coordinator/gate.py::_reverse_dep_files`). The BFS
+  now walks at FILE granularity -- any parcel of a file being reached marks the
+  whole file, and expansion continues from every parcel of it. Measured on the
+  same clone: the modules where the graph lost reverse-dependents went **10 -> 0**
+  (it now agrees exactly with this file's independent file-granularity import
+  closure, in both directions), and the **4 test files** it had been losing for
+  `codelearner/__init__.py` (`test_chunk`, `test_onboard`, `test_rerank`,
+  `test_retrieve`) are recalled by the graph rather than by a substring
+  coincidence. The precision cost is small and was measured, not assumed: summed
+  over all 34 source modules the gate selects **238 -> 240** test files (+0.84%),
+  all of it on that one module (9 -> 11); no other module's selection changed at
+  all. The test that CHARACTERIZED this defect has been inverted into a
+  regression guard, as its own failure message instructed.
 
 H2 -- correctness, AS ORIGINALLY MEASURED: **the gate's union selection held
 (recall 1.00 on all three changes measured), but its authoritative signal did
@@ -48,20 +57,21 @@ while the full suite is red):
   none. The impact map for those two files is exactly inverted.
   See `test_h2_from_pkg_import_submodule_is_no_longer_a_gate_false_negative`.
 
-  DEFECT 2 -- STILL OPEN (`coordinator/gate.py::_reverse_dep_files`, the BFS). The walk is
-  PARCEL-granular and only projects to file granularity at the very end, so a
-  file-level chain breaks whenever the intermediate module is imported
+  DEFECT 2 -- NOW FIXED (`coordinator/gate.py::_reverse_dep_files`, the BFS). The walk was
+  PARCEL-granular and only projected to file granularity at the very end, so a
+  file-level chain broke whenever the intermediate module is imported
   by-symbol and the reached symbol is not the imported one. Traced on the real
   repo: the BFS from `chunk/chunker.py` reaches exactly two of
   `cli/commands.py`'s 13 parcels (`<module>` and `cmd_index`), while
   `server/app.py` imports `resolve_index_path`/`_scalar`/`_classify_unresolved`/
   `_embedding_info` from that same file -- none of them in the reached set -- so
-  `server/app.py` is never marked as depending on `chunker.py`. The docstring's
+  `server/app.py` was never marked as depending on `chunker.py`. The docstring's
   claim ("Every repo file that TRANSITIVELY reverse-depends on a changed `.py`
-  file") is therefore stronger than what the code computes. Seeding the BFS with
-  every parcel of an affected FILE (which is the granularity swarm-sync leases
-  at) is what would close it.
-  See `test_h2_defect2_parcel_granular_bfs_is_a_gate_false_negative`.
+  file") was therefore stronger than what the code computed. The fix is what this
+  paragraph originally proposed: expand at FILE granularity (which is the
+  granularity swarm-sync leases at), so any parcel of a reached file puts the
+  whole file in the frontier.
+  See `test_h2_defect2_file_granular_bfs_keeps_the_chain`.
 
 Neither defect produced a false negative on code-learner itself, and the reason
 was luck, not design: the `db.py` loss was covered by the substring backstop
@@ -71,11 +81,12 @@ repos, not code-learner -- but they use ordinary import forms and an ordinary
 refactor, and the second one does not even need a raise: renaming a function is
 enough.
 
-Post-fix, Defect 2 is no longer confined to non-test files: it now loses 4 test
-files for `codelearner/__init__.py` on the real repo. That is still not a gate
-false negative -- the stem `"codelearner"` appears in every test file, so the
-substring backstop selects all 11 -- but the thing standing between it and a
-merged red change is once again a substring coincidence, not the graph.
+After Defect 1 was fixed, Defect 2 was no longer confined to non-test files: it
+lost 4 test files for `codelearner/__init__.py` on the real repo. That was still
+not a gate false negative -- the stem `"codelearner"` appears in every test file,
+so the substring backstop selected all 11 -- but the thing standing between it
+and a merged red change was once again a substring coincidence, not the graph.
+With the file-granular walk the graph carries those 4 on its own.
 
 The graph signal is nonetheless LOAD-BEARING, not decoration: for
 `codelearner/ingest/types.py::content_hash`, 10 test files genuinely fail and the
@@ -629,8 +640,9 @@ def test_h2_graph_selection_keeps_test_dependents_on_the_real_graph(
     own failure message carried. As originally written it asserted the defect: the
     graph lost reverse-dependents on 8 of 34 source modules, and on `db.py` -- imported
     exclusively as `from codelearner import db` -- it found *no* dependent file at all,
-    because `build_graph` credited the edge to `codelearner/__init__.py`. It now finds
-    29, including 11 test files.
+    because `build_graph` credited the edge to `codelearner/__init__.py`. It found 29
+    after that fix, and 37 -- every file the independent closure knows of, including all
+    11 test files -- once Defect 2's parcel-granular walk was fixed too.
 
     Kept rather than deleted, and still keyed on `db.py` specifically, because that
     file is the sharpest available probe: it is imported only via the form that broke,
@@ -701,11 +713,10 @@ def test_h2_graph_selection_keeps_test_dependents_on_the_real_graph(
         "a loss a false negative rather than merely an inefficiency."
     )
 
-    # `db.py` STILL under-approximates by ~8 non-test files, and that is expected:
-    # **Defect 2 is not fixed.** Only Defect 1 (the `ast.ImportFrom` misattribution)
-    # was. The parcel-granular BFS in `_reverse_dep_files` still severs file-level
-    # chains when the intermediate module is imported by-symbol, and those residual losses are
-    # its doing.
+    # `db.py` used to STILL under-approximate by 8 non-test files after Defect 1 was
+    # fixed -- Defect 2's doing: the then parcel-granular BFS severed file-level chains
+    # when the intermediate module was imported by-symbol. With the file-granular walk
+    # that residue is gone too (measured: 0 lost, on every one of the 34 modules).
     #
     # Asserted on the TEST-file subset rather than on the sweep as a whole on purpose.
     # An earlier version of this asserted `db not in lost` -- that no under-
@@ -714,17 +725,21 @@ def test_h2_graph_selection_keeps_test_dependents_on_the_real_graph(
     # failing test can go unselected, and the answer for `db.py` is now no.
     residual = lost.get(db, {}).get("all", [])
     _record("db_py_residual_defect2_losses", residual)
-    assert not lost.get(db, {}).get("test_files"), (
-        f"{db} is losing dependent test files again: {lost.get(db)}"
+    assert not residual, (
+        f"{db} is losing dependent files again: {lost.get(db)}. Post-Defect-2 the "
+        "graph must agree with the independent import closure exactly."
     )
     assert len(db_mine) >= 26 and len([m for m in db_mine if m in tests]) == len(tests), (
         f"expected db.py to be transitively imported by every test file; got "
         f"{len(db_mine)} dependents, {sorted(m for m in db_mine if m in tests)} tests"
     )
 
-    # Defect 2, traced rather than asserted from counts: the BFS from chunker.py
-    # touches only part of cli/commands.py, and server/app.py imports a different
-    # part -- so the file-level chain chunker -> commands -> app is severed.
+    # Defect 2, traced rather than asserted from counts. The PARCEL-granular walk
+    # replicated inline below still reaches only part of cli/commands.py, and
+    # server/app.py still imports a different part -- that is a property of the raw
+    # graph and has not changed. What changed is that `_reverse_dep_files` no longer
+    # walks that way: it expands at FILE granularity, so the chain
+    # chunker -> commands -> app holds and app.py IS selected.
     chunker = "codelearner/chunk/chunker.py"
     parcels = index_repo(scale.root)
     from swarmsync.classifier.graph import build_graph  # local: only Defect 2 needs it
@@ -770,11 +785,14 @@ def test_h2_graph_selection_keeps_test_dependents_on_the_real_graph(
         "chunker BFS reaches, so Defect 2 no longer manifests on this chain "
         f"(app needs {sorted(app_needs)}, BFS reached {sorted(commands_hit)})"
     )
-    assert "codelearner/server/app.py" not in gate._reverse_dep_files(
+    assert "codelearner/server/app.py" in gate._reverse_dep_files(
         scale.root, {chunker}
     ), (
-        "DEFECT 2 appears to be FIXED: server/app.py is now selected for a "
-        "chunker.py change. Invert this assertion."
+        "DEFECT 2 HAS REGRESSED: server/app.py is not a dependent of chunker.py, "
+        "though it imports cli/commands.py which imports chunker.py. The reverse-dep "
+        "walk has gone back to parcel granularity, which severs a file-level chain "
+        "whenever the intermediate module is imported by a symbol the walk did not "
+        "happen to reach."
     )
 
 
@@ -1080,25 +1098,33 @@ def test_h2_from_pkg_import_submodule_is_no_longer_a_gate_false_negative() -> No
     )
 
 
-def test_h2_defect2_parcel_granular_bfs_is_a_gate_false_negative() -> None:
-    """DEFECT 2, reproduced: the parcel-granular BFS severs a file-level chain and
-    the gate APPROVES an ordinary rename that breaks the suite.
+def test_h2_defect2_file_granular_bfs_keeps_the_chain() -> None:
+    """DEFECT 2, now fixed: the file-granular walk keeps a file-level chain intact and
+    the gate REJECTS an ordinary rename that breaks the suite.
 
-    No `from <pkg> import <submodule>` anywhere, and nothing raises -- `value` is
-    simply renamed, which is what `mutators.change_signature` and any real agent
-    do routinely. `mid.py` still fails to import, so `tests/test_alpha.py` errors
-    at collection; but `test_alpha` imports `b` from `mid`, and the BFS only ever
-    reached `mid.py::<module>`, so `test_alpha` is never selected.
+    **Inverted when the fix landed**, per the instruction this test's own failure
+    message carried. As written it reproduced the defect: the gate returned `ok=True`
+    while the suite was red, because the PARCEL-granular BFS reached only
+    `mid.py::<module>` and `tests/test_alpha.py` imports `b` from `mid` -- a symbol
+    off that chain -- so the test file was never selected.
 
-    Control: the identical repo where the test imports `a` -- the symbol that
-    actually sits on the reached chain -- must be REJECTED.
+    Nothing here needs an exotic import form and nothing raises: `value` is simply
+    renamed, which is what `mutators.change_signature` and any real agent do
+    routinely. `mid.py` then fails to import, so `tests/test_alpha.py` errors at
+    collection -- and the gate must run it.
+
+    The discrimination control is retained and still matters: the identical repo whose
+    test imports `a` -- the symbol that sat ON the parcel chain -- was rejected all
+    along. Both must now reject, and keeping both is what lets anyone tell a general
+    gate regression (both fail) from this specific defect returning (only the
+    off-chain form fails).
     """
     results: dict[str, dict[str, Any]] = {}
     for label, imported_symbol, call, expected in (
-        # `b` is NOT on the parcel chain the BFS walks, so the file-level
-        # dependency test_alpha -> mid -> core is lost.
+        # `b` is NOT on the parcel chain the old BFS walked, so the file-level
+        # dependency test_alpha -> mid -> core used to be lost.
         ("test_imports_off_chain_symbol", "b", "b() == 42", 42),
-        # `a` IS on it: same files, same rename, but the chain holds.
+        # `a` IS on it: same files, same rename, and the chain held even then.
         ("test_imports_on_chain_symbol", "a", "a() == 1", 1),
     ):
         with _synthetic_repo() as root:
@@ -1160,16 +1186,20 @@ def test_h2_defect2_parcel_granular_bfs_is_a_gate_false_negative() -> None:
             f"[{label}] the reproduction's premise failed: the rename must break "
             f"tests/test_alpha.py, got {result}"
         )
-    assert bad["graph_dependents"] == ["mid.py"], (
-        "the BFS was supposed to reach mid.py and stop there; it reached "
-        f"{bad['graph_dependents']}"
+    # `core.py` is in there because the changed files are returned too (a changed
+    # test file must run); `mid.py` is the direct dependent; `tests/test_alpha.py` is
+    # the one the parcel-granular walk used to lose.
+    assert bad["graph_dependents"] == ["core.py", "mid.py", "tests/test_alpha.py"], (
+        "the walk must reach mid.py AND, through every parcel of it, the test file "
+        f"that imports an off-chain symbol from it; it reached {bad['graph_dependents']}"
     )
     assert gate.DEFAULT_TEST_DIR not in bad["gate_selection"], (
         f"the gate fell back to the whole suite: {bad['gate_selection']}"
     )
-    assert bad["gate_ok"] is True, (
-        "DEFECT 2 appears to be FIXED: the gate now rejects a rename whose only "
-        f"dependent imports an off-chain symbol ({bad}). Invert this assertion."
+    assert bad["gate_ok"] is False, (
+        "DEFECT 2 HAS REGRESSED: the gate APPROVED a rename that breaks the suite, "
+        f"because the only dependent test imports an off-chain symbol ({bad}). The "
+        "reverse-dep walk is parcel-granular again."
     )
     assert control["gate_ok"] is False, (
         "the discrimination control failed: when the test imports the ON-chain "

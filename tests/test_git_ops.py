@@ -9,12 +9,19 @@ Done when:
 from __future__ import annotations
 
 
+import contextlib
 import logging
+import os
+import signal
 import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
 from swarmsync.worktree import git_ops
+
+SWARMSYNC_ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.fixture()
@@ -400,3 +407,234 @@ def test_remove_worktree_rmtrees_the_dir_when_git_remove_fails(repo, monkeypatch
     assert any("leaked" in rec.message or "rmtree" in rec.message for rec in caplog.records), (
         "a silent fallback is nearly as bad as the leak -- it must be observable"
     )
+
+
+# --- WP4.7: a SIGKILLed agent's worktree (the H6a leak) -----------------------------
+#
+# These need a REAL, separate OS process: the mechanism under test is that the
+# kernel releases the worktree's `flock` when its owner dies however it died, and a
+# thread cannot be SIGKILLed (killing it would take this test process with it).
+# `sys.path` is prepended rather than relying on the install so the child imports
+# THIS tree.
+
+ORPHAN_SENTINEL = "PARTIAL-EDIT-FROM-A-PROCESS-ABOUT-TO-BE-SIGKILLED"
+
+_OWNER_PROCESS = f"""
+import sys, time
+sys.path.insert(0, {str(SWARMSYNC_ROOT)!r})
+from pathlib import Path
+from swarmsync.worktree import git_ops
+repo, name, base = sys.argv[1:4]
+worktree = git_ops.add_worktree(repo, name, base)
+(Path(worktree) / "fileA.txt").write_text({ORPHAN_SENTINEL!r} + "\\n")
+print("ready", flush=True)
+time.sleep(600)  # only the parent's SIGKILL ends this process
+"""
+
+
+@contextlib.contextmanager
+def _worktree_owner(repo, name: str, base: str):
+    """A real child process that creates `.worktrees/<name>`, leaves genuinely
+    uncommitted work in it, and then hangs until it is killed."""
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _OWNER_PROCESS, str(repo), name, base],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        assert proc.stdout is not None
+        first = proc.stdout.readline().strip()
+        assert first == "ready", (
+            f"the owner process never created its worktree: {first!r}"
+            f"{proc.stdout.read()}"
+        )
+        yield proc
+    finally:
+        if proc.poll() is None:
+            with contextlib.suppress(OSError):
+                os.kill(proc.pid, signal.SIGKILL)
+        with contextlib.suppress(Exception):
+            proc.wait(timeout=15)
+        with contextlib.suppress(Exception):
+            proc.stdout.close()  # type: ignore[union-attr]
+
+
+def _parked_refs(repo, name: str) -> list[str]:
+    out = git_ops._run(
+        ["git", "for-each-ref", "--format=%(refname:short)", f"refs/heads/rejected/{name}-*"],
+        cwd=repo,
+    ).stdout
+    return [line for line in out.splitlines() if line.strip()]
+
+
+def test_orphan_worktree_of_a_dead_process_is_reclaimed_under_a_different_name(repo):
+    """THE H6a leak. A SIGKILLed agent left `.worktrees/<agent>` behind forever:
+    the reaper only touches `leases`, the dead process ran no `finally`, and the one
+    mechanism that removes a worktree -- `add_worktree`'s S5 prune -- matches the
+    SAME name, while the broker retries under `{task}-attempt-{n+1}`. Measured at
+    scale: 540 KiB survived the reap AND the reassignment, still in `git worktree
+    list`. So the next agent to start in this repo must reclaim it -- and must not
+    destroy the uncommitted work it held while doing so."""
+    r, base = repo
+    dead = "task7-attempt-1"
+    orphan = r / ".worktrees" / dead
+
+    with _worktree_owner(r, dead, base) as proc:
+        assert orphan.is_dir()
+        assert ORPHAN_SENTINEL in (orphan / "fileA.txt").read_text()
+        assert git_ops._run(
+            ["git", "status", "--porcelain"], cwd=orphan
+        ).stdout.splitlines() == [" M fileA.txt"], "the work is not genuinely uncommitted"
+        assert str(orphan) in git_ops._run(
+            ["git", "worktree", "list", "--porcelain"], cwd=r
+        ).stdout
+        leaked_bytes = sum(
+            f.stat().st_size for f in orphan.rglob("*") if f.is_file()
+        )
+        os.kill(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=15)
+
+    # The retry: a DIFFERENT agent id, which is exactly why the S5 prune never fired.
+    survivor = git_ops.add_worktree(r, "task7-attempt-2", base)
+
+    assert not orphan.exists(), (
+        f"the dead agent's worktree survived the next agent's start "
+        f"({leaked_bytes} bytes) -- the H6a leak is back"
+    )
+    assert str(orphan) not in git_ops._run(
+        ["git", "worktree", "list", "--porcelain"], cwd=r
+    ).stdout, "still registered with git"
+    assert survivor.is_dir(), "the sweep must not disturb the worktree being created"
+
+    # ...and the uncommitted work is still RECOVERABLE, not destroyed: committed onto
+    # the orphan's branch and parked under `rejected/*`, which pruning never touches.
+    parked = _parked_refs(r, dead)
+    assert len(parked) == 1, parked
+    recovered = git_ops._run(["git", "show", f"{parked[0]}:fileA.txt"], cwd=r).stdout
+    assert ORPHAN_SENTINEL in recovered, "the partial edit was DESTROYED, not preserved"
+    # The original branch is dropped only because the parked ref now holds it.
+    assert git_ops._run(["git", "branch", "--list", dead], cwd=r).stdout.strip() == ""
+
+
+def test_sweep_never_touches_a_worktree_whose_owner_is_still_alive(repo):
+    """The dangerous direction. Over-deletion here destroys a live agent's
+    uncommitted work, so liveness must be the kernel's answer (an unheld `flock`),
+    never a TTL, an mtime or an age: an agent whose heartbeat merely lapsed, or that
+    is parked in an unbounded gate run, is still very much alive."""
+    r, base = repo
+    live_name = "still-working"
+    live_worktree = r / ".worktrees" / live_name
+
+    with _worktree_owner(r, live_name, base) as proc:
+        git_ops.add_worktree(r, "someone-else", base)
+        assert proc.poll() is None, "the owner died on its own; this proves nothing"
+        assert live_worktree.is_dir(), "a LIVE agent's worktree was deleted"
+        assert ORPHAN_SENTINEL in (live_worktree / "fileA.txt").read_text(), (
+            "a live agent's uncommitted work was destroyed"
+        )
+        assert str(live_worktree) in git_ops._run(
+            ["git", "worktree", "list", "--porcelain"], cwd=r
+        ).stdout
+        assert _parked_refs(r, live_name) == [], (
+            "a live agent's branch was parked/rewritten under it"
+        )
+
+
+def test_sweep_never_touches_a_worktree_this_process_owns(repo):
+    """Same guard, in-process: the broker creates a whole wave of worktrees from one
+    process, and each `add_worktree` sweeps. `flock` is per open file DESCRIPTION, so
+    a process's own lock is honored against its own probe -- the sibling that is
+    mid-edit must survive its neighbours starting."""
+    r, base = repo
+    mine = git_ops.add_worktree(r, "wave-sibling-a", base)
+    (mine / "fileA.txt").write_text("uncommitted-in-a-live-sibling\n")
+    git_ops.add_worktree(r, "wave-sibling-b", base)
+    assert mine.is_dir()
+    assert (mine / "fileA.txt").read_text() == "uncommitted-in-a-live-sibling\n"
+
+
+def test_sweep_never_touches_a_worktree_it_did_not_create(repo):
+    """No ownership lock file -> not ours to delete. This covers a worktree made by
+    hand (`git worktree add`), one left by a swarm-sync older than this mechanism,
+    and a repo whose `.git` is a FILE (a linked worktree) where no lock can be
+    written at all. Conservative on purpose: the cost is a leaked directory, the
+    cost of guessing wrong is someone's work."""
+    r, base = repo
+    name = "not-ours"
+    handmade = git_ops.add_worktree(r, name, base)
+    (handmade / "fileA.txt").write_text("work-in-an-unowned-worktree\n")
+    # Exactly the state a pre-WP4.7 (or hand-made) worktree is in: dir present, no
+    # lock file, nobody in this process holding anything for it.
+    git_ops._release_worktree_lock(r, name, unlink=True)
+    assert git_ops._worktree_lock_path(r, name) is not None
+    assert not git_ops._worktree_lock_path(r, name).exists()  # type: ignore[union-attr]
+
+    git_ops.add_worktree(r, "a-new-agent", base)
+
+    assert handmade.is_dir(), "a worktree with no ownership lock was swept anyway"
+    assert (handmade / "fileA.txt").read_text() == "work-in-an-unowned-worktree\n"
+
+
+def test_orphan_is_left_alone_when_its_work_cannot_be_preserved(repo, monkeypatch, caplog):
+    """If the preserving commit fails, the bytes on disk are the ONLY copy of that
+    work. Leaking a directory then beats deleting it, and the choice must be
+    observable rather than silent."""
+    r, base = repo
+    dead = "unpreservable"
+    orphan = r / ".worktrees" / dead
+
+    with _worktree_owner(r, dead, base) as proc:
+        os.kill(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=15)
+
+    def refuse_commit(*args, **kwargs):
+        raise git_ops.GitOpsError("simulated: index.lock contention")
+
+    monkeypatch.setattr(git_ops, "commit_all", refuse_commit)
+    with caplog.at_level(logging.WARNING):
+        git_ops.add_worktree(r, "next-agent", base)
+
+    assert orphan.is_dir(), "the only copy of the work was deleted"
+    assert ORPHAN_SENTINEL in (orphan / "fileA.txt").read_text()
+    assert any("only copy" in rec.message for rec in caplog.records), [
+        rec.message for rec in caplog.records
+    ]
+
+
+def test_orphan_branch_is_never_deleted_unless_it_was_parked_first(repo, monkeypatch):
+    """The invariant behind `delete_branch=parked is not None`: the sweep may drop the
+    orphan's branch ONLY because `rejected/<name>-<ts>` now points at the same commits.
+    If parking fails, the branch is the last reference and must survive."""
+    r, base = repo
+    dead = "unparkable"
+    with _worktree_owner(r, dead, base) as proc:
+        os.kill(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=15)
+
+    def refuse_park(*args, **kwargs):
+        raise git_ops.GitOpsError("simulated: cannot create the parked ref")
+
+    monkeypatch.setattr(git_ops, "park_branch", refuse_park)
+    git_ops.add_worktree(r, "next-agent", base)
+
+    assert not (r / ".worktrees" / dead).exists(), "the directory is still reclaimable"
+    assert _parked_refs(r, dead) == []
+    assert git_ops._run(["git", "branch", "--list", dead], cwd=r).stdout.strip() != "", (
+        "the sweep deleted the LAST reference to the orphan's commits"
+    )
+    recovered = git_ops._run(["git", "show", f"{dead}:fileA.txt"], cwd=r).stdout
+    assert ORPHAN_SENTINEL in recovered
+
+
+def test_orphan_sweep_is_reported_and_returns_what_it_reclaimed(repo):
+    """`prune_orphan_worktrees` is public (an operator/`doctor` may want to call it),
+    so it reports what it did rather than sweeping silently."""
+    r, base = repo
+    dead = "reported-orphan"
+    with _worktree_owner(r, dead, base) as proc:
+        os.kill(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=15)
+
+    assert git_ops.prune_orphan_worktrees(r) == [dead]
+    assert git_ops.prune_orphan_worktrees(r) == [], "not idempotent"

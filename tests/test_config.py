@@ -41,6 +41,7 @@ def _clean_env(monkeypatch):
         config.TOKEN_ENV,
         config.ROOTS_ENV,
         config.GATE_TIMEOUT_ENV,
+        config.GATE_PYTHON_ENV,
         config.LEASE_TTL_ENV,
         config.ACTIVE_ENV,
         config.URL_ENV,
@@ -118,6 +119,31 @@ def test_gate_timeout_garbage_and_non_positive_fall_back(monkeypatch, junk):
     to the default -- the unification must preserve every one of them."""
     monkeypatch.setenv(config.GATE_TIMEOUT_ENV, junk)
     assert config.gate_timeout() == config.DEFAULT_GATE_TIMEOUT_SECONDS
+
+
+# --- gate_python: the raw interpreter override --------------------------------------
+
+
+def test_gate_python_is_none_unless_set(monkeypatch):
+    """Unset means "no override" -- `coordinator.gate` supplies the default
+    (`sys.executable`), because the default is the running interpreter and cannot
+    be a constant here."""
+    assert config.gate_python() is None
+    monkeypatch.setenv(config.GATE_PYTHON_ENV, "/opt/py312/bin/python")
+    assert config.gate_python() == "/opt/py312/bin/python"
+
+
+@pytest.mark.parametrize("blank", ["", " ", "\t", "\n"])
+def test_gate_python_blank_counts_as_unset(monkeypatch, blank):
+    """A blank override must read as unset, not as an interpreter named "".
+
+    `SWARMSYNC_GATE_PYTHON=` in a shell profile or a CI `env:` block is an
+    ordinary way to spell "leave it alone". Returned literally, it would become
+    `Popen([""])` -- an OSError on every single gate run, i.e. every merge
+    rejected for a reason that has nothing to do with the branch.
+    """
+    monkeypatch.setenv(config.GATE_PYTHON_ENV, blank)
+    assert config.gate_python() is None
 
 
 # --- roots + set_roots -------------------------------------------------------------

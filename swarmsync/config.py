@@ -58,6 +58,7 @@ def require_python() -> None:
 TOKEN_ENV = "SWARMSYNC_TOKEN"
 ROOTS_ENV = "SWARMSYNC_ROOTS"
 GATE_TIMEOUT_ENV = "SWARMSYNC_GATE_TIMEOUT"
+GATE_PYTHON_ENV = "SWARMSYNC_GATE_PYTHON"
 LEASE_TTL_ENV = "SWARMSYNC_LEASE_TTL"
 ACTIVE_ENV = "SWARMSYNC_ACTIVE"
 URL_ENV = "SWARMSYNC_URL"
@@ -168,6 +169,34 @@ def gate_timeout() -> float:
     except ValueError:
         return DEFAULT_GATE_TIMEOUT_SECONDS
     return value if value > 0 else DEFAULT_GATE_TIMEOUT_SECONDS
+
+
+def gate_python() -> Optional[str]:
+    """`SWARMSYNC_GATE_PYTHON`: interpreter the pytest gate spawns, or None if unset.
+
+    Default (None): the gate falls back to `sys.executable` -- the interpreter
+    running swarm-sync itself -- which is what it hardcoded before this knob
+    existed. That default only works when the repo under test happens to share
+    swarm-sync's interpreter AND its installed dependencies. It very often does
+    not: a repo that requires 3.12, or needs `tree-sitter`/`sqlite-vec` that
+    swarm-sync's venv has never heard of, makes EVERY gate run fail for
+    environment reasons. That failure mode is worse than an inconvenience,
+    because a gate that rejects every merge for the same reason it would reject a
+    genuinely broken one makes "trunk stayed green" vacuously true -- the gate
+    looks like it is working while testing nothing. Point this at the target
+    repo's own venv python and the gate tests the repo instead of the harness.
+
+    Deliberately RAW (like `lease_ttl()` / `token()`), for one reason: the
+    default is not a constant, it is *whatever interpreter is running*, and
+    `coordinator.gate` must resolve it through its own `sys` at call time (see
+    `gate.resolve_python`). Empty/whitespace-only values are treated as unset --
+    an empty override would otherwise hand `subprocess.Popen` an empty argv[0]
+    and turn a typo into a hard failure of every merge.
+    """
+    raw = os.environ.get(GATE_PYTHON_ENV)
+    if raw is None or not raw.strip():
+        return None
+    return raw
 
 
 def lease_ttl() -> Optional[str]:

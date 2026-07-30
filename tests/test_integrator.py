@@ -564,6 +564,152 @@ def test_gate_timeout_is_configurable_and_falls_back_to_the_default():
         del os.environ["SWARMSYNC_GATE_TIMEOUT"]
 
 
+def test_impact_selection_runs_a_CHANGED_test_file_itself(repo):
+    """An edited test file is affected by its own edit, so the gate must run it.
+
+    Nothing else selects it here, which is the point:
+      * the substring backstop looks for the changed file's stem in a test's TEXT,
+        and `tests/test_c.py` never spells "test_c" (asserted below, so this stays
+        a real gap and not an accident of this fixture);
+      * nothing IMPORTS a test file, so no reverse-dependency edge reaches it;
+      * and the change set also contains `mod_a.py`, whose own selection is
+        non-empty -- so the full-suite fallback never fires to cover the gap.
+    `_reverse_dep_files` therefore returns the changed files themselves. The walk
+    used to reach a changed test file only if it happened to have an intra-file
+    call edge, which is not something a gate should depend on.
+    """
+    r, _base = repo
+    text = (r / "tests" / "test_c.py").read_text(encoding="utf-8")
+    assert "test_c" not in text, (
+        "tests/test_c.py now spells its own stem, so the substring backstop covers "
+        "it and this test no longer isolates the graph rule"
+    )
+
+    affected = integrator._reverse_dep_files(r, {"mod_a.py", "tests/test_c.py"})
+    assert "tests/test_c.py" in affected, affected
+
+    ok, log = integrator.run_impact_tests(r, ["mod_a.py", "tests/test_c.py"])
+    assert ok is True, log
+    # test_a.py (substring: it names mod_a) + test_c.py (the changed file itself),
+    # and NOT test_b.py -- so this is a genuine subset, not a full-suite fallback.
+    assert "2 passed" in log, log
+
+
+# --- the gate's INTERPRETER: SWARMSYNC_GATE_PYTHON ---------------------------------
+#
+# The gate used to hardcode `sys.executable`, so it could only ever gate a repo that
+# shares swarm-sync's own interpreter AND its installed dependencies. A repo needing a
+# different Python version, or a dependency swarm-sync's venv has never heard of, failed
+# the gate for environment reasons on EVERY merge -- and that failure is
+# indistinguishable, from the outside, from a gate that works: nothing lands, so trunk
+# trivially "stays green" while being tested by nothing.
+
+
+def _fake_interpreter(path, argv_log, exit_code):
+    """An executable that records its argv and exits `exit_code`, standing in for a
+    python. Not a real interpreter on purpose: what is under test is WHICH program the
+    gate spawns, and a second real python on the box is neither guaranteed to exist nor
+    able to prove the difference."""
+    path.write_text(
+        f'#!/bin/sh\nprintf "%s\\n" "$0" "$@" > {argv_log}\nexit {exit_code}\n',
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+    return path
+
+
+def test_gate_python_is_configurable_and_falls_back_to_this_interpreter(monkeypatch):
+    """`SWARMSYNC_GATE_PYTHON` overrides the gate's interpreter; unset (or blank) is
+    swarm-sync's own, which is the pre-knob behaviour exactly."""
+    monkeypatch.delenv("SWARMSYNC_GATE_PYTHON", raising=False)
+    assert integrator.resolve_python() == sys.executable
+    monkeypatch.setenv("SWARMSYNC_GATE_PYTHON", "/opt/py312/bin/python")
+    assert integrator.resolve_python() == "/opt/py312/bin/python"
+    for blank in ("", "   "):
+        monkeypatch.setenv("SWARMSYNC_GATE_PYTHON", blank)
+        assert integrator.resolve_python() == sys.executable, blank
+
+
+def test_the_gate_really_spawns_the_configured_interpreter(repo, tmp_path, monkeypatch):
+    """The knob has to reach the actual subprocess, not just an accessor.
+
+    Proven two ways at once, because either alone is weak: the fake interpreter
+    records the argv it was called with (so we know it ran, with the gate's own
+    pytest flags and selection), and it exits non-zero (so the VERDICT changes).
+    The control below runs the identical call with the knob unset, where the real
+    pytest passes -- so `ok=False` here can only have come from the configured
+    interpreter.
+    """
+    r, _base = repo
+    argv_log = tmp_path / "argv.txt"
+    fake = _fake_interpreter(tmp_path / "fake-python", argv_log, exit_code=1)
+
+    monkeypatch.setenv("SWARMSYNC_GATE_PYTHON", str(fake))
+    ok, _log = integrator.run_impact_tests(r, ["mod_a.py"])
+
+    assert argv_log.exists(), (
+        "the gate never executed the configured interpreter -- SWARMSYNC_GATE_PYTHON "
+        "is being ignored and the gate is still hardcoded to its own python"
+    )
+    recorded = argv_log.read_text(encoding="utf-8").split()
+    assert recorded[0] == str(fake), recorded
+    assert recorded[1:3] == ["-m", "pytest"], recorded
+    assert "tests/test_a.py" in recorded, (
+        f"the gate's real impact selection did not reach the override: {recorded}"
+    )
+    assert ok is False, "the configured interpreter's exit code must decide the verdict"
+
+    # Control: same repo, same change, knob unset -> the real pytest runs and passes.
+    monkeypatch.delenv("SWARMSYNC_GATE_PYTHON")
+    control_ok, control_log = integrator.run_impact_tests(r, ["mod_a.py"])
+    assert control_ok is True, (
+        "the control failed: this repo's tests must pass under swarm-sync's own "
+        f"interpreter, or the ok=False above proves nothing.\n{control_log}"
+    )
+
+
+def test_a_blank_gate_python_does_not_break_the_gate(repo, monkeypatch):
+    """`SWARMSYNC_GATE_PYTHON=` (set but empty) must behave as unset.
+
+    The plausible wrong spelling of this knob is
+    `os.environ.get(ENV, sys.executable)`, which hands `Popen` an empty argv[0] --
+    every merge then fails on an OSError that has nothing to do with the branch.
+    """
+    r, _base = repo
+    monkeypatch.setenv("SWARMSYNC_GATE_PYTHON", "")
+    ok, log = integrator.run_impact_tests(r, ["mod_a.py"])
+    assert ok is True, f"a blank interpreter override broke the gate:\n{log}"
+
+
+def test_an_unusable_gate_python_is_a_rejection_naming_the_knob(repo, tmp_path, monkeypatch):
+    """A typo'd/deleted interpreter must reject with the reason NAMED -- not crash,
+    and above all not silently fall back to swarm-sync's own python.
+
+    Two failure modes this pins, both of which a naive fix walks into:
+      * falling back to `sys.executable` when the configured path is unusable --
+        the gate would go green here by testing with the wrong environment, which
+        is the exact vacuous-green outcome the knob exists to prevent;
+      * letting `OSError` escape `run_impact_tests`, which surfaces inside
+        `integrate` while it holds the ONE global integrate lock, with an un-gated
+        merge already on trunk.
+    """
+    r, _base = repo
+    missing = tmp_path / "no-such-venv" / "bin" / "python"
+    monkeypatch.setenv("SWARMSYNC_GATE_PYTHON", str(missing))
+
+    ok, log = integrator.run_impact_tests(r, ["mod_a.py"])
+
+    assert ok is False, (
+        "an interpreter that cannot be executed must be a gate FAILURE; a green "
+        "verdict here means the gate quietly tested with a different python than "
+        "the operator configured"
+    )
+    assert "SWARMSYNC_GATE_PYTHON" in log and str(missing) in log, (
+        f"the rejection must name the knob and the bad value, or the operator gets "
+        f"a wall of rejected merges with no cause: {log!r}"
+    )
+
+
 # --- R3 P1-5: rolling back trunk must roll back the blackboard too -----------------
 
 

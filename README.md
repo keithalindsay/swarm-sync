@@ -33,7 +33,7 @@ designed, measured, and decided not to build.
 ## Status
 
 A working prototype and a local developer tool — not a hosted service. The engineering is
-deliberately thorough: **581 tests** (run 3× with zero flakes), `ruff` + `mypy` clean, and five
+deliberately thorough: **605 tests** (run 3× with zero flakes), `ruff` + `mypy` clean, and five
 review-gated hardening phases — correctness, resource bounds, architecture consolidation, and an
 operator surface (`swarmsync status`/`holds`/`free`/`doctor`). Every fix carries a test that fails
 when the fix is removed, and the architecture pass was adversarially reviewed before it merged.
@@ -266,7 +266,8 @@ no-op and every edit is allowed, so installing the hooks never interferes with o
 
 **4 — Confirm, then run your agents.** `swarmsync doctor` checks the whole setup end to end (server
 reachable, root matches the cwd's git toplevel, marker present and fresh, hooks wired, DB writable,
-version match) and prints a remedy for each check that fails. Then that's it: edits to free files
+version match, and that the gate's interpreter can actually collect this repo's tests — see
+`SWARMSYNC_GATE_PYTHON`) and prints a remedy for each check that fails. Then that's it: edits to free files
 proceed silently; edits to a file another agent holds are denied with the message above until it's
 released.
 
@@ -330,7 +331,7 @@ following the wrong one was a silent fail-open, so it's gone.
 ## Configuration
 
 Every knob is optional and every default is sane, so nothing here is required to run swarm-sync. The
-full reference — all twelve `SWARMSYNC_*` environment variables, `swarmsync-serve`'s flags, the
+full reference — all thirteen `SWARMSYNC_*` environment variables, `swarmsync-serve`'s flags, the
 `swarmsync` CLI's flags, and the raw Claude Code hook block — is in
 [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md). Two properties hold across all of it: a garbage
 value falls back to the default rather than crashing (a typo must never take the blackboard down or

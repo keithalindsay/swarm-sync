@@ -297,7 +297,11 @@ def run_agent(
     still propagate. This covers IN-PROCESS exceptions only, and deliberately
     does not change the crash-recovery story: a SIGKILLed agent process has
     nothing to run an except path, so its leases still leak until TTL expiry /
-    the reaper reclaims them (DESIGN §6) -- that remains by design.
+    the reaper reclaims them (DESIGN §6) -- that remains by design. Its WORKTREE
+    is likewise not cleaned by this call (there is no `finally` to run); it is
+    reclaimed by the next agent to call `git_ops.add_worktree` in this repo,
+    whose `prune_orphan_worktrees` pass detects the dead owner and preserves the
+    partial edit under `rejected/*` before removing the checkout (WP4.7).
     """
     mutator_kwargs = mutator_kwargs or {}
     repo = Path(repo)

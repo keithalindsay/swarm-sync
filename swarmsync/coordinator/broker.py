@@ -78,6 +78,35 @@ Design notes (this unit's own decisions):
   separate, later step -- see `coordinator/integrator.py`'s own docstring --
   since only a genuinely landed before/after `type_hash` diff is trustworthy
   (DESIGN §5.4/§6 "lying blackboard").
+- **`contract_aware=True` is likewise INERT at file granularity, and it was
+  never an ordering promise.** DESIGN §5.3 names *both* mechanisms that test
+  `pid in frozen_ids` as switched off by file granularity: the lease upgrade
+  above and `co_schedulable`'s frozen clause, which is the only thing
+  `contract_aware` (and therefore `load_scheduling_graph`'s `frozen_ids`)
+  feeds. Measured on a real 45-file/567-parcel repo post-#22: 94 frozen
+  contracts, all `function`/`class` parcels, ZERO `<module>` parcels, and
+  across all 990 module-parcel pairs the frozen clause changed the
+  co-schedulability answer 0 times. So a contract change and a dependent in
+  ANOTHER file are co-scheduled into the SAME wave; a dependent in the SAME
+  file separates only because the two tasks share one whole-file lock (§5.2)
+  -- a lock consequence, not contract awareness. Both are pinned by tests
+  (`tests/test_broker.py`, `tests/scale/test_contracts_and_crash.py::
+  test_h5_a_cross_file_dependent_is_NOT_ordered_after_the_contract_change`).
+  Do NOT "fix" this by lifting `frozen_ids`/`reverse_edges` to file
+  granularity to make the clause fire. It cannot buy the ordering it looks
+  like it would: `co_schedulable` is a SYMMETRIC parallel-safety relation
+  (DESIGN §3) and `group_schedulable` is a greedy input-order partition, so
+  the most it can express is "not in the same wave" -- *which* wave each task
+  lands in follows the caller's task order, not the dependency direction, so
+  a dependent listed first is scheduled BEFORE the contract change (measured).
+  Ordering would need a topological scheduler, which is a different design.
+  Meanwhile the cost is real: on that same repo, a fully file-lifted clause
+  turned ONE wave of 34 file-disjoint tasks into SIX (14/8/6/3/2/1) -- work
+  that cannot collide, serialized for no guarantee. The honest statement of
+  what ships is README's guarantees table: a landed signature change is
+  *detected and announced*; it does not *prevent* an in-flight dependent from
+  having built against the old signature (DESIGN §5.3's own "weaker
+  guarantee" paragraph).
 - **`/integrate` is not internally locked** (server/app.py's own docstring:
   "whatever submits branches... must call this one branch at a time").
   `run_agent` calls it as the very last step of every successful edit, so
@@ -220,6 +249,13 @@ def load_scheduling_graph(conn: sqlite3.Connection, repo: StrPath) -> tuple[DepG
     kept separate from `classifier.store.run_index` (which also re-parses
     every file and re-upserts everything) since the broker just needs a
     schedulability answer, not a re-index.
+
+    `frozen_ids` is the `contracts.symbol` set, i.e. *symbol* parcel ids
+    (`extract_contracts` only emits `function`/`class` parcels). At file
+    granularity every task resolves to a `<module>` parcel instead, so the
+    clause this feeds cannot fire -- DESIGN §5.3, and this module's own
+    `contract_aware` design note. Returned anyway: it is what the parked
+    mechanism is scheduled against, and `_run_task_once` reuses the SAME set.
     """
     rows = conn.execute("SELECT * FROM parcels").fetchall()
     parcels = [Parcel.model_validate(dict(r)) for r in rows]
@@ -510,6 +546,15 @@ def run(
        before the next one starts.
     3. Merges are serialized regardless of wave concurrency -- see
        `_SerializingIntegrateClient`.
+
+    `contract_aware` (default True) loads the scheduling graph + frozen-contract
+    set and passes them to `group_schedulable`/`_run_task_once`. At the file
+    granularity this ships with, it changes NO scheduling decision and NO lease
+    mode -- both mechanisms key on `pid in frozen_ids`, which a `<module>`
+    target never satisfies (DESIGN §5.3; this module's `contract_aware` design
+    note has the measurements and the reason ordering was never on offer). It
+    is left on by default so the parked mechanism stays exercised end-to-end;
+    `contract_aware=False` only skips the `load_scheduling_graph` work.
 
     `db_path` (WP4.6, A7): when given, each worker task runs on its OWN
     `db.connect(db_path)` connection (opened at task start, closed in a

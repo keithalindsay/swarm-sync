@@ -110,6 +110,7 @@ DEFAULT_TEST_DIR = gate.DEFAULT_TEST_DIR
 DEFAULT_GATE_TIMEOUT_SECONDS = gate.DEFAULT_GATE_TIMEOUT_SECONDS
 run_impact_tests = gate.run_impact_tests
 _gate_timeout = gate._gate_timeout
+resolve_python = gate.resolve_python
 _kill_process_group = gate._kill_process_group
 _close_streams = gate._close_streams
 _reverse_dep_files = gate._reverse_dep_files

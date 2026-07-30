@@ -6,6 +6,19 @@ table: heartbeats stop -> the reaper marks the lease `reaped` once its
 event and reassigns the task; the orphan worktree branch never reached trunk
 (merges are gated, U10), so nothing partial poisons the integration branch.
 
+This module deliberately owns NO filesystem state -- it holds a `sqlite3`
+connection and nothing else, not even a repo path. That is not an oversight, and
+WP4.7 explicitly re-decided it rather than hanging worktree cleanup off `reap_once`:
+a reaped lease does NOT imply a dead process. Reaping is a TTL judgement, and the
+runner's own heartbeat path logs "beat lost; the reaper may reclaim the lease" and
+KEEPS WORKING -- so an agent whose beat was delayed (loaded machine, a gate run
+past its TTL) can be alive and mid-edit with a reaped lease. If this loop deleted
+`.worktrees/<agent_id>` on that signal it would destroy that agent's uncommitted
+work, and it would do so on a timer, in the background, with nothing to notice.
+Worktree reclamation therefore lives in `worktree/git_ops.prune_orphan_worktrees`,
+where liveness is the kernel's answer (an unheld `flock`, released only on actual
+process death) instead of an inference from a timestamp -- see DESIGN §6.
+
 Correctness note (carried over from U5/U6's handoff): `leases.acquire`'s CAS
 already treats an expired lease (`ttl_expires_at <= now`) as not-active via lazy
 expiry, so a fresh agent can re-acquire a dead agent's parcel *without* the

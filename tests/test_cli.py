@@ -418,6 +418,53 @@ def test_doctor_hooks_and_marker_pass_after_init(git_repo):
     assert _check(text, "in a git repo") == "ok"
 
 
+_GATE_INTERPRETER_CHECK = "gate interpreter can collect this repo's tests"
+
+
+def test_doctor_flags_a_gate_interpreter_that_cannot_import_the_repos_tests(git_repo):
+    """The setup-time answer to "why is every merge being rejected?".
+
+    The gate runs `<interpreter> -m pytest` in the repo, so an interpreter without
+    the repo's test dependencies fails EVERY gate run for a reason that has
+    nothing to do with the branch -- while the coordinator still looks healthy,
+    because nothing merging means trunk trivially "stays green". Here the repo's
+    test imports a module no interpreter has, which is that situation in
+    miniature; the control below is the same repo with an importable test, so the
+    FAIL cannot be a check that just always fails.
+    """
+    tests = git_repo / "tests"
+    tests.mkdir()
+    ok_test = tests / "test_ok.py"
+    ok_test.write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+
+    _, text = _cli(["--url", "http://127.0.0.1:9", "--timeout", "1", "doctor"])
+    assert _check(text, _GATE_INTERPRETER_CHECK) == "ok", text
+
+    ok_test.write_text(
+        "import swarmsync_no_such_dependency_xyz\n\n\ndef test_ok():\n    assert True\n",
+        encoding="utf-8",
+    )
+    code, text = _cli(["--url", "http://127.0.0.1:9", "--timeout", "1", "doctor"])
+    assert _check(text, _GATE_INTERPRETER_CHECK) == "FAIL", text
+    assert code != 0
+    line = next(ln for ln in text.splitlines() if _GATE_INTERPRETER_CHECK in ln)
+    assert "SWARMSYNC_GATE_PYTHON" in line, line
+
+
+def test_doctor_flags_a_gate_interpreter_it_cannot_even_execute(git_repo, monkeypatch):
+    """A typo'd `SWARMSYNC_GATE_PYTHON` must be reported here, not discovered as a
+    wall of rejected merges (and must not raise out of doctor)."""
+    missing = git_repo / "no-such-venv" / "bin" / "python"
+    monkeypatch.setenv("SWARMSYNC_GATE_PYTHON", str(missing))
+
+    code, text = _cli(["--url", "http://127.0.0.1:9", "--timeout", "1", "doctor"])
+
+    assert _check(text, _GATE_INTERPRETER_CHECK) == "FAIL", text
+    assert code != 0
+    line = next(ln for ln in text.splitlines() if _GATE_INTERPRETER_CHECK in ln)
+    assert "cannot execute" in line and str(missing) in line, line
+
+
 def test_doctor_flags_a_non_git_cwd(tmp_path, monkeypatch):
     plain = tmp_path / "not-a-repo"
     plain.mkdir()

@@ -31,6 +31,7 @@ import swarmsync
 from swarmsync import __version__, config, repolock
 from swarmsync.agent.client import BlackboardClient, BlackboardUnreachable
 from swarmsync.blackboard import parcel_id
+from swarmsync.coordinator import gate
 
 # Poll cadence for `events --follow`. Deliberately not a knob: the loop is a
 # convenience tail, not a low-latency stream (the blackboard is not a bus).
@@ -462,6 +463,92 @@ def _add_repo_lock_check(
     )
 
 
+_GATE_COLLECT_TIMEOUT_SECONDS = 120.0
+
+
+def _gate_interpreter_check(toplevel: Path) -> tuple[str, bool, str]:
+    """Can the gate's interpreter even IMPORT this repo's test suite?
+
+    The integrator gates every merge by running `<interpreter> -m pytest` in this
+    repo (`coordinator/gate.py`), where the interpreter is `SWARMSYNC_GATE_PYTHON`
+    or, unset, swarm-sync's own. If that interpreter is the wrong Python version
+    for the repo, or simply lacks the repo's test dependencies, EVERY gate run
+    fails for environment reasons -- and the operator sees a wall of rejected
+    merges with pytest import errors in each `test_log`, never a statement that
+    the setup is wrong. Worse, the coordinator still looks healthy: nothing ever
+    lands, so trunk trivially "stays green" while being tested by nothing. This
+    check is here to make that a setup-time answer instead.
+
+    Deliberately the gate's own command, minus the actual running of tests:
+    `--collect-only` with the gate's flags imports every conftest and test module
+    (and through them the repo under test), which is exactly the step that fails
+    on a wrong interpreter -- so a pass here means the gate's imports work, not
+    merely that some python exists at that path. It is the one doctor check that
+    costs real time (a collect of the repo's suite, bounded at
+    `_GATE_COLLECT_TIMEOUT_SECONDS`); everything else here is local and instant.
+
+    pytest's exit 5 ("no tests collected") is a PASS with a note, matching the
+    gate's own verdict that nothing to gate on is not a rejection reason.
+    """
+    python = gate.resolve_python()
+    configured = config.gate_python()
+    source = (
+        f"{config.GATE_PYTHON_ENV}={python}"
+        if configured
+        else f"{python} (swarm-sync's own; set {config.GATE_PYTHON_ENV} to override)"
+    )
+    cmd = [
+        python,
+        "-m",
+        "pytest",
+        "-q",
+        "--collect-only",
+        "-p",
+        "no:cacheprovider",
+        "--import-mode=importlib",
+    ]
+    if (toplevel / gate.DEFAULT_TEST_DIR).is_dir():
+        cmd.append(gate.DEFAULT_TEST_DIR)
+    label = "gate interpreter can collect this repo's tests"
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(toplevel),
+            capture_output=True,
+            text=True,
+            env=config.subprocess_env(PYTEST_DISABLE_PLUGIN_AUTOLOAD="1"),
+            timeout=_GATE_COLLECT_TIMEOUT_SECONDS,
+        )
+    except OSError as exc:
+        return (
+            label,
+            False,
+            f"cannot execute {python!r} ({exc}) — point {config.GATE_PYTHON_ENV} at a "
+            "python that can run this repo's tests, or unset it to use swarm-sync's own",
+        )
+    except subprocess.TimeoutExpired:
+        return (
+            label,
+            False,
+            f"collecting this repo's tests with {python} did not finish in "
+            f"{_GATE_COLLECT_TIMEOUT_SECONDS:.0f}s — the gate would hit "
+            f"{config.GATE_TIMEOUT_ENV} on every merge",
+        )
+    if proc.returncode == 0:
+        return label, True, source
+    if proc.returncode == 5:
+        return label, True, f"{source} — no tests collected, so there is nothing to gate on"
+    tail = (proc.stdout + proc.stderr).strip().splitlines()[-3:]
+    return (
+        label,
+        False,
+        f"{python} cannot collect this repo's tests (pytest exit {proc.returncode}): "
+        + " / ".join(line.strip() for line in tail)
+        + " — every merge would be rejected for this reason. Set "
+        f"{config.GATE_PYTHON_ENV} to the interpreter (venv) that runs this repo's suite",
+    )
+
+
 def cmd_doctor(client: BlackboardClient, args: argparse.Namespace, out: TextIO) -> int:
     """Diagnose a swarm-sync setup: each check prints pass/fail + a remedy, and
     the exit code is non-zero iff any check failed."""
@@ -533,6 +620,7 @@ def cmd_doctor(client: BlackboardClient, args: argparse.Namespace, out: TextIO) 
                 else "no swarm-sync hooks in global/project settings.json — run `swarmsync init-hooks`",
             )
         )
+        checks.append(_gate_interpreter_check(toplevel))
 
     checks.append(("db writable", *_db_writable(config.db_path())))
 

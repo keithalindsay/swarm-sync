@@ -3,7 +3,8 @@ containment. DESIGN.md §5.4 step 3.
 
 `run_impact_tests` is the only entry point. Everything else here is its
 apparatus: dependency-graph test selection (`_reverse_dep_files`), the gate
-timeout (`_gate_timeout` / SWARMSYNC_GATE_TIMEOUT), and the kill/drain
+timeout (`_gate_timeout` / SWARMSYNC_GATE_TIMEOUT), the interpreter the gate
+spawns (`resolve_python` / SWARMSYNC_GATE_PYTHON), and the kill/drain
 machinery (`_kill_process_group`, `_close_streams`) that guarantees a hung
 gate cannot wedge the caller -- which holds the ONE global `integrate_lock`.
 
@@ -53,6 +54,25 @@ _DRAIN_TIMEOUT_SECONDS = 5.0
 # WP4.2: the single env read for the gate timeout is `config.gate_timeout()`.
 _gate_timeout = config.gate_timeout
 
+# The single env read for the gate's interpreter is `config.gate_python()`.
+_gate_python = config.gate_python
+
+
+def resolve_python() -> str:
+    """The interpreter the gate spawns pytest with: `SWARMSYNC_GATE_PYTHON`, else
+    `sys.executable` (the interpreter running swarm-sync itself).
+
+    Why the default is resolved HERE rather than in `config`: it is not a
+    constant. `config`'s accessors return fixed defaults, and caching "whatever
+    interpreter is running" at import time in the bottom layer would freeze it --
+    so `config.gate_python()` is deliberately RAW (None when unset, like
+    `lease_ttl()`), and this function supplies the default by reading THIS
+    module's `sys` at call time. That also keeps the pre-existing test seam
+    (`tests/scale/harness.gate_interpreter`, which swaps `gate.sys`) working,
+    though with the env knob in place that shim is no longer necessary.
+    """
+    return _gate_python() or sys.executable
+
 
 def _reverse_dep_files(repo: Path, changed_py: set[str]) -> set[str]:
     """Every repo file that TRANSITIVELY reverse-depends on a changed `.py` file,
@@ -62,12 +82,43 @@ def _reverse_dep_files(repo: Path, changed_py: set[str]) -> set[str]:
     changed code only *indirectly* (it imports module M, which imports the changed
     module C -- and the test's own source never names C) is a genuine dependent
     a textual scan of the test source cannot see. We re-index the (already
-    merged) repo on disk, build the dep graph, seed a BFS at every parcel whose
-    file is a changed file, walk `reverse_edges` to the transitive dependent set,
-    and map those parcel ids back to their files. Returns an empty set on any
-    failure (a broken repo, etc.) -- the substring heuristic + full-suite fallback
-    in `run_impact_tests` still backstop selection, so this only ever ADDS
-    coverage, never removes.
+    merged) repo on disk, build the dep graph, and walk `reverse_edges` out from
+    the changed files. Returns an empty set on any failure (a broken repo, etc.)
+    -- the substring heuristic + full-suite fallback in `run_impact_tests` still
+    backstop selection, so this only ever ADDS coverage, never removes.
+
+    THE WALK IS FILE-GRANULAR, and that is the whole point. It used to be
+    parcel-granular -- seed every parcel of a changed file, walk parcel->parcel
+    reverse edges, and project to files only at the very end -- which severed
+    file-level chains: reaching *some* parcel of module M does not put M's OTHER
+    parcels in the frontier, so anything importing M by a different symbol was
+    never reached. Traced on a real 45-file repo: the walk from
+    `chunk/chunker.py` reached 2 of `cli/commands.py`'s 13 parcels (`<module>`,
+    `cmd_index`) while `server/app.py` imports four *different* symbols from that
+    same file -- so `app.py` was not a dependent of `chunker.py` as far as the
+    gate was concerned, though it plainly is one. It cost reverse-dependents on
+    10 of 34 modules, including 4 dependent TEST files for the package
+    `__init__.py`; those escaped being a live false negative only because the
+    substring backstop happened to match, which is a coincidence about filenames
+    and not a guarantee.
+
+    So: any parcel of a file being affected marks the WHOLE file affected, and
+    expansion continues from every parcel of that file. File granularity is not
+    an approximation bolted on here either -- it is the granularity swarm-sync
+    leases and schedules at (`graph.check_file_granularity`), and the granularity
+    this function's own return type and its caller's selection both use. The
+    price is over-selection, which is the documented, safe direction: the gate
+    may run a test it did not need to, never skip one it did.
+
+    The changed files themselves are INCLUDED in the result. A file is not a
+    reverse-dependent of itself, so this is deliberate: when the change set
+    contains a test file, that test is affected by definition and must run, and
+    the substring backstop only catches it by accident (it looks for the stem in
+    the file's TEXT, so `tests/test_payments.py` is matched only if something in
+    it happens to spell "test_payments"). The old walk picked such a file up only
+    when it happened to have an intra-file call edge, which is not a property
+    anyone should be relying on. For a changed non-test file this adds nothing:
+    `run_impact_tests` only ever asks about `test_*.py` paths.
     """
     if not changed_py:
         return set()
@@ -76,18 +127,27 @@ def _reverse_dep_files(repo: Path, changed_py: set[str]) -> set[str]:
         graph = build_graph(parcels, repo)
     except Exception:  # noqa: BLE001 -- selection is best-effort; never fail the gate here
         return set()
-    changed_parcel_ids = {p.id for p in parcels if p.path in changed_py}
-    affected: set[str] = set()
-    queue: deque[str] = deque(changed_parcel_ids)
+    parcels_by_file: dict[str, set[str]] = {}
+    for parcel in parcels:
+        parcels_by_file.setdefault(parcel.path, set()).add(parcel.id)
+
+    # `visited` starts at the changed files so the walk cannot loop back through
+    # them (a cycle would otherwise re-expand a file already done). They are also
+    # seeded into `affected` -- see the docstring: a changed test file must run.
+    visited: set[str] = set(changed_py)
+    affected: set[str] = {f for f in changed_py if f in parcels_by_file}
+    queue: deque[str] = deque(affected)
     while queue:
-        pid = queue.popleft()
-        for dependent in graph.reverse_edges.get(pid, set()):
-            if dependent not in affected:
-                affected.add(dependent)
-                queue.append(dependent)
-    return {
-        graph.parcels_by_id[a].path for a in affected if a in graph.parcels_by_id
-    }
+        current_file = queue.popleft()
+        for pid in parcels_by_file.get(current_file, ()):
+            for dependent in graph.reverse_edges.get(pid, set()):
+                target = graph.parcels_by_id.get(dependent)
+                if target is None or target.path in visited:
+                    continue
+                visited.add(target.path)
+                affected.add(target.path)
+                queue.append(target.path)
+    return affected
 
 
 def _close_streams(proc: subprocess.Popen) -> None:
@@ -156,10 +216,13 @@ def run_impact_tests(
     rather than risk a silent skip. If `test_dir` doesn't exist under `repo` at
     all, falls back further to running pytest across the whole repo.
 
-    Returns `(ok, combined_stdout_stderr_log)`. Uses `sys.executable -m pytest`
-    so it runs against whichever Python/venv is already running this process
-    (the repo under test has no independent environment of its own in this
-    prototype).
+    Returns `(ok, combined_stdout_stderr_log)`. Runs `<interpreter> -m pytest`,
+    where the interpreter is `SWARMSYNC_GATE_PYTHON` if set and `sys.executable`
+    (this process's own Python) otherwise -- see `resolve_python`. Point the knob
+    at the target repo's own venv when the repo has an environment of its own;
+    with the default, a repo needing a different Python version or dependencies
+    swarm-sync's venv lacks fails the gate for environment reasons on every
+    merge, which is indistinguishable from a gate that works.
     """
     repo = Path(repo)
     tests_root = repo / test_dir
@@ -171,8 +234,9 @@ def run_impact_tests(
     # `--import-mode=importlib` avoids mutating `sys.path`/polluting the parent's
     # module namespace via legacy prepend-import. These narrow WHAT the gate can do
     # without changing whether a genuinely passing/failing suite passes/fails.
+    python = resolve_python()
     base_cmd = [
-        sys.executable,
+        python,
         "-m",
         "pytest",
         "-q",
@@ -214,15 +278,30 @@ def run_impact_tests(
     # direct child -- pytest spawns (xdist workers, subprocesses under test), and
     # those orphans would keep running, holding the repo and the CPU, after we'd
     # already reported the merge rejected.
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(repo),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        env=env,
-        start_new_session=True,
-    )
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        # A misconfigured SWARMSYNC_GATE_PYTHON (typo, deleted venv, a path that
+        # is not executable) cannot even be spawned. Report it as a REJECTION with
+        # the reason named, rather than letting OSError escape into
+        # `integrate`'s error path while it holds the global integrate lock: the
+        # verdict "we could not test this" must never read as "this is fine", and
+        # an operator staring at rejected merges needs the knob's name in the log.
+        return False, (
+            f"swarm-sync: could not start the test gate's interpreter {python!r} "
+            f"({exc}). Set SWARMSYNC_GATE_PYTHON to a python that can run this "
+            f"repo's tests, or unset it to use swarm-sync's own ({sys.executable}). "
+            f"Treating as a gate FAILURE: a branch whose tests never ran cannot be "
+            f"shown to keep trunk green."
+        )
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
         returncode = proc.returncode

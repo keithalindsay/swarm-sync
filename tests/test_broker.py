@@ -540,6 +540,112 @@ def test_frozen_contract_target_is_upgraded_to_an_exclusive_lease_parked_mechani
     assert granted and all(g["mode"] == "exclusive" for g in granted)
 
 
+# --- DESIGN §5.3: contract-aware scheduling is DETECTION, never ORDERING -------------
+
+
+def _plain_task(task_id, path):
+    """A task whose only interesting property is which FILE it targets."""
+    return broker.Task(task_id=task_id, targets=[(path, None)], mutator=mutators.edit_function_body)
+
+
+def test_contract_aware_scheduling_does_not_order_a_cross_file_dependent(
+    frozen_conn_and_client, frozen_repo
+):
+    """THE RULE, pinned so nobody mistakes wave separation for contract ordering.
+
+    `co_schedulable`'s frozen-contract clause cannot fire at file granularity, so a
+    change to a frozen contract and a genuine dependent in ANOTHER file are dispatched
+    in the SAME wave -- concurrently, with nothing ordering the dependent after the
+    `contract_change` announcement it would react to. DESIGN §5.3 states this outright
+    ("both preventive mechanisms that test `pid in frozen_ids` never fire ... the
+    broker's upgrade of a frozen target's lease to `exclusive` and `co_schedulable`'s
+    frozen clause"), and README's guarantees table promises detection only: it "does
+    not *prevent* an in-flight dependent from having built against the old signature."
+
+    Both HALVES of the clause are keyed on symbol parcels -- `frozen_ids` (contracts
+    are only extracted for `function`/`class` parcels) AND `graph.reverse_edges` (a
+    dependent's import edge points at `mod_a.py::helper`, not at
+    `mod_a.py::<module>`). Asserted separately below, because lifting only one of them
+    would still not make the clause fire, and a future reader chasing this needs to
+    know that.
+
+    This test FAILS if someone lifts the frozen set (or the reverse edges) to file
+    granularity to "activate" the clause. That is not a fix: measured on a real
+    45-file repo, it turns one wave of 34 file-disjoint tasks into six while still not
+    delivering ordering -- see the companion test below for why it structurally cannot.
+    """
+    conn, _client = frozen_conn_and_client
+    r, _base = frozen_repo
+    graph, frozen_ids = broker.load_scheduling_graph(conn, r)
+
+    # Precondition: `helper` really IS a frozen contract, and mod_b really depends on it.
+    assert "mod_a.py::helper" in frozen_ids
+    assert "mod_b.py::caller" in graph.reverse_edges.get("mod_a.py::helper", set())
+
+    change = _plain_task("change-the-frozen-contract", "mod_a.py")
+    dependent = _plain_task("cross-file-dependent", "mod_b.py")
+
+    # (a) The frozen set holds SYMBOL ids; a file-mode target is a `<module>` id, so
+    #     the two id sets cannot intersect -- clause half one, dead.
+    assert broker.resolve_task(conn, change, mode="file") == ["mod_a.py::<module>"]
+    assert not (set(broker.resolve_task(conn, change, mode="file")) & frozen_ids)
+    assert not any(pid.endswith("::<module>") for pid in frozen_ids)
+
+    # (b) Even if it did, the dependent's edge points at the SYMBOL parcel, so the
+    #     reverse-edge half is dead independently.
+    assert "mod_b.py::<module>" not in graph.reverse_edges.get("mod_a.py::<module>", set())
+
+    # ...therefore: ONE wave. Dispatched concurrently, in either input order.
+    for tasks in ([change, dependent], [dependent, change]):
+        waves = broker.group_schedulable(conn, tasks, graph=graph, frozen_ids=frozen_ids)
+        assert len(waves) == 1, waves
+        assert {t.task_id for t in waves[0]} == {"change-the-frozen-contract", "cross-file-dependent"}
+
+    # And contract-awareness is not what put them together: it is the same answer off.
+    assert len(broker.group_schedulable(conn, [change, dependent], mode="file")) == 1
+
+
+def test_wave_separation_follows_input_order_not_dependency_direction(
+    frozen_conn_and_client, frozen_repo
+):
+    """Why activating the frozen clause could never deliver the ordering it looks like.
+
+    `co_schedulable` is a SYMMETRIC parallel-safety relation (DESIGN §3) and
+    `group_schedulable` is a greedy partition over `tasks` in INPUT order, so the most
+    any clause in it can say is "these two may not share a wave" -- never "this one
+    goes first." Two same-file tasks are the pair that genuinely does separate (one
+    whole-file lock, §5.2), and which of them lands in wave 1 is decided purely by the
+    caller's list order: reverse the list and the waves reverse with it.
+
+    So the same-file "the dependent ran in wave 2" observation is an artifact of the
+    caller having listed the contract change first. This test FAILS if someone replaces
+    the greedy partition with a dependency-ordered (topological) scheduler -- which
+    would be a real design change, and would need DESIGN §5.3 and README's guarantees
+    table rewritten to promise ordering before it could be called a fix.
+    """
+    conn, _client = frozen_conn_and_client
+    r, _base = frozen_repo
+    graph, frozen_ids = broker.load_scheduling_graph(conn, r)
+
+    contract_change = _plain_task("change-the-frozen-contract", "mod_a.py")
+    same_file = _plain_task("same-file-sibling", "mod_a.py")
+
+    forward = broker.group_schedulable(
+        conn, [contract_change, same_file], graph=graph, frozen_ids=frozen_ids
+    )
+    reverse = broker.group_schedulable(
+        conn, [same_file, contract_change], graph=graph, frozen_ids=frozen_ids
+    )
+    assert [[t.task_id for t in w] for w in forward] == [
+        ["change-the-frozen-contract"],
+        ["same-file-sibling"],
+    ], forward
+    assert [[t.task_id for t in w] for w in reverse] == [
+        ["same-file-sibling"],
+        ["change-the-frozen-contract"],
+    ], reverse
+
+
 # --- C11 (WP3.6): broker failure containment -----------------------------------------
 
 

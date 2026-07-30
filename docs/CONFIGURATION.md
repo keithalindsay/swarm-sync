@@ -22,6 +22,7 @@ to touch the environment.
 | `SWARMSYNC_DB` | `swarmsync.db` | Default SQLite path for the launcher's `--db` (the flag wins). `SWARM_SYNC_DB` is honored as a deprecated alias, with a stderr warning. |
 | `SWARMSYNC_LEASE_TTL` | `300` (seconds) | Lease TTL the hook acquires/renews with. Zero/negative/over-ceiling values are refused loudly and the default used — a typo must not disable lease protection. |
 | `SWARMSYNC_GATE_TIMEOUT` | `600` (seconds) | Wall-clock ceiling on the integrator's pytest gate; also widens the agent client's `/integrate` HTTP timeout to match. |
+| `SWARMSYNC_GATE_PYTHON` | swarm-sync's own interpreter | Python the pytest gate spawns (`<python> -m pytest`). Set this to the **target repo's** venv python whenever that repo has an environment of its own — a different Python version, or dependencies swarm-sync's venv lacks. With the wrong interpreter every gate run fails for environment reasons, so every merge is rejected and "trunk stayed green" becomes vacuously true. `swarmsync doctor` checks it by collecting the repo's tests with it. A blank value counts as unset. |
 | `SWARMSYNC_MAX_LEASES_PER_AGENT` | `256` | Cap on active leases one agent id may hold (bounds `ensure_parcel` abuse). |
 | `SWARMSYNC_MAX_BODY_BYTES` | `10485760` (10 MiB) | Request bodies declaring more than this are rejected 413 before buffering. |
 | `SWARMSYNC_EVENTS_COMPACT_INTERVAL` | `60` (seconds) | How often the background reaper runs an events-compaction pass. |

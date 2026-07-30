@@ -1,4 +1,4 @@
-"""H5 / H6 at realistic scale: frozen-contract detection at 86 contracts, and the
+"""H5 / H6 at realistic scale: frozen-contract detection at 94 contracts, and the
 two crash paths -- an agent SIGKILLed mid-edit, and the SERVER SIGKILLed mid-
 integration (the least-tested path in the system).
 
@@ -15,7 +15,7 @@ H5 and the bonus experiment need no kill, so they use the harness directly.
 
 RESULTS UP FRONT (measured 2026-07-29 on this machine)
 ======================================================
-H5  -- HELD. 86 contracts indexed; `change_signature` on
+H5  -- HELD. 94 contracts indexed; `change_signature` on
     `codelearner/ingest/python_extract.py::module_qualname` (blast_radius 152)
     emitted exactly ONE `contract_change`, naming that symbol, version 1 -> 2,
     and the dependent task the BROKER scheduled into wave 2 re-read the contract
@@ -27,23 +27,36 @@ H5  -- HELD. 86 contracts indexed; `change_signature` on
     nothing ordering it after the announcement -- see
     `test_h5_a_cross_file_dependent_is_NOT_ordered_after_the_contract_change`.
 
-H6a -- SPLIT. The crash was genuinely mid-edit (` M codelearner/ingest/types.py`
-    uncommitted in the worktree, no commit made) with a LIVE, heartbeat-renewed
-    lease. Lease reclamation and trunk isolation HOLD: reaped 30.3 s after the
-    kill, and a fresh agent then re-took the parcel and landed the task; trunk's
-    HEAD, working tree and reflog never saw the partial edit. Two things did NOT
-    hold:
-      * "the worktree is cleaned" is **FALSIFIED**. Nothing cleans a SIGKILLed
-        agent's worktree: the reaper only touches `leases` (its own docstring says
-        so) and the dead process ran no `finally`. 540 KiB survived the reap, the
-        reassignment, and stayed registered with git. The only thing that ever
-        removes it is `add_worktree`'s S5 prune -- which matches on the SAME agent
-        id, while the broker retries under `{task}-attempt-{n+1}`.
+H6a -- HELD, after two defects this test FOUND were fixed. The crash is genuinely
+    mid-edit (` M codelearner/ingest/types.py` uncommitted in the worktree, no
+    commit made) with a LIVE, heartbeat-renewed lease. Lease reclamation and trunk
+    isolation held from the first run: a fresh agent re-takes the parcel and lands
+    the task, and trunk's HEAD, working tree and reflog never see the partial edit.
+
+    The two clauses that did NOT hold, and what closed them:
+      * "the worktree is cleaned" was **FALSIFIED** -- nothing cleaned a SIGKILLed
+        agent's worktree. The reaper only touches `leases` (deliberately: an expired
+        lease does not imply a dead process, so pruning on TTL could delete a live
+        agent's work), the dead process ran no `finally`, and `add_worktree`'s S5
+        prune matched only the SAME agent id while the broker retries under
+        `{task}-attempt-{n+1}`. 540 KiB survived the reap AND the reassignment.
+        Now reclaimed by `git_ops.prune_orphan_worktrees`, which asks the KERNEL who
+        is alive -- an unheld `flock` on `.git/swarmsync-worktrees/<name>.lock`,
+        released however the owner died. Uncommitted work is committed and parked
+        under `rejected/<name>-<UTC ts>` before the checkout goes, so a crash costs
+        disk but never work. Post-fix: 0 bytes, gone from `git worktree list`, the
+        partial edit recoverable from the parked ref.
       * reclamation took 30.3 s for an agent that asked for an 8 s TTL, because
-        `_Heartbeater` renews with no ttl and `POST /heartbeat` then applies
-        `leases.DEFAULT_TTL_SECONDS` (30 s). `run_agent(lease_ttl=...)` is honored
-        on acquire and silently discarded on renewal, so crash-detection latency
-        is the server default no matter what the caller chose.
+        `_Heartbeater` renewed with no ttl and `POST /heartbeat` applied
+        `leases.DEFAULT_TTL_SECONDS`. `run_agent(lease_ttl=...)` was honored on
+        acquire and silently discarded on renewal, so crash-detection latency was
+        the server default whatever the caller chose. Fixed; the ttl is now carried
+        into every beat, and passed only when the caller asked for one (passing it
+        unconditionally raises TypeError into a broad `except` that swallows it,
+        which would silently stop every beat -- worse than the bug).
+
+    Both are now regression guards rather than characterizations: this test asserts
+    the fixed behaviour and will go red if either defect returns.
 
 H6b -- HELD, and the dangerous state was really reached. The server was SIGKILLed
     with the gate's pytest confirmed running (its pid is asserted, then killed
@@ -101,7 +114,7 @@ SWARMSYNC_ROOT = Path(__file__).resolve().parents[2]
 # same-file dependent is the only way to get a genuine broker-scheduled "later
 # wave" to observe the announcement.
 #
-# Verified against the real index (2026-07-29): `module_qualname` is one of the 86
+# Verified against the real index (2026-07-29): `module_qualname` is one of the 94
 # frozen contracts, blast_radius 152, signature `module_qualname(rel_path)`, and its
 # only same-file caller is `extract` (`mod_qual = module_qualname(rel_path)`).
 H5_PATH = "codelearner/ingest/python_extract.py"
@@ -498,7 +511,7 @@ def _worktree_dirty_files(worktree: Path) -> list[str]:
 
 
 # ===================================================================================
-# H5 -- contract detection at 86 contracts
+# H5 -- contract detection at 94 contracts
 # ===================================================================================
 
 
@@ -560,7 +573,7 @@ def h5_wave(scale):
 
 
 def test_h5_the_contract_is_really_frozen_before_we_touch_it(scale):
-    """Precondition. If `module_qualname` were not one of the 86 frozen contracts,
+    """Precondition. If `module_qualname` were not one of the 94 frozen contracts,
     a `contract_change` could never fire and H5 would pass or fail for reasons that
     have nothing to do with contract detection."""
     assert scale.contract_count == harness.MEASURED_CONTRACTS
@@ -818,10 +831,11 @@ def test_h6a_agent_sigkilled_mid_edit(capsys):
         assert live.events_of("integrate_started") == []
         assert integrator.unresolved_orphan_count(live.conn) == 0
 
-        # --- FALSIFIED: nothing cleans the dead agent's worktree ----------------
+        # --- the REAP alone does not clean the worktree (still true) ------------
         # The reaper only touches `leases` (its own docstring), and the SIGKILLed
         # process ran no `finally`. So the worktree survives the reap, still
-        # registered with git, still carrying the partial edit.
+        # registered with git, still carrying the partial edit. What changed with
+        # WP4.7 is who reclaims it afterwards -- see the inverted clause below.
         leaked_bytes = _dir_bytes(worktree)
         assert worktree.is_dir(), "worktree was cleaned -- H6a's third clause HOLDS"
         assert CRASH_SENTINEL in (worktree / H6A_PATH).read_text(encoding="utf-8")
@@ -848,15 +862,37 @@ def test_h6a_agent_sigkilled_mid_edit(capsys):
         assert result.status == "done", result
         assert result.integrate_result["status"] == "merged", result.integrate_result
         assert H6A_EDIT["new_body"].splitlines()[0] in live.file_text(H6A_PATH)
-        # The reassignment landed, and the crashed agent's worktree is STILL there:
-        # the broker's next attempt uses a NEW agent id, so `add_worktree`'s S5
-        # prune (which only matches the same name) never touches it.
-        assert worktree.is_dir(), (
-            "the reassignment cleaned the crashed worktree -- then the leak is "
-            "self-healing and this finding needs re-stating"
+        # INVERTED when the leak was fixed (WP4.7), exactly as the original
+        # assertion invited ("then the leak is self-healing and this finding needs
+        # re-stating"). As written it pinned the leak: the reassignment runs under a
+        # NEW agent id, so `add_worktree`'s S5 prune -- which matches only the SAME
+        # name -- never touched the crashed worktree, and nothing else ever did.
+        # `add_worktree` now ALSO sweeps worktrees whose creating process is
+        # provably dead (its `flock` on `.git/swarmsync-worktrees/<name>.lock` is
+        # unheld), so the reassignment reclaims it. Cleanup is still lazy -- the
+        # reaper stayed a pure `leases` actor, which is why the block above still
+        # finds the worktree intact right after the reap -- but it is no longer
+        # keyed on a name that never recurs.
+        assert not worktree.exists(), (
+            "the crashed agent's worktree survived the reassignment -- the H6a leak "
+            "is back (one leaked checkout per crash, for the life of the repo)"
         )
+        assert str(worktree) not in harness.worktrees(live.root), harness.worktrees(live.root)
+        # The partial edit is RECLAIMED, not destroyed: committed onto the dead
+        # agent's own branch and parked under `rejected/*` (WP3.5's namespace, which
+        # pruning never touches), so the 540 KiB checkout is gone while the one thing
+        # that was unique to it stays recoverable.
+        parked = git_ops._run(
+            ["git", "for-each-ref", "--format=%(refname:short)",
+             f"refs/heads/rejected/{agent_id}-*"],
+            cwd=live.root,
+        ).stdout.split()
+        assert len(parked) == 1, parked
+        assert CRASH_SENTINEL in git_ops._run(
+            ["git", "show", f"{parked[0]}:{H6A_PATH}"], cwd=live.root
+        ).stdout, "the crashed agent's uncommitted work was destroyed, not preserved"
 
-        # The ONLY thing that ever removes it: a re-run under the SAME agent id.
+        # A re-run under the SAME agent id still prunes and re-cuts it (S5).
         pruned_path = git_ops.add_worktree(live.root, agent_id, live.base_commit)
         try:
             assert CRASH_SENTINEL not in (pruned_path / H6A_PATH).read_text(
@@ -876,8 +912,10 @@ def test_h6a_agent_sigkilled_mid_edit(capsys):
                 f"(agent asked for ttl {H6A_TTL}s; the heartbeat had widened it to "
                 f"{renewed_window:.0f}s -- the server default)"
                 f"\nuncommitted work at kill:    {dirty} in {worktree.name}"
-                f"\nleaked worktree after reap:  {leaked_bytes / 1024:.0f} KiB, "
-                f"still registered with git"
+                f"\nworktree after the reap:     {leaked_bytes / 1024:.0f} KiB still "
+                f"there, still registered with git (the reaper is leases-only)"
+                f"\nafter the reassignment:      reclaimed; work preserved as "
+                f"{parked[0]}"
                 f"\ntrunk moved:                 no ({pre_trunk_head[:8]} throughout)"
                 f"\nreassignment landed:         {result.integrate_result['status']}"
             )
