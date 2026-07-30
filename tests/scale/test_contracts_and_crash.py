@@ -766,12 +766,21 @@ def test_h6a_agent_sigkilled_mid_edit(capsys):
         )
         assert lease_before_kill["status"] == "active", lease_before_kill
         renewed_window = lease_before_kill["ttl_expires_at"] - beat["ts"]
-        assert renewed_window > H6A_TTL + 1.0, (
-            "the heartbeat did NOT widen the TTL past the requested one -- if this "
-            "fails the renewal now honors lease_ttl and the finding is fixed",
-            renewed_window,
+        # INVERTED when the finding was fixed, exactly as the original assertion
+        # predicted it would be. As written it pinned the bug: `_Heartbeater` called
+        # `client.heartbeat(agent, lease_id)` with no ttl, so the server applied its
+        # 30 s default and `run_agent(lease_ttl=8.0)` was honored on the acquire and
+        # silently discarded from the first beat onward. Crash-detection latency was
+        # the server default whatever the caller asked for.
+        #
+        # A window is asserted rather than equality because the beat timestamp and the
+        # server's own clock read are not the same instant.
+        assert abs(renewed_window - H6A_TTL) < 2.0, (
+            "the renewal is not honoring the requested lease_ttl -- `_Heartbeater` is "
+            f"dropping its ttl again, so the server default is back. Asked for "
+            f"{H6A_TTL}s, renewed window was {renewed_window}s "
+            f"({'looks like the 30s server default' if renewed_window > 20 else 'unexpected'})."
         )
-        assert 25.0 < renewed_window < 35.0, renewed_window  # the 30s server default
         assert lease_before_kill["ttl_expires_at"] > time.time(), (
             "the lease was already expired at kill time, so the reap below would "
             "prove nothing about a crash"

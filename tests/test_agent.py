@@ -194,6 +194,82 @@ def test_run_agent_releases_already_held_leases_on_a_mid_acquire_denial(client, 
     assert regrab["granted"] is True, "helper was not released on rollback"
 
 
+def test_heartbeater_carries_the_requested_ttl_into_every_beat():
+    """REGRESSION. `run_agent(lease_ttl=N)` must be honored on RENEWAL, not only on
+    the acquire.
+
+    `_Heartbeater` used to call `client.heartbeat(agent, lease_id)` with no ttl, so
+    the server applied `leases.DEFAULT_TTL_SECONDS` on every beat. A caller asking for
+    8 s held a 30 s lease from the first beat onward, which meant crash-detection
+    latency was always the server default whatever the caller chose -- the one thing
+    `lease_ttl` exists to control. Found by SIGKILLing a real agent mid-edit and
+    reading the lease row.
+    """
+    import time
+
+    from swarmsync.agent.runner import _Heartbeater
+
+    class _Recording:
+        def __init__(self):
+            self.ttls = []
+
+        def heartbeat(self, agent_id, lease_id, ttl=None):
+            self.ttls.append(ttl)
+
+    client = _Recording()
+    hb = _Heartbeater(client, "agent-x", interval=0.02, ttl=8.0)
+    hb.add(lease_id=1)
+    hb.start()
+    try:
+        deadline = time.time() + 3.0
+        while time.time() < deadline and len(client.ttls) < 3:
+            time.sleep(0.02)
+    finally:
+        hb.stop()
+    assert client.ttls, "the heartbeater never beat"
+    assert set(client.ttls) == {8.0}, (
+        f"the requested ttl was dropped on renewal: {client.ttls!r}. The server would "
+        "apply its own default, so lease_ttl would be honored on acquire and silently "
+        "discarded from the first beat onward."
+    )
+
+
+def test_heartbeater_omits_the_ttl_keyword_when_none_was_requested():
+    """The complement, and it is not cosmetic: passing `ttl=None` unconditionally
+    raises TypeError on any client whose `heartbeat` lacks the keyword, and `_run`'s
+    per-beat `except Exception` SWALLOWS that. Every beat would fail silently and
+    leases would expire under a live agent -- strictly worse than the bug above. So a
+    caller with no preference must produce the exact original call."""
+    import time
+
+    from swarmsync.agent.runner import _Heartbeater
+
+    class _NoTtlKeyword:
+        """Deliberately mirrors a client written before `ttl` existed."""
+
+        def __init__(self):
+            self.beats = 0
+
+        def heartbeat(self, agent_id, lease_id):
+            self.beats += 1
+
+    client = _NoTtlKeyword()
+    hb = _Heartbeater(client, "agent-x", interval=0.02)
+    hb.add(lease_id=1)
+    hb.start()
+    try:
+        deadline = time.time() + 3.0
+        while time.time() < deadline and client.beats < 3:
+            time.sleep(0.02)
+    finally:
+        hb.stop()
+    assert client.beats >= 3, (
+        f"a client without a `ttl` keyword stopped receiving beats ({client.beats}). "
+        "The TypeError is swallowed per-beat, so this presents as leases quietly "
+        "expiring rather than as an error."
+    )
+
+
 def test_heartbeater_survives_a_raising_heartbeat_and_keeps_beating():
     """The background `_Heartbeater` thread must never die on a failed beat
     (DESIGN §6 'server went away' -- a lost beat is a legitimate outcome the

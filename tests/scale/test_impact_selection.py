@@ -48,7 +48,7 @@ while the full suite is red):
   none. The impact map for those two files is exactly inverted.
   See `test_h2_from_pkg_import_submodule_is_no_longer_a_gate_false_negative`.
 
-  DEFECT 2 (`coordinator/gate.py::_reverse_dep_files`, the BFS). The walk is
+  DEFECT 2 -- STILL OPEN (`coordinator/gate.py::_reverse_dep_files`, the BFS). The walk is
   PARCEL-granular and only projects to file granularity at the very end, so a
   file-level chain breaks whenever the intermediate module is imported
   by-symbol and the reached symbol is not the imported one. Traced on the real
@@ -63,13 +63,19 @@ while the full suite is red):
   at) is what would close it.
   See `test_h2_defect2_parcel_granular_bfs_is_a_gate_false_negative`.
 
-Neither defect produces a false negative on code-learner as it stands, and the
-reason is luck, not design: the `db.py` loss is covered by the substring
-backstop because the 2-character stem `"db"` happens to occur in all 11 test
-files, and Defect 2's losses on this repo are all non-test files. Both repros
-below are minimal repos, not code-learner -- but they use ordinary import forms
-and an ordinary refactor, and the second one does not even need a raise: renaming
-a function is enough.
+Neither defect produced a false negative on code-learner itself, and the reason
+was luck, not design: the `db.py` loss was covered by the substring backstop
+because the 2-character stem `"db"` happens to occur in all 11 test files, and
+Defect 2's losses were (then) all non-test files. Both repros below are minimal
+repos, not code-learner -- but they use ordinary import forms and an ordinary
+refactor, and the second one does not even need a raise: renaming a function is
+enough.
+
+Post-fix, Defect 2 is no longer confined to non-test files: it now loses 4 test
+files for `codelearner/__init__.py` on the real repo. That is still not a gate
+false negative -- the stem `"codelearner"` appears in every test file, so the
+substring backstop selects all 11 -- but the thing standing between it and a
+merged red change is once again a substring coincidence, not the graph.
 
 The graph signal is nonetheless LOAD-BEARING, not decoration: for
 `codelearner/ingest/types.py::content_hash`, 10 test files genuinely fail and the

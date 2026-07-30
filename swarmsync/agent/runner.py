@@ -103,10 +103,20 @@ class _Heartbeater:
         client: BlackboardClient,
         agent_id: str,
         interval: float = DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
+        ttl: Optional[float] = None,
     ) -> None:
         self._client = client
         self._agent_id = agent_id
         self._interval = interval
+        # `ttl` must be carried into every beat, not just the acquire. Without it the
+        # server applies `leases.DEFAULT_TTL_SECONDS` on each renewal, so a caller's
+        # `run_agent(lease_ttl=N)` was honored exactly once and silently discarded
+        # from the first beat onward -- measured: an agent asked for 8 s and held a
+        # 30 s lease. Crash-detection latency was therefore always the server default
+        # regardless of what the caller chose, which is the one thing `lease_ttl`
+        # exists to control. `None` keeps the server default, which is the right
+        # behaviour for a caller that expressed no preference.
+        self._ttl = ttl
         self._lease_ids: list[int] = []
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -124,7 +134,17 @@ class _Heartbeater:
         while not self._stop.wait(self._interval):
             for lease_id in list(self._lease_ids):
                 try:
-                    self._client.heartbeat(self._agent_id, lease_id)
+                    # `ttl` is passed ONLY when the caller asked for one. Passing
+                    # `ttl=None` unconditionally would be equivalent in meaning but not
+                    # in shape: any client whose `heartbeat` does not accept the keyword
+                    # raises TypeError, and the per-beat `except` below SWALLOWS it. The
+                    # result is every beat silently failing and leases expiring under a
+                    # live agent -- strictly worse than the wrong-TTL bug this fixes.
+                    # Callers with no preference therefore keep the exact old call.
+                    if self._ttl is None:
+                        self._client.heartbeat(self._agent_id, lease_id)
+                    else:
+                        self._client.heartbeat(self._agent_id, lease_id, ttl=self._ttl)
                 except Exception as exc:
                     # A heartbeat failure (e.g. the server went away) must never
                     # crash the background thread -- it just means this beat is
@@ -324,7 +344,9 @@ def run_agent(
         lease_ids[parcel_id] = result["lease_id"]
         lease_modes_used[parcel_id] = mode
 
-    heartbeater = _Heartbeater(client, agent_id, interval=heartbeat_interval)
+    heartbeater = _Heartbeater(
+        client, agent_id, interval=heartbeat_interval, ttl=lease_ttl
+    )
     for lease_id in lease_ids.values():
         heartbeater.add(lease_id)
     heartbeater.start()
