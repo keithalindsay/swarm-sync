@@ -5,6 +5,31 @@ S = security, A = architecture, U = usability). This document is the execution p
 each a set of work packages (WPs) with explicit file footprints so disjoint WPs can run in
 parallel — under swarm-sync itself, if you like the symmetry.
 
+## STATUS — PHASES 1–5 HAVE LANDED
+
+**Everything from WP1.1 through WP5.3 is done, merged, and tested.** Read those sections as the
+record of what was planned and executed, not as a to-do list; each WP's closing commit is in
+[`AUDIT.md`](AUDIT.md) §0. Two are partial and say so there: **WP3.5** landed branch parking but not
+rebase-and-resubmit (that is WP6.1), and **WP4.3** extracted the gate but left `integrator.py` the
+largest module in the package at 842 lines.
+
+**Phase 6 is what remains, and it is not defect work:**
+
+| WP | What | State |
+|---|---|---|
+| 6.1 | Rebase-and-resubmit (C6) | open — `DESIGN.md` §5.5's unkept promise |
+| 6.2 | Answer the contract question (AUDIT §6) | open — a decision, and it wants real session data rather than an argument |
+| 6.3 | Multi-language classifier | deliberately blocked on 6.2 — indexing more languages into an abstraction that might be deleted is waste |
+
+One thing the phases did not anticipate, recorded here because the plan's ground rules are the
+reason it stung: six further defects were found by *using* the fabric on real work, against a suite
+of 605 tests that could not see any of them, and two of the six were in fixes made hours earlier the
+same day. Ground rule 1 (a fix needs a test that fails when you delete the fix) held up — every one
+of those six carries such a test. Ground rule 3 (reproduce before fixing) is the one that would have
+caught them sooner: a fix "verified" against a hand-built four-case matrix, where all four cases
+turned out to exercise the same code path, is not reproduced. **Add a seventh rule: verify a fix by
+using the system, not only by testing it.**
+
 ## Ground rules (binding on every WP)
 
 1. **The campaign rule:** *a fix without a test that fails when you delete the fix is not a fix.*

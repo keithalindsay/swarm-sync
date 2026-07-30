@@ -14,44 +14,112 @@ Severity scale: **P0** trunk-destroying / data loss · **P1** serious, reachable
 **P2** moderate / needs unusual-but-real conditions · **P3** minor. Usability findings use
 blocker/major/minor for *adoption* impact.
 
-**On the `ROUND5` references below.** Four findings cite "ROUND5" — an earlier, unpublished review
-round from the hardening phases, whose write-up is not in this repo. The citations are kept because
-they record that a finding is *recurring* rather than new, which is real information about it. But
-nothing here depends on that document: every finding below was reproduced against the source at
-`8beeb49` before being recorded, so each stands on its own reproduction. Read `ROUND5` as "this was
-raised once before and is still open," and nothing more.
+---
+
+## 0. STATUS — READ THIS BEFORE ANY FINDING BELOW
+
+**Everything below is a point-in-time snapshot of commit `8beeb49`, and every finding in it has
+since been closed.** Sections 1–7 are preserved verbatim as the audit record — what was found, how
+it was reproduced, what it would have cost. They are *not* a description of the current code. Read
+a finding's prose in the past tense and check this table for where it went.
+
+Two claims further down are now actively wrong and are corrected here rather than edited away,
+because an audit whose findings can be quietly revised is not evidence of anything: **C5** and
+**C14** both say "ROUND5 known-open, verified still present." That was true at `8beeb49`. Both are
+fixed and carry tests.
+
+| # | Sev | Closed by | Notes |
+|---|---|---|---|
+| C1 | P0 | WP1.1 `1f08021` | plus `8b13e13` — a failed rollback must keep the orphan row |
+| C2 | P1 | WP2.A `47d0ffd` | |
+| C3 | P1 | WP3.2 `1a07a3a` | `open_integrations` projection replaced the 1M-row scan |
+| C4 | P1 | WP1.2 `e6cfe29` | |
+| C5 | P1 | WP1.4 `c581ed3` | ownership predicate on SQLite's clock; §C5's "still present" is stale |
+| C6 | P1 | WP3.5 `a709ed4` — **PARTIAL** | branch parking landed; rebase-and-resubmit is WP6.1, **still open** |
+| C7 | P1 | WP3.4 `3381e12` | the replay claim was demoted, not defended |
+| C8 | P2 | WP1.5 `68d4bfc` | |
+| C9 | P2 | WP1.3 `ecb134b` | TTL floor = 2× busy_timeout, ceiling, positive-only |
+| C10 | P2 | WP2.A `47d0ffd` | |
+| C11 | P2 | WP3.6 `f6d6a16` | |
+| C12 | P2 | WP2.A `47d0ffd` | |
+| C13 | P2 | WP1.3 `ecb134b`, `0040f60` | every liveness predicate now reads SQLite's clock |
+| C14 | P2 | WP3.5 `a709ed4` | `retire_rows`, scoped to the landed merge's paths; §C14's "still present" is stale |
+| C15–C17 | P3 | WP4.5 `7bccf6c`, WP4.3 `d6e029a`, WP4.6 `317782b` | |
+| S1 | P2 | WP3.3 `009600a` | |
+| S2 | P2 | WP3.1 `02d542e` | |
+| S3 | P3 | WP1.6 `3d20888` | |
+| S4 | P3 | **decided, documented** | index the out-of-repo link (it must stay leasable or edits through it bypass coordination); README now names the leak explicitly. In-repo aliases skipped. |
+| S5 | P3 | WP3.3 `009600a` | declared-length body cap; chunked bodies pass through by stated trade-off |
+| A1 | — | WP4.6 `317782b` | |
+| A2 | — | WP4.1 `2c3529c` | layering is one-directional now |
+| A3 | — | WP4.3 `d6e029a` — **PARTIAL** | gate extracted to `coordinator/gate.py` (488 lines); `integrator.py` is still the largest module at 842 |
+| A4 | — | WP4.2 `32041f6` | |
+| A5 | — | WP4.4 `9e97da8` | |
+| A6 | — | WP4.5 `7bccf6c`, `e0ff9fb` | |
+| A7 | — | WP4.6 `317782b` | |
+| A8 | — | WP1.6 `3d20888`, WP4.4 `9e97da8` | |
+| U1–U9 | — | WP5.1 `329fd00`, WP5.2 `dd6ca1d`, WP5.3 `e6512a6`, WP1.7 `d4a103e` | operator CLI, `doctor`, `init-hooks`, docs pass, harness removed |
+
+Four more landed after the phases, from *using* the system rather than auditing it: `e474c1d`,
+`9a166d9`, `e6bebc9`, `8771b21`, `982386a`. Those are not in this document because this document
+did not find them — a 605-test suite did not find them either. That is worth more than the table
+above.
+
+**What is actually open** is in [`IMPROVEMENT_PLAN.md`](IMPROVEMENT_PLAN.md) Phase 6: rebase-and-resubmit
+(WP6.1 / C6), the contract question (WP6.2 / §6), and multi-language (WP6.3, deliberately blocked on
+WP6.2). None is a defect; the first is an unkept `DESIGN.md` §5.5 promise and the second is a
+decision that wants real session data, not an argument.
+
+**On the `ROUND5` citations.** Four findings cite "ROUND5" — an earlier, unpublished review round
+whose write-up is not in this repo. They are kept because they record that a finding was *recurring*,
+which is real information about it. Nothing here depends on that document: every finding was
+reproduced against `8beeb49` before being recorded. Read `ROUND5` as "this had been raised once
+before," and nothing more — **not** as "still open," which is what an earlier version of this note
+wrongly said.
 
 ---
 
 ## 1. Scorecard
 
-| Metric | Value | Notes |
-|---|---|---|
-| Tests | **312 passed**, 0 failed (47.6s) | 3 deprecation warnings (anyio/py3.11) |
-| Coverage | **94%** (1,704 stmts, 97 missed) | The missing 6% characterized in §5.1 |
-| Ruff | clean | |
-| Mypy | clean (25 files) | untyped-body note in `server/app.py:361` |
-| Avg cyclomatic complexity | **A (3.39)** across 163 blocks | 8 blocks ≥ C, 1 at D (§5.2) |
-| Maintainability index | all modules rank A | lowest raw: `integrator.py` 43.4 |
-| Source / test LOC | 5,460 / 7,472 (ratio 1.37) | statements are only 31% of source lines — doc-heavy by design |
-| Import cycles | none | but one layering inversion (§5.3) |
-| SQL injection / shell injection / auth bypass | **none found** | §4 |
-| Demo | 5/5 PASS in 8.6s from a fresh clone | quickstart caveat in U1 |
+**As measured at `8beeb49`** — kept because §5.1's coverage discussion and §5.2's complexity
+discussion refer to these numbers. Current values follow.
 
-**Overall:** the codebase is unusually careful and unusually honest — every dangerous edge carries a
-written justification, the fail-open policy is deliberate and documented, and five audit rounds have
-burned off nearly all the easy defects. What's left clusters into four shapes: **(a)** one genuine
-P0 in crash-recovery replay, **(b)** the hook path (the mode where the lease is the *only*
-protection) has integrity holes the broker path doesn't, **(c)** nothing is bounded — events,
-parcels, leases, scans all grow forever against a persistent DB with no schema versioning, and
-**(d)** there is no operational surface — a silently-uncoordinated session is indistinguishable
-from a working one.
+| Metric | At `8beeb49` | Now (`982386a`) |
+|---|---|---|
+| Tests | **312 passed** (47.6s) | **632 passed** (75s), + 39 scale tests that need a private fixture |
+| Coverage | 94% (1,704 stmts, 97 missed) | **95%** (2,889 stmts, 154 missed) |
+| Ruff / Mypy | clean / clean (25 files) | clean / clean (32 files) |
+| Avg cyclomatic complexity | A (3.39), 163 blocks; 8 ≥ C, 1 at D | A (3.50), 263 blocks; 14 ≥ C, 1 at D (`build_graph`, 28) |
+| Maintainability index | all A; lowest `integrator.py` 43.4 | all A; lowest `git_ops.py` 43.8 |
+| Source / test LOC | 5,460 / 7,472 | 10,050 / 14,724 |
+| Import cycles | none (one layering inversion) | none (inversion fixed — A2) |
+| SQL / shell injection, auth bypass | none found | none found |
+| Demo | 5/5 PASS in 8.6s | 5/5 PASS |
+
+The source roughly doubled and coverage went *up* a point, which is the only direction that means
+anything: 154 uncovered statements are characterized in §5.1's terms, not accumulated.
+
+**Overall, as written at `8beeb49`:** the codebase is unusually careful and unusually honest — every
+dangerous edge carries a written justification, the fail-open policy is deliberate and documented,
+and five audit rounds have burned off nearly all the easy defects. What's left clusters into four
+shapes: **(a)** one genuine P0 in crash-recovery replay, **(b)** the hook path (the mode where the
+lease is the *only* protection) has integrity holes the broker path doesn't, **(c)** nothing is
+bounded — events, parcels, leases, scans all grow forever against a persistent DB with no schema
+versioning, and **(d)** there is no operational surface — a silently-uncoordinated session is
+indistinguishable from a working one.
+
+All four shapes are gone: (a) WP1.1, (b) WP2.x, (c) WP3.x, (d) WP5.x. The shape that replaced them
+was not on this list at all — six defects found by *using* the fabric on real work, two of them in
+fixes made hours earlier the same day.
 
 ---
 
 ## 2. Correctness & concurrency findings (C-series)
 
 ### C1 · P0 — Startup reconciliation re-orphans forever; every restart after one orphan resets trunk to a stale sha
+
+**FIXED · WP1.1 `1f08021`**
+
 `coordinator/integrator.py:709, 736-779`
 
 `reconcile_orphaned_integrations` treats only `{"merged", "merge_rejected", "needs_rebase"}` as
@@ -67,6 +135,9 @@ starts to verdicts by the start's `seq` rather than `(repo, branch, into)` so a 
 can't close an unrelated older orphan.
 
 ### C2 · P1 — Hook-path agent identity collapse
+
+**FIXED · WP2.A `47d0ffd`**
+
 `hooks/adapter.py:463-468, 435-441`
 
 `_agent_id` falls back `agent_id → session_id → "main"`. Claude Code hook payloads carry
@@ -79,6 +150,9 @@ allowed — the lock is vacuously permissive between exactly the agents it exist
 dropping protection for subagents still mid-edit. Verify against the real payload shape first.
 
 ### C3 · P1 — Reconciliation is silently blind past 1M events
+
+**FIXED · WP3.2 `1a07a3a`**
+
 `coordinator/integrator.py:736`
 
 `events_mod.tail(conn, since_seq=0, limit=1_000_000)`, oldest-first, on the event loop at startup.
@@ -87,6 +161,9 @@ invisible — a poisoned trunk is never rolled back; and a start whose verdict l
 looks orphaned — trunk reset to an ancient sha (same blast radius as C1).
 
 ### C4 · P1 — Reaper blocks the loop, dies permanently, poisons shutdown
+
+**FIXED · WP1.2 `e6cfe29`**
+
 `coordinator/reaper.py:145-173`, `server/app.py:303-319`, `blackboard/db.py:64`
 
 Three verified parts: (1) `run()` is `async` but calls `reap_once`/`decay_once` synchronously on
@@ -99,6 +176,9 @@ the stored exception; only `CancelledError` is caught, so lifespan teardown abor
 `conn.close()`.
 
 ### C5 · P1 — `/parcel/update` has no lease-ownership check
+
+**FIXED · WP1.4 `c581ed3` — the "still present" line below is STALE**
+
 `server/app.py:470-508` (ROUND5 known-open, verified still present, impact sharpened)
 
 The UPDATE is keyed on `parcel_id` only; `body.agent_id` is decorative. Any client can overwrite
@@ -110,6 +190,9 @@ validates against state that never landed. Fix (S): a single SQL predicate requi
 write/exclusive lease owned by `body.agent_id`, same shape as `heartbeat`'s scoping.
 
 ### C6 · P1 — No rebase-and-resubmit, and the "preserved" rejected branch is destroyed on rerun
+
+**PARTIAL · WP3.5 `a709ed4`; rebase-and-resubmit still open as WP6.1**
+
 `coordinator/broker.py:370-383`, `worktree/git_ops.py:149-169`, `agent/runner.py:126-143`
 
 Known-open (DESIGN §5.5 promises it; `needs_rebase`/`merge_rejected` are terminal; broker retries
@@ -122,6 +205,9 @@ practice. Interim fix (S): park rejected branches under `rejected/<id>-<ts>` out
 reach. Real fix (L): the §5.5 rebase-and-resubmit loop with bounded attempts.
 
 ### C7 · P1 — The "events are the replay source of truth" claim is false three ways
+
+**FIXED · WP3.4 `3381e12`**
+
 `blackboard/schema.sql:3-4`, throughout
 
 (1) **Not atomic**: every state change + its event are separate autocommit statements
@@ -134,6 +220,9 @@ honest fix (S): demote the claim — events = audit log, SQLite tables = truth �
 `schema_version` table. Real event-sourcing is L and probably not worth it.
 
 ### C8 · P2 — Hook precheck can deny an agent because of its own lease
+
+**FIXED · WP1.5 `68d4bfc`**
+
 `hooks/adapter.py:327-337`, `server/leases.py:159-165`
 
 Two concurrent tool calls from one agent (Claude Code batches parallel Edits routinely): both
@@ -143,6 +232,9 @@ The agent is blocked from a file it just locked, with a message naming itself as
 (S): after a lost acquire, if `_find_holder(...) == agent_id`, allow and keepalive.
 
 ### C9 · P2 — TTL is unvalidated everywhere; a lease can be granted and dead simultaneously
+
+**FIXED · WP1.3 `ecb134b`**
+
 `server/leases.py:116-137`, `blackboard/models.py:138-168`, `hooks/adapter.py:110-119`
 
 `POST /lease` accepts any float. With `ttl <= 0` the row is born expired: the caller gets
@@ -152,6 +244,9 @@ hook-path protection. Huge TTLs are the symmetric hazard (effectively permanent 
 `gt=0` + sane ceiling on `LeaseRequest`/`HeartbeatBody`, clamp in `_hook_lease_ttl`.
 
 ### C10 · P2 — Hook 2s timeout < server 5s busy_timeout: load silently un-gates the shared tree
+
+**FIXED · WP2.A `47d0ffd`**
+
 `hooks/adapter.py:85, 563-565`, `blackboard/db.py:64`
 
 Precisely when the system is busiest (integrate re-index holding a write txn, WAL checkpoint on a
@@ -163,6 +258,9 @@ PreToolUse latency), and/or fail closed with a retry message when the marker fil
 coordination and recent contact.
 
 ### C11 · P2 — One transient git error aborts the whole broker run and leaks leases
+
+**FIXED · WP3.6 `f6d6a16`**
+
 `agent/runner.py:219-324`, `coordinator/broker.py:425-440`
 
 `run_agent` has try/finally but no except: an exception from
@@ -173,6 +271,9 @@ contention, making this reachable under exactly the concurrency the broker creat
 release held leases on the exception path; catch per-task exceptions into an error `AgentResult`.
 
 ### C12 · P2 — Hook parcel ids are cwd-relative; the server's are root-relative
+
+**FIXED · WP2.A `47d0ffd`**
+
 `hooks/adapter.py:471-473, 176-214`, `server/app.py:179-185`
 
 If a session runs in `repo/subdir` (or two agents run with different cwds), the same file yields
@@ -182,6 +283,9 @@ prevent. Also split-brains hook-path leases against broker/index-path leases. Fi
 the repo root by walking to the git root, or query the server's managed root at session start.
 
 ### C13 · P2 — Heartbeat clock knife-edge (known; currently latent, sharpened)
+
+**FIXED · WP1.3 `ecb134b`, `0040f60`**
+
 `server/leases.py:239-251`
 
 The hardened form is correct at default TTLs (liveness predicate evaluated on SQLite's clock,
@@ -191,6 +295,9 @@ and reap still use Python-side timestamps) — an implicit cross-clock invariant
 assertion. Fix (S): TTL floor (≥ 2× busy_timeout) + a startup assertion comparing the two clocks.
 
 ### C14 · P2 — Renames/deletes leave ghost parcels and contracts served as truth
+
+**FIXED · WP3.5 `a709ed4` — the "still present" line below is STALE**
+
 `classifier/store.py:38-45`, `hooks/adapter.py:395-396`, `coordinator/integrator.py:626-632`
 (ROUND5 known-open, verified still present)
 
@@ -202,6 +309,9 @@ advertised. Fix (M): the integrator's post-land re-index retires vanished parcel
 (closing leases/pheromone first for the FK), emitting `parcel_retired`.
 
 ### C15-C17 · P3 — Minor races and staleness
+
+**FIXED · WP4.5 `7bccf6c`, WP4.3 `d6e029a`, WP4.6 `317782b`**
+
 - **C15** `server/events.py:158-177` — `decay_pheromone` is read-modify-write in Python; a
   `drop_pheromone` landing between SELECT and `executemany` gets overwritten with a stale decayed
   value. Fix: single-statement SQL UPDATE with `pow()`.
@@ -227,6 +337,9 @@ itself asserted by a test; `git_ops.py` argv-only with `-`-prefix rejection, nam
 and `--end-of-options` fences.
 
 ### S1 · P2 — Unbounded parcels/leases via `/lease` with `ensure_parcel=True`
+
+**FIXED · WP3.3 `009600a`**
+
 `server/leases.py:102-113` via `server/app.py:427`
 
 Any client can post unlimited distinct parcel ids; each mints a permanent `parcels` row + an
@@ -234,6 +347,9 @@ acquirable lease + a `lease_granted` event. No cap, no cleanup, no per-agent quo
 per-agent quota on auto-created parcels/active leases; shape/length check on `ensure_parcel` ids.
 
 ### S2 · P2 — Unbounded `events` table; uncapped `GET /events?limit=`; 1M-row boot scan
+
+**FIXED · WP3.1 `02d542e`**
+
 `server/events.py:54`, `server/app.py:513`, `coordinator/integrator.py:736`
 
 `?limit=999999999` materializes the whole table into memory + JSON. Compounds C3/C7. Fix (S/M):
@@ -241,6 +357,9 @@ clamp limit (e.g. 1000); retention/compaction job (heartbeat events especially);
 projection-based reconciliation scan.
 
 ### S3 · P3 — The `root + os.sep` boundary check is undefended by tests (M-2, confirmed)
+
+**FIXED · WP1.6 `3d20888`**
+
 `server/app.py:229`, `tests/test_security.py`
 
 The check is *correct*; the problem is that deleting `+ os.sep` (reducing to
@@ -249,6 +368,9 @@ careless edit from a sibling-prefix escape (`/managed` vs `/managed-evil`) with 
 it. Fix (S): one test with a sibling dir whose name extends the root, asserting 403.
 
 ### S4 · P3 — Out-of-repo leaf symlinks leak external file structure on unauthenticated reads
+
+**DECIDED · index it, and say so — see §0**
+
 `classifier/indexer.py:274-280`, `hooks/adapter.py:190-214`
 
 By design (S5: keep it leasable), `link.py -> /home/other/private/thing.py` is parsed and its
@@ -258,6 +380,9 @@ This is also ROUND5's open "leaf-symlink escape" decision. Decide: doc-note the 
 out-of-repo targets in the indexer (S either way) — and write the decision down.
 
 ### S5 · P3 — No HTTP request-body size limit
+
+**FIXED · WP3.3 `009600a`**
+
 No middleware cap anywhere; a giant POST body is read fully into memory. Trivial to add (S).
 
 ### Documented-accepted (consistent between trust model and code — no action)
@@ -269,6 +394,9 @@ TOCTOU on managed-path validation · `/integrate` merging any existing commit-is
 ## 4. Architecture & code-quality findings (A-series)
 
 ### A1 — `needs_rebase` / `expected_read_deps` is unreachable in production
+
+**FIXED · WP4.6 `317782b`**
+
 `coordinator/integrator.py:142-160, 413-436`, `blackboard/models.py:178-184`, `agent/runner.py:245-247`
 
 `IntegrateBody` has no `expected_read_deps` field, so `POST /integrate` — the only path the runner,
@@ -280,6 +408,9 @@ advertised drift detection) or **delete step 1** and note it in SYMBOL_MODE_DESI
 as-is is the worst option.
 
 ### A2 — Layering inversion: pure-SQL `events.py`/`leases.py` homed in `server/`
+
+**FIXED · WP4.1 `2c3529c`**
+
 `coordinator/integrator.py:88`, `coordinator/reaper.py:55` import `server.events`; `server/app.py:90-91`
 imports `coordinator` — bidirectional package dependency, one import away from a cycle. Both
 modules are pure SQLite domain operations (no FastAPI); ../ARCHITECTURE.md's own diagram places them
@@ -287,6 +418,9 @@ modules are pure SQLite domain operations (no FastAPI); ../ARCHITECTURE.md's own
 release; the layering becomes strictly `blackboard ← {classifier, server, coordinator, agent}`.
 
 ### A3 — `integrator.py` is the god module
+
+**PARTIAL · WP4.3 `d6e029a`; `integrator.py` still 842 lines**
+
 780 LOC, MI 43.4 (repo lowest), 3 of the 8 flagged functions (`integrate` C19,
 `reconcile_orphaned_integrations` C16, `run_impact_tests` C14). It does five jobs: merge,
 gate/subprocess-kill machinery, re-index, contract diff, reconciliation. The highest-stakes file
@@ -295,6 +429,9 @@ extract `run_impact_tests` + process-group-kill/stream machinery into `coordinat
 extract the contract-diff helper.
 
 ### A4 — Config sprawl: 7 point-of-use env knobs, two launchers, one misnamed var
+
+**FIXED · WP4.2 `32041f6`**
+
 - `SWARM_SYNC_DB` breaks the `SWARMSYNC_*` convention and is honored only by the `swarm-sync`
   launcher (`server/app.py:568`).
 - Two launchers with different defaults for everything: `swarm-sync` (port 8000, `blackboard.db`,
@@ -310,6 +447,9 @@ Fix (S-M): one `swarmsync/config.py` with typed accessors; accept `SWARMSYNC_DB`
 as deprecated alias; retire one launcher (make the other an alias); one env-var table in README.
 
 ### A5 — Duplication worth factoring
+
+**FIXED · WP4.4 `9e97da8`**
+
 - `MODULE_SYMBOL = "<module>"` defined 3× (`indexer.py:49` canonical, `graph.py:80`,
   `broker.py:140`); parcel-id construction/splitting scattered across 6+ sites (`broker._module_id`,
   `adapter._parcel_id`, `partition("::")` in `leases.py:102`, `runner.py:280`). Any id-scheme change
@@ -319,6 +459,9 @@ as deprecated alias; retire one launcher (make the other an alias); one env-var 
 - `client.integrate` smuggles transport into domain data (`result["_status_code"]`).
 
 ### A6 — API-shape inconsistencies
+
+**FIXED · WP4.5 `7bccf6c`, `e0ff9fb`**
+
 `GET /parcels` and `GET /leases` (`app.py:352-382`) return raw `dict(row)` with no response model —
 the wire shape is whatever `schema.sql` says today; the hook duck-types against it. Unknown-entity
 signaling is split: `/parcel/update` → 404 but `/heartbeat`/`/release` → 200 `{"ok": false}`.
@@ -326,12 +469,18 @@ Fix (S): `response_model` from the existing pydantic models; pick one convention
 fits the philosophy better).
 
 ### A7 — Broker's shared-connection model contradicts the server's
+
+**FIXED · WP4.6 `317782b`**
+
 `coordinator/broker.py:425-440` shares one SQLite connection across worker threads (the `RETURNING`
 comments are scar tissue from real races this invites), while the server uses per-request
 connections — two opposing connection disciplines in one codebase. Fix (S-M): per-thread
 `db.connect()` in `_run_task_with_retries`.
 
 ### A8 — Test-coverage gaps that matter (the 6%)
+
+**FIXED · WP1.6 `3d20888`, WP4.4 `9e97da8`**
+
 - **The `BaseException` trunk-rollback handler** (`integrator.py:654-663`) — the only guard between
   an operator's Ctrl-C and a permanently un-gated merge on trunk — has **zero test coverage**. One
   test: stub the gate to raise `KeyboardInterrupt`, assert rollback + re-raise. (S, no risk.)
@@ -357,12 +506,18 @@ Measured on this machine: venv + `pip install -e ".[dev]"` 11.6s; demo 8.6s, 5/5
 312 green. Time-to-first-success ≈ 1 minute — *if* your `python3` is 3.11+.
 
 ### U1 · Major — Quickstart's literal commands hang on stock Ubuntu
+
+**FIXED · WP5.3 `e6512a6`**
+
 README says "check your version first" then shows `python3 -m venv .venv`. On Ubuntu 22.04
 (`python3` = 3.10, `python3.11` alongside), pasting literally builds a 3.10 venv and
 `pip install -e ".[dev]"` **hangs in resolver backtracking 8+ minutes with zero output** (verified
 live). Fix (S): quickstart leads with `python3.11 -m venv` + a fail-fast preflight one-liner.
 
 ### U2 · Blocker (for operating) — No status/observability surface at all
+
+**FIXED · WP5.1 `329fd00`**
+
 No `/health`, no `/` (both 404, verified), no CLI for "what's leased right now, by whom, expiring
 when." `GET /leases` returns raw epoch floats. The event log is the system's soul and the only tail
 is hand-curl with `?since=`. Combined with fail-open quietness (U4), "it's silently not
@@ -370,6 +525,9 @@ coordinating" is indistinguishable from "it's working." Fix (M): `swarmsync stat
 `events --follow` + a `/health` endpoint returning `{root, db_path, active_leases, last_event_seq}`.
 
 ### U3 · Major — The deny message under-informs, and "retry shortly" is misleading
+
+**FIXED · WP2.S `e0ff9fb`**
+
 Live capture: `swarm-sync: calc.py is leased by agent-a; pick different work or retry shortly.`
 No TTL remaining, no pointer to what *is* free — and hook leases renew on every precheck/postupdate,
 so the lease lives until the holder *stops*; "retry shortly" tells a waiting agent to burn turns
@@ -378,35 +536,53 @@ Related: the server-side `LeaseResult.reason` omits the holder entirely (the ada
 round-trip to recover it) — include `holder`/`ttl_expires_at` in the deny response. Fix (S).
 
 ### U4 · Major — Silent-failure modes are documented but not detectable
+
+**FIXED · WP5.2 `dd6ca1d`**
+
 Server down / wrong root / wrong port → hooks fail open with a note on hook stderr, which Claude
 Code doesn't surface (adapter.py:54 says so itself). Fix (M): `swarmsync doctor` — server reachable
 at `SWARMSYNC_URL`, root matches cwd, marker file present, hooks wired in settings.json, DB
 writable. ~150 lines; kills both README Troubleshooting bullets.
 
 ### U5 · Major — No work-discovery affordance on the hook path
+
+**FIXED · WP5.1 `329fd00`**
+
 The only coordination signal an agent ever receives is being denied *after* deciding to edit.
 Pheromones/intents/`/parcels` exist but nothing surfaces them. Fix (M): `swarmsync free [path...]`
 / `swarmsync holds` that agents can Bash-call, named in the deny message.
 
 ### U6 · Major — The swarmsync skill is machine-local and unshipped
+
+**FIXED · WP5.3 `e6512a6`**
+
 A good SKILL.md (deny-message etiquette, setup) exists at `~/.claude/skills/swarmsync/` but the
 repo contains zero references to it and doesn't ship it; it also hardcodes `~/projects/swarm-sync`
 paths. Every adopter rebuilds that knowledge. Fix (S): ship it in-repo, parameterize, link from
 README.
 
 ### U7 · Major — First-impression/trust: internal audit harness shipped in `scripts/`
+
+**FIXED · WP1.7 `d4a103e`**
+
 `scripts/audit-r4-workflow.js` is a personal audit workflow containing private context (a
 near-miss anecdote, absolute home paths). Commit d6ef512 removed internal docs; this survived,
 sitting next to `swarmsync-hook-guard` — the one script users are told to wire into their editor.
 Fix (S): remove it.
 
 ### U8 · Major — Stale-DB hazard has no remedy command
+
+**FIXED · WP3.4 `3381e12`, WP3.6 `f6d6a16`**
+
 `blackboard.db` sits in the repo root right now (residue of running the `swarm-sync` launcher from
 cwd). DB paths are cwd-relative; leases survive restart; re-index never deletes stale parcels.
 Reusing a DB against a different repo silently mixes parcel maps (compounds C14). Fix (S-M):
 `swarmsync reset` / `--fresh`; default the DB under `$XDG_RUNTIME_DIR` keyed by root hash.
 
 ### U9 · Minor — Papercuts
+
+**FIXED · WP5.2 `dd6ca1d`, WP5.3 `e6512a6`**
+
 Not on PyPI, name unclaimed (squatting risk) · `requirements.txt` duplicates pyproject (drift trap) ·
 `/docs` (Swagger) works and is mentioned nowhere · broker `BlackboardClient` against a down server
 surfaces a raw `httpx.ConnectError` traceback · `swarmsync init-hooks` would replace a 20-line

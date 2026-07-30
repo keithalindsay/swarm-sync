@@ -33,10 +33,21 @@ designed, measured, and decided not to build.
 ## Status
 
 A working prototype and a local developer tool — not a hosted service. The engineering is
-deliberately thorough: **605 tests** (run 3× with zero flakes), `ruff` + `mypy` clean, and five
-review-gated hardening phases — correctness, resource bounds, architecture consolidation, and an
-operator surface (`swarmsync status`/`holds`/`free`/`doctor`). Every fix carries a test that fails
-when the fix is removed, and the architecture pass was adversarially reviewed before it merged.
+deliberately thorough: **632 tests** at 95% coverage, `ruff` + `mypy` clean, and five review-gated
+hardening phases — correctness, resource bounds, architecture consolidation, and an operator surface
+(`swarmsync status`/`holds`/`free`/`doctor`). Every fix carries a test that fails when the fix is
+removed, and the architecture pass was adversarially reviewed before it merged. (The *3× with zero
+flakes* run was done at 605; the 27 since are the regression tests for the defects in the next
+paragraph, and have not had the same treatment.)
+
+**The most useful thing I can tell you about that suite is what it missed.** Six real defects came
+out of *using* the fabric to build another project, not out of testing it — two of them in fixes made
+hours earlier the same day. Among them: coordination keyed on the session's working directory instead
+of the file being edited, so an agent editing a subdirectory repo was silently ungoverned; and a
+`SubagentStop` release that no-op'd whenever the session cwd sat outside the repo, which logged 94
+lease grants against 0 releases before anyone noticed. The 605 tests could not see any of it. That
+gap between *tested* and *used* is the honest headline here, and it is why `pytest` is no longer the
+last step before I believe something works.
 
 Separately, **39 scale tests** under [`tests/scale/`](tests/scale/) drive the broker against a real
 34-module, 10k-line repository with its own 252-test suite, rather than the 96-line `sample_repo` the
@@ -49,7 +60,7 @@ One flake in three runs is not "zero flakes," so it is reported here rather than
 private, and they cannot substitute another one: the gate imports that package from the clone and the
 assertions name its real symbols, because the point is a real import graph rather than a generated
 one. `pytest tests/scale/` therefore reports 39 skips with the reason, instead of erroring — set
-`SWARMSYNC_SCALE_REPO` if you have a checkout. The 605 above need nothing external and cover every
+`SWARMSYNC_SCALE_REPO` if you have a checkout. The 632 above need nothing external and cover every
 claim on this page at small scale; what the scale run found is in the note under *How it works*.
 
 Scope is intentionally tight: Python target (the classifier is stdlib `ast`; a tree-sitter backend
@@ -389,7 +400,13 @@ network you don't control.
   token on `/index`, `/intent`, `/lease`, `/heartbeat`, `/release`, `/parcel/update`, and
   `/integrate`. Unset, anyone who can reach the port can merge a branch and run its tests. Read routes
   (`/parcels`, `/leases`, `/events`, `/contract/{symbol}`) are unauthenticated regardless and expose
-  your code's structure — symbol names, signatures, file paths.
+  your code's structure — symbol names, signatures, file paths. **Including structure from outside the
+  repo**, if a `.py` file in it is a symlink whose target is not: the indexer deliberately indexes such
+  a link under its own in-repo name, because that name is the only handle this repo has on the file and
+  it must stay leasable or an edit through it bypasses coordination entirely. The symbol names and
+  signatures it yields are the *target's*, and an unauthenticated `GET /parcels` will serve them. In-repo
+  symlink aliases are skipped (two names for one inode would mean two write leases on one file); it is
+  only the out-of-repo case that leaks, and the trade is made in favour of not losing edits.
 - **Bind to localhost.** The default host is `127.0.0.1`; keep it there.
 - **Bash-mediated edits are not gated.** The hook matcher covers `Edit|Write|MultiEdit|NotebookEdit`;
   an agent that writes through `Bash` (`sed -i`, `cat >`, `patch`, `git checkout`) bypasses the lease
