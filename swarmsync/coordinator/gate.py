@@ -15,17 +15,20 @@ writes the blackboard or trunk. `integrator.integrate` consumes only the
 """
 from __future__ import annotations
 
+import logging
 import os
 import signal
 import subprocess
 import sys
 from collections import deque
 from pathlib import Path
-from typing import Union
+from typing import Optional, Union
 
 from swarmsync import config
 from swarmsync.classifier.graph import build_graph
-from swarmsync.classifier.indexer import index_repo
+from swarmsync.classifier.indexer import DEFAULT_MAX_INDEX_FILES, index_repo
+
+logger = logging.getLogger(__name__)
 
 StrPath = Union[str, Path]
 
@@ -74,6 +77,37 @@ def resolve_python() -> str:
     return _gate_python() or sys.executable
 
 
+class _AffectedFiles(set[str]):
+    """The reverse-dependency answer, plus whether it IS an answer.
+
+    `_reverse_dep_files` used to return a bare `set()` for two states a caller
+    must not confuse: "the graph says nothing reverse-depends on this change"
+    (a real, empty answer) and "the graph could not be built, so I have no idea"
+    (no answer at all). Both were `set()`, so `run_impact_tests` narrowed
+    identically in each case -- see that function's WIDENING note.
+
+    Why a `set` subclass rather than a second return value: `_reverse_dep_files`
+    is a long-standing seam. `coordinator.integrator` re-exports it,
+    `tests/scale/test_impact_selection.py` replaces it with `lambda r, c: set()`
+    to mutation-test the graph rule and wraps it with a timing shim that returns
+    its result verbatim, and several tests call it directly and do set algebra on
+    what comes back. A tuple return would break every one of those; a subclass of
+    `set[str]` keeps the published contract (`-> set[str]`, and `== set()` still
+    holds) while carrying the one extra bit out of band. A caller that gets a
+    PLAIN set -- because something patched this function -- sees
+    `unavailable_reason` absent via `getattr(..., None)`, i.e. "available", which
+    is the correct reading of a stub that answered without failing.
+    """
+
+    unavailable_reason: Optional[str] = None
+
+    @classmethod
+    def unavailable(cls, reason: str) -> "_AffectedFiles":
+        out = cls()
+        out.unavailable_reason = reason
+        return out
+
+
 def _reverse_dep_files(repo: Path, changed_py: set[str]) -> set[str]:
     """Every repo file that TRANSITIVELY reverse-depends on a changed `.py` file,
     via the classifier's real import/call dependency graph.
@@ -83,9 +117,39 @@ def _reverse_dep_files(repo: Path, changed_py: set[str]) -> set[str]:
     module C -- and the test's own source never names C) is a genuine dependent
     a textual scan of the test source cannot see. We re-index the (already
     merged) repo on disk, build the dep graph, and walk `reverse_edges` out from
-    the changed files. Returns an empty set on any failure (a broken repo, etc.)
-    -- the substring heuristic + full-suite fallback in `run_impact_tests` still
-    backstop selection, so this only ever ADDS coverage, never removes.
+    the changed files.
+
+    NEVER RAISES, and that is deliberate: selection is best-effort and must not
+    turn a gate into an outage, so every failure below is swallowed. But it is no
+    longer swallowed SILENTLY, and the empty set it returns on failure is no
+    longer indistinguishable from a genuine "nothing depends on this":
+
+      * the failure is logged at WARNING with the exception chained
+        (`exc_info`), so a repo that has quietly outgrown
+        `indexer.DEFAULT_MAX_INDEX_FILES` says so on every gate run rather than
+        never; and
+      * the returned set carries `unavailable_reason` (see `_AffectedFiles`), so
+        `run_impact_tests` can WIDEN to the whole suite instead of narrowing on
+        the substring backstop alone.
+
+    Every exception that can reach that handler is a capability loss, not an
+    answer, which is why they are treated alike. Working through them:
+    `index_repo` raises `IndexLimitError` past its file-count OR wall-clock cap
+    (the file cap is the one a growing repo hits); a single pathological source
+    file can raise `RecursionError`/`ValueError` out of `ast.parse` past
+    `index_repo`'s and `build_graph`'s per-file
+    `OSError`/`SyntaxError`/`UnicodeDecodeError` guards; and `MemoryError` on a
+    huge tree. In none of those is "no dependents" the right answer.
+
+    The genuinely quiet cases are the ones that never reach the handler at all,
+    and they are unchanged: an empty `changed_py` (nothing was asked), a changed
+    file with no parcels, a changed file nothing imports, and -- the one worth
+    naming -- the ORDINARY broken repo, because an unparseable file is
+    skipped-and-logged per-file INSIDE `index_repo` rather than aborting the
+    walk. So a syntax error an agent just merged still yields a real, narrowed
+    answer and no widening; only a wholesale inability to index widens. That
+    matters, because "broken repo" is the common case and the one this docstring
+    used to cite as the reason for the bare `except`.
 
     THE WALK IS FILE-GRANULAR, and that is the whole point. It used to be
     parcel-granular -- seed every parcel of a changed file, walk parcel->parcel
@@ -121,12 +185,24 @@ def _reverse_dep_files(repo: Path, changed_py: set[str]) -> set[str]:
     `run_impact_tests` only ever asks about `test_*.py` paths.
     """
     if not changed_py:
-        return set()
+        return _AffectedFiles()
     try:
         parcels = index_repo(repo)
         graph = build_graph(parcels, repo)
-    except Exception:  # noqa: BLE001 -- selection is best-effort; never fail the gate here
-        return set()
+    except Exception as exc:  # noqa: BLE001 -- selection is best-effort; never fail the gate here
+        reason = f"{type(exc).__name__}: {exc}"
+        logger.warning(
+            "swarm-sync: impact selection's dependency graph is UNAVAILABLE for %s "
+            "(%s). Reverse-dependents are UNKNOWN, not empty, so the test gate will "
+            "widen to the whole suite instead of trusting the substring backstop. If "
+            "this repo has grown past classifier.indexer.DEFAULT_MAX_INDEX_FILES "
+            "(%d) .py files, this is permanent until that cap is raised.",
+            repo,
+            reason,
+            DEFAULT_MAX_INDEX_FILES,
+            exc_info=True,
+        )
+        return _AffectedFiles.unavailable(reason)
     parcels_by_file: dict[str, set[str]] = {}
     for parcel in parcels:
         parcels_by_file.setdefault(parcel.path, set()).add(parcel.id)
@@ -147,7 +223,7 @@ def _reverse_dep_files(repo: Path, changed_py: set[str]) -> set[str]:
                 visited.add(target.path)
                 affected.add(target.path)
                 queue.append(target.path)
-    return affected
+    return _AffectedFiles(affected)
 
 
 def _close_streams(proc: subprocess.Popen) -> None:
@@ -216,6 +292,38 @@ def run_impact_tests(
     rather than risk a silent skip. If `test_dir` doesn't exist under `repo` at
     all, falls back further to running pytest across the whole repo.
 
+    WIDENING WHEN THE GRAPH IS UNAVAILABLE. The authoritative signal above can be
+    unavailable rather than empty -- most realistically because the repo has more
+    than `indexer.DEFAULT_MAX_INDEX_FILES` (5000) `.py` files, so `index_repo`
+    raises `IndexLimitError` on every gate run. `_reverse_dep_files` swallows that
+    (it must never fail the gate) and used to return the same bare `set()` it
+    returns for "nothing depends on this change", so selection collapsed to the
+    substring backstop with NO log line, NO event and no change in this
+    function's verdict shape. Measured on a real repo with the cap lowered, an
+    `ingest/types.py` change went from 10 selected test files to 2 (13 to 2 when
+    re-measured on a later state of that same repo) -- the same gap that
+    `tests/scale/test_impact_selection.py::test_h2_graph_selection_is_load_bearing`
+    demonstrates is a false negative -- and an operator had nothing to look at.
+    So when the graph is unavailable this now runs the WHOLE `test_dir` and says
+    so in the returned log.
+
+    The widening's marginal cost is smaller than it sounds, and was measured on
+    that repo for the same change: 34.9 s graph-selected (13 of 14 test files)
+    vs 36.7 s widened, i.e. +5%. The 2.4 s the silent narrowing took was not a
+    cheap gate, it was 2 of 13 test files. Whether that holds on a repo actually
+    past the cap is NOT measured -- see the class of failure named below.
+
+    That trade is deliberate and it is not free: on a repo big enough to trip the
+    cap the full suite may exceed `SWARMSYNC_GATE_TIMEOUT`, in which case every
+    merge is rejected as a timeout instead of being under-tested. That is the
+    failure this chooses, for two reasons. A rejection is recoverable and
+    `integrator._reject_and_reset` restores trunk byte-for-byte, so nothing bad
+    lands and nothing is left half-merged; an under-tested merge is neither
+    recoverable nor visible. And it is consistent with the rest of this module,
+    where "we could not test this" must never read as "this is fine" (see the
+    unusable-interpreter path below). The timeout message names the widening when
+    it applies, so the stall is diagnosable rather than mysterious.
+
     Returns `(ok, combined_stdout_stderr_log)`. Runs `<interpreter> -m pytest`,
     where the interpreter is `SWARMSYNC_GATE_PYTHON` if set and `sys.executable`
     (this process's own Python) otherwise -- see `resolve_python`. Point the knob
@@ -245,6 +353,10 @@ def run_impact_tests(
         "--import-mode=importlib",
     ]
 
+    # Prepended to whatever log this call returns, so a degraded gate is visible in
+    # the merge verdict itself and not only in swarm-sync's logger. Empty on the
+    # normal path.
+    notice = ""
     if not tests_root.exists():
         cmd = base_cmd
     else:
@@ -253,6 +365,12 @@ def run_impact_tests(
         # Authoritative dependency-graph reverse-deps (transitive), plus the
         # substring backstop -- their union is the conservative over-select.
         affected_files = _reverse_dep_files(repo, changed_py)
+        # `getattr`, not an attribute access: the annotated return type here is the
+        # published `set[str]`, and the test seams that replace this function hand
+        # back a PLAIN set. Absent means "the graph answered" -- see `_AffectedFiles`.
+        graph_unavailable: Optional[str] = getattr(
+            affected_files, "unavailable_reason", None
+        )
         selected: list[str] = []
         for test_file in sorted(tests_root.rglob("test_*.py")):
             rel_posix = test_file.relative_to(repo).as_posix()
@@ -264,7 +382,24 @@ def run_impact_tests(
             hit_substr = any(stem and stem in text for stem in changed_stems)
             if hit_graph or hit_substr:
                 selected.append(str(test_file.relative_to(repo)))
-        if selected:
+        if graph_unavailable is not None:
+            # The authoritative signal did not answer. Narrowing on the substring
+            # backstop alone would be a SILENT loss of coverage; widening is a
+            # visible, recoverable loss of time. See the WIDENING note above.
+            cmd = [*base_cmd, test_dir]
+            notice = (
+                f"swarm-sync: impact selection WIDENED this gate run to the whole "
+                f"'{test_dir}' suite. The dependency graph could not be built "
+                f"({graph_unavailable}), so reverse-dependents are UNKNOWN rather "
+                f"than empty. The substring backstop alone would have selected "
+                f"{len(selected)} test file(s) and would have skipped any dependent "
+                f"it does not textually name. If this repo has grown past "
+                f"classifier.indexer.DEFAULT_MAX_INDEX_FILES "
+                f"({DEFAULT_MAX_INDEX_FILES}) .py files then EVERY gate run from now "
+                f"on runs the full suite and may exceed SWARMSYNC_GATE_TIMEOUT; raise "
+                f"that cap to restore impact selection.\n"
+            )
+        elif selected:
             cmd = [*base_cmd, *selected]
         else:
             # Selection uncertain (nothing matched, or no changed .py files) --
@@ -324,15 +459,30 @@ def run_impact_tests(
             # the output rather than wait on it; the verdict does not depend on it.
             stdout, stderr = "", ""
             _close_streams(proc)
+        # Name the widening in the timeout message when it applies. This is the one
+        # place the widening's chosen failure mode actually bites, and "your tests do
+        # not terminate" would be a misdiagnosis of "the gate ran your entire suite
+        # because it could not index the repo".
+        widened_note = (
+            ""
+            if not notice
+            else (
+                " NOTE: this run had been WIDENED to the whole suite because impact "
+                "selection's dependency graph was unavailable, so the timeout may be "
+                "the widening rather than a non-terminating test -- fix the indexing "
+                "failure named above, or raise SWARMSYNC_GATE_TIMEOUT."
+            )
+        )
         return False, (
-            f"{stdout}{stderr}\n"
+            f"{notice}{stdout}{stderr}\n"
             f"swarm-sync: test gate exceeded {timeout:.0f}s and was killed "
             f"(SWARMSYNC_GATE_TIMEOUT to change). Treating as a gate FAILURE: a "
-            f"branch whose tests do not terminate cannot be shown to keep trunk green."
+            f"branch whose tests do not terminate cannot be shown to keep trunk "
+            f"green.{widened_note}"
         )
     # pytest exit code 5 == "no tests were collected" -- e.g. a repo/fixture with
     # no test suite yet, or an impact-selection pass that (correctly) found no
     # test touches this change. Nothing to gate on is not a rejection reason.
     ok = returncode in (0, 5)
-    log = stdout + stderr
+    log = notice + stdout + stderr
     return ok, log

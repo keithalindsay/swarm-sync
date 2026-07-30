@@ -10,6 +10,12 @@
 #
 # Fail-open by construction: if the adapter is missing or errors, editing still works.
 #
+# ONE EXCEPTION -- `release`: the marker check below cannot answer the question for
+# a SubagentStop payload, so `release` skips it and always launches the adapter (see
+# the "release is ungated" note above the dispatch at the bottom of this file). Every
+# other subcommand -- precheck/postupdate (the per-EDIT hot path) and session-start --
+# is unchanged, so "normal, non-coordinated editing pays nothing" still holds exactly.
+#
 # HOOK_BIN resolution (no hardcoded path -- this script must keep working
 # regardless of where the repo/venv is checked out, or under an install that
 # isn't a venv at all):
@@ -66,7 +72,31 @@ is_active() {
     return 1
 }
 
-if is_active; then
+# `release` IS UNGATED. Every signal is_active() consults is derived from a PATH:
+# the env var, a marker at $CLAUDE_PROJECT_DIR/$PWD, or a walk UP from the edited
+# file. A `release` payload (SubagentStop) carries NO file_path, so signal (3) has
+# nothing to walk from and degrades to the payload's `cwd` -- and a Claude Code
+# subagent inherits its parent session's cwd, which is routinely a workspace root or
+# another project entirely. When the coordinated repo is not an ANCESTOR of that cwd
+# there is no marker to find anywhere up the tree, so the guard exited 0 and never
+# called the adapter: the finished agent's leases were never released and every other
+# agent was blocked on them until the 300s TTL expired. Measured, varying only cwd:
+# release from inside the repo -> lease released; from outside -> lease STILL HELD,
+# exit 0, no event, no stderr. A dogfood run logged 94 lease_granted / 0 released.
+#
+# So the gate is not "under-informed" here, it is UNANSWERABLE, and getting it wrong
+# is not fail-OPEN (let work through) but fail-STUCK (hold a lock). Launching the
+# adapter unconditionally is safe because `release` is the one subcommand that cannot
+# act on a repo: it deletes only rows whose agent_id is this very caller's, from a
+# blackboard that exists only because someone opted in (adapter.cmd_release filters
+# by agent_id and POST /release refuses a foreign lease). The gate could therefore
+# only ever cause a leak, never prevent one. Cost when nothing is coordinated:
+# ~0.3s per SubagentStop (measured with no server listening: adapter start, then a
+# refused loopback connect and a silent no-op) against ~8ms for the dormant path it
+# replaces. That is once per finished SUBAGENT, off the editing path -- precheck and
+# postupdate still short-circuit here, so the advertised "non-coordinated editing pays
+# nothing" is untouched, and no per-edit cost is added at all.
+if [ "${1-}" = "release" ] || is_active; then
     if HOOK_BIN=$(resolve_hook_bin) && [ -x "$HOOK_BIN" ]; then
         # Re-feed the event we consumed above; exit with the adapter's status so a
         # DENY (non-zero) still blocks the tool call.

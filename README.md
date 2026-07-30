@@ -38,13 +38,19 @@ review-gated hardening phases — correctness, resource bounds, architecture con
 operator surface (`swarmsync status`/`holds`/`free`/`doctor`). Every fix carries a test that fails
 when the fix is removed, and the architecture pass was adversarially reviewed before it merged.
 
-Separately, **38 scale tests** under [`tests/scale/`](tests/scale/) drive the broker against a real
+Separately, **39 scale tests** under [`tests/scale/`](tests/scale/) drive the broker against a real
 34-module, 10k-line repository with its own 252-test suite, rather than the 96-line `sample_repo` the
-demo uses. They are excluded from the count above because they are slow (~58 s: they clone a repo,
-index 567 parcels, and run real pytest gates) and because they are honest about what that costs — in
+demo uses. They are excluded from the count above because they are slow (~11 min: they clone a repo,
+index 800+ parcels, and run real pytest gates) and because they are honest about what that costs — in
 one of three full-suite runs with them included, `test_demo.py` timed out under the added contention.
-One flake in three runs is not "zero flakes," so it is reported here rather than averaged away. Run
-them with `pytest tests/scale/`; what they found is in the note under *How it works*.
+One flake in three runs is not "zero flakes," so it is reported here rather than averaged away.
+
+**These 39 will SKIP for you, and that is expected.** They need an external fixture repo that is
+private, and they cannot substitute another one: the gate imports that package from the clone and the
+assertions name its real symbols, because the point is a real import graph rather than a generated
+one. `pytest tests/scale/` therefore reports 39 skips with the reason, instead of erroring — set
+`SWARMSYNC_SCALE_REPO` if you have a checkout. The 605 above need nothing external and cover every
+claim on this page at small scale; what the scale run found is in the note under *How it works*.
 
 Scope is intentionally tight: Python target (the classifier is stdlib `ast`; a tree-sitter backend
 is a documented extension point), deterministic scripted agents in the demo (a real Claude Agent SDK

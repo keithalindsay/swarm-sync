@@ -16,9 +16,12 @@ test in one file:
         with harness.scale_blackboard() as sr:
             yield sr
 
-`scale_blackboard()` never touches `/home/keith/projects/code-learner` itself --
-it `git clone`s it into a fresh temp dir under `tempfile.gettempdir()`. That is
-not optional: the broker force-merges, `git reset --hard`s and rewrites trunk.
+`scale_blackboard()` never touches `CODE_LEARNER_REPO` itself -- it `git clone`s
+it into a fresh temp dir under `tempfile.gettempdir()`. That is not optional: the
+broker force-merges, `git reset --hard`s and rewrites trunk. The fixture repo is
+located by `$SWARMSYNC_SCALE_REPO` and the whole package skips when it is absent
+(see `fixture_unavailable`, and the long note above that constant on why the env
+var relocates the fixture rather than substituting a different repo).
 
 WHY THE GATE'S INTERPRETER IS OVERRIDDEN
 ========================================
@@ -41,11 +44,14 @@ PUBLIC INTERFACE
 ================
 Constants::
 
-    CODE_LEARNER_REPO      Path to the real checkout that gets cloned (never written)
-    CODE_LEARNER_PYTHON    Path to code-learner's 3.12 venv python (what the gate runs)
+    CODE_LEARNER_REPO      Checkout that gets cloned (never written). Overridable via
+                           $SWARMSYNC_SCALE_REPO; absent -> the whole package SKIPS.
+    CODE_LEARNER_PYTHON    The FIXTURE's interpreter, which is what the gate runs.
+                           Overridable via $SWARMSYNC_SCALE_PYTHON.
+    fixture_unavailable()  Why this suite cannot run here, or None. Used by conftest.
     TRUNK                  "integration" -- the branch name run_agent/integrate default to
-    PARCEL_COUNT_RANGE     measured sanity range for the index (see MEASURED_* below)
-    MEASURED_PARCELS / MEASURED_CONTRACTS / MEASURED_FILES / PLAN_STATED_PARCELS
+    PARCEL_COUNT_MIN       structural floor for the index -- a floor, NOT a band
+    MEASURED_*             dated observations, asserted against by NOTHING (see below)
 
 Context manager::
 
@@ -176,9 +182,81 @@ from swarmsync.coordinator import broker, gate
 from swarmsync.server.app import create_app
 
 # --- the repo under test ----------------------------------------------------------
+#
+# THIS SUITE NEEDS AN EXTERNAL FIXTURE REPO AND CANNOT SYNTHESIZE ONE. The whole
+# point is a real ~10k-line package with real cross-module import chains and a real
+# 250-test suite; the assertions name its actual symbols (`module_qualname`,
+# `codelearner/db.py`, `ingest/types.py::content_hash`) because a generated repo would
+# only re-encode the author's assumptions about what a dependency graph looks like.
+#
+# The consequence is that the fixture path is ENVIRONMENT, not source. It used to be
+# a bare hardcoded absolute path into one developer's home directory, with no skip: a
+# fresh clone of swarm-sync following the README's `pytest tests/scale/` got 32 errors
+# from a missing directory. Now the path is overridable and its absence SKIPS.
+#
+# READ THIS BEFORE ASSUMING THE ENV VAR MAKES THE SUITE PORTABLE -- IT DOES NOT.
+# `$SWARMSYNC_SCALE_REPO` RELOCATES the fixture; it does not substitute a different
+# repo. `_assert_gate_tests_the_clone` imports `codelearner` from the clone, and the
+# per-hypothesis tests name that package's real symbols. So the only valid value is
+# another checkout of code-learner, WHICH IS A PRIVATE REPOSITORY -- meaning anyone
+# else who clones swarm-sync will skip these 39 tests, not run them, and that is the
+# honest state of affairs rather than something the env var fixes. Generalizing the
+# suite would mean giving up the thing that makes it worth having (assertions about a
+# real import graph, not a generated one). `fixture_unavailable` therefore checks for
+# the package by name and says so, instead of failing 39 times inside setup.
+SCALE_REPO_ENV = "SWARMSYNC_SCALE_REPO"
+SCALE_PYTHON_ENV = "SWARMSYNC_SCALE_PYTHON"
+_DEFAULT_SCALE_REPO = "/home/keith/projects/code-learner"
+# The package the clone must contain -- kept next to the path it qualifies. Same name
+# `_assert_gate_tests_the_clone` imports and the test modules' path prefixes assume.
+FIXTURE_PACKAGE = "codelearner"
 
-CODE_LEARNER_REPO = Path("/home/keith/projects/code-learner")
-CODE_LEARNER_PYTHON = CODE_LEARNER_REPO / ".venv" / "bin" / "python"
+CODE_LEARNER_REPO = Path(os.environ.get(SCALE_REPO_ENV) or _DEFAULT_SCALE_REPO)
+CODE_LEARNER_PYTHON = Path(
+    os.environ.get(SCALE_PYTHON_ENV) or CODE_LEARNER_REPO / ".venv" / "bin" / "python"
+)
+
+
+def fixture_unavailable() -> Optional[str]:
+    """Why this suite cannot run here, or None if it can.
+
+    Checked at collection time by `tests/scale/conftest.py`, which skips every test
+    in the package rather than letting each one error out inside a fixture. Both
+    halves are required and neither is substitutable: without the repo there is
+    nothing to clone, and without ITS interpreter every gate run fails for
+    environment reasons and "trunk stayed green" is vacuously true (see this
+    module's docstring on `SWARMSYNC_GATE_PYTHON`)."""
+    if not CODE_LEARNER_REPO.is_dir():
+        return (
+            f"scale fixture repo not found at {CODE_LEARNER_REPO}. These 39 tests clone "
+            f"a real multi-module Python package ('{FIXTURE_PACKAGE}') and assert on its "
+            f"actual symbols, so they cannot synthesize a fixture and cannot run against "
+            f"an arbitrary repo -- see harness.py. That repo is PRIVATE, so a fresh clone "
+            f"of swarm-sync is expected to skip these; the other ~630 tests need nothing "
+            f"external and cover every README claim at small scale. Set {SCALE_REPO_ENV} "
+            f"if you have a checkout elsewhere."
+        )
+    if not (CODE_LEARNER_REPO / ".git").exists():
+        return (
+            f"{CODE_LEARNER_REPO} is not a git checkout, and the harness clones it "
+            f"(and asserts on reflog/ancestry). Point {SCALE_REPO_ENV} elsewhere."
+        )
+    if not (CODE_LEARNER_REPO / FIXTURE_PACKAGE).is_dir():
+        return (
+            f"{CODE_LEARNER_REPO} has no '{FIXTURE_PACKAGE}/' package, so it is not the "
+            f"fixture this suite is written against. {SCALE_REPO_ENV} RELOCATES that "
+            f"repo; it does not substitute a different one (the gate imports "
+            f"'{FIXTURE_PACKAGE}' from the clone and the assertions name its symbols). "
+            f"Without this check the run failed 39 times deep inside setup instead."
+        )
+    if not os.access(CODE_LEARNER_PYTHON, os.X_OK):
+        return (
+            f"no usable interpreter for the fixture repo at {CODE_LEARNER_PYTHON}. The "
+            f"gate must run the FIXTURE's environment, not swarm-sync's, or every "
+            f"merge is rejected for environment reasons and trunk-stayed-green is "
+            f"vacuous. Set {SCALE_PYTHON_ENV}, or create the venv."
+        )
+    return None
 
 # `worktree.git_ops.init_repo`'s convention, and the default `into` for both
 # `agent.client.integrate` and `coordinator.integrator.integrate`. A clone comes
@@ -186,22 +264,22 @@ CODE_LEARNER_PYTHON = CODE_LEARNER_REPO / ".venv" / "bin" / "python"
 # every /integrate would fail on a missing ref.
 TRUNK = "integration"
 
-# Measured on 2026-07-29 against code-learner @ 661d91b (`classifier.store.run_index`).
-# The execution plan states "380 parcels / 66 contracts / 34 modules"; the first two
-# numbers are STALE -- the real index is 567 parcels over 45 files (34 source modules
-# + 11 test files). Recorded here rather than quietly asserted away, because a harness
-# that "expects ~380" and sees 567 has either indexed the wrong tree or the plan is out
-# of date, and those are very different problems.
+# THESE ARE OBSERVATIONS, NOT EXPECTATIONS. Nothing asserts equality against them.
+#
+# They were measured on 2026-07-29 against code-learner @ 661d91b, a commit that no
+# longer exists -- a history rewrite in that repo replaced every sha. Between that
+# measurement and the next day the same repo also went 567 -> 821 parcels by gaining
+# three modules and three test files. Both events turned this suite red without a
+# single swarm-sync change, which is what taught us not to assert on them:
+#
+#   the fixture is a separately-developed repository, so its parcel and contract
+#   counts are facts about ITS progress, not about swarm-sync's correctness.
+#
+# Kept because they date-stamp what "realistic scale" meant when the hypotheses were
+# written, and because a reader comparing them to a fresh run learns something real
+# about drift. Do not re-pin an assertion to them.
+MEASURED_AT = "code-learner, 2026-07-29 (sha since rewritten)"
 MEASURED_PARCELS = 567
-
-# Contracts went 86 -> 94 when `build_graph`'s `from <pkg> import <submodule>`
-# misattribution was fixed. Those 8 are contracts that SHOULD always have frozen: the
-# bug credited their dependents to the package `__init__` instead, so their
-# blast_radius never reached FREEZE_THRESHOLD and signature changes to them were
-# announced to nobody. `codelearner/db.py` went from blast_radius 3 to 279 -- from
-# barely-at-threshold to the highest in the repo, which is what it always was.
-# Deliberately a hard number, not a range: it is the observable that moved when the
-# defect was fixed, and a silent drift back to 86 would mean the defect returned.
 MEASURED_CONTRACTS = 94
 MEASURED_FILES = 45
 MEASURED_SOURCE_MODULES = 34
@@ -209,10 +287,17 @@ MEASURED_TEST_FILES = 11
 PLAN_STATED_PARCELS = 380
 PLAN_STATED_CONTRACTS = 66
 
-# Deliberately loose: this is a "did we index the real repo, not an empty dir or
-# swarm-sync itself" gate, not a pin on code-learner's exact contents.
-PARCEL_COUNT_RANGE = (500, 650)
-CONTRACT_COUNT_MIN = 60
+# Structural floors, not bands. The only question this gate answers is "did we index a
+# real multi-module Python repo, rather than an empty dir, a single file, or swarm-sync
+# itself" -- so it must survive the fixture growing without bound. A ceiling would make
+# ordinary progress in another repo look like a swarm-sync defect.
+#
+# The #22 regression (contracts 86 -> 94, `from <pkg> import <submodule>` no longer
+# misattributed) is NOT pinned here any more. Pinning it to an absolute count coupled
+# it to how much code the fixture happens to contain; it is asserted RELATIVELY
+# instead, by `test_the_index_is_a_real_repo_at_realistic_scale`.
+PARCEL_COUNT_MIN = 200
+CONTRACT_COUNT_MIN = 40
 
 # --- edit targets, verified against the real import graph + the real suite ---------
 
@@ -881,16 +966,27 @@ def scale_blackboard(
             assert resp.status_code == 200, resp.text
             payload = resp.json()
             parcels, contracts = payload["parcels"], payload["contracts"]
-            low, high = PARCEL_COUNT_RANGE
-            assert low <= parcels <= high, (
-                f"indexed {parcels} parcels from {root}, expected {low}..{high} "
-                f"(measured {MEASURED_PARCELS} for code-learner @ 661d91b; the "
-                f"execution plan's {PLAN_STATED_PARCELS} is stale). Did we index "
-                "the right tree?"
+            # STRUCTURAL, not a band. This asserts "we indexed a real multi-module
+            # Python repo and not an empty dir, a single file, or swarm-sync itself"
+            # -- which is the only thing this gate is for.
+            #
+            # It used to assert a (500, 650) parcel band measured against
+            # code-learner @ 661d91b, and that broke TWICE in one day without a single
+            # swarm-sync change: the fixture repo gained three modules and three test
+            # files (567 -> 821 parcels), and a history rewrite in that repo deleted
+            # 661d91b outright, so even the reference point stopped existing. A band
+            # pinned to a separately-developed repo encodes how much code that repo
+            # happens to contain today, which is not a property of swarm-sync and not
+            # something swarm-sync can keep true.
+            assert parcels >= PARCEL_COUNT_MIN, (
+                f"indexed only {parcels} parcels from {root} (want >= "
+                f"{PARCEL_COUNT_MIN}). That is too small to be the fixture repo -- "
+                "did the clone fail, or is CODE_LEARNER_REPO pointing somewhere else?"
             )
             assert contracts >= CONTRACT_COUNT_MIN, (
-                f"only {contracts} frozen contracts (expected >= {CONTRACT_COUNT_MIN}; "
-                f"measured {MEASURED_CONTRACTS})"
+                f"only {contracts} frozen contracts (want >= {CONTRACT_COUNT_MIN}). "
+                "A real multi-module repo has a frozen-contract surface; near-zero "
+                "means the dependency graph did not build."
             )
 
         scale = ScaleRepo(
@@ -928,22 +1024,27 @@ __all__ = [
     "BREAK_TARGET",
     "CODE_LEARNER_PYTHON",
     "CODE_LEARNER_REPO",
+    "FIXTURE_PACKAGE",
     "CONTRACT_COUNT_MIN",
     "INTEGRATE_TERMINAL_TYPES",
+    "MEASURED_AT",
     "MEASURED_CONTRACTS",
     "MEASURED_FILES",
     "MEASURED_PARCELS",
     "MEASURED_SOURCE_MODULES",
     "MEASURED_TEST_FILES",
-    "PARCEL_COUNT_RANGE",
+    "PARCEL_COUNT_MIN",
     "PLAN_STATED_CONTRACTS",
     "PLAN_STATED_PARCELS",
+    "SCALE_PYTHON_ENV",
+    "SCALE_REPO_ENV",
     "ScaleRepo",
     "TRUNK",
     "blob_at",
     "break_task",
     "edit_task",
     "events",
+    "fixture_unavailable",
     "gate_interpreter",
     "hang_task",
     "integrate_spans",

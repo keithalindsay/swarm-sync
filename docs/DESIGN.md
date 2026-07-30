@@ -20,8 +20,13 @@ Four sub-problems every design must answer, and where we answer them:
 
 ## 2. Chosen architecture: Pheromesh
 
-Selected over Loom, ZLP, Ledger, and Plan-DAG-Contracts. All three judge panels ranked it #1.
-Rationale: it is the **best-of synthesis** of the field —
+Selected over Loom, ZLP, Ledger, and Plan-DAG-Contracts during design, where three independent
+LLM judge panels scored the five candidates and all three ranked this one first. Recorded as
+provenance, not as evidence: those panels judged *design documents*, nothing was built or measured
+yet, and the scoring artifacts are not in this repo — so the claim is unverifiable here and load-bears
+nothing. What follows is the actual argument.
+
+It is the **best-of synthesis** of the field —
 
 - **git worktree physical isolation** (from Loom/ZLP): two broker-driven agents can never share a
   working tree (§5.1 — but hook-driven Claude subagents *do* share one, where the lease is the

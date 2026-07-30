@@ -58,6 +58,21 @@ _SKIP_DIRS = {"__pycache__", ".git", ".venv", "venv", ".pytest_cache", "node_mod
 # spin forever / exhaust memory on a pathologically large (or symlink-inflated)
 # tree. Generous enough that no real prototype repo (sample_repo, the fixtures,
 # the demo copies) comes close, so this never changes existing behavior.
+#
+# BEFORE RAISING OR LOWERING THIS, know that a SECOND caller depends on it, one
+# whose root is NOT caller-supplied and therefore not what the cap defends:
+# `coordinator.gate._reverse_dep_files` indexes the coordinator's own trunk repo
+# on every merge to compute impact selection. Past this cap that call raises and
+# the graph signal is unavailable, so the gate widens to running the WHOLE test
+# suite (it used to narrow to a substring heuristic, silently -- that was the
+# defect). Consequences of each direction, so neither is a surprise:
+#   * lower  -> gates widen sooner, and a repo whose full suite exceeds
+#               SWARMSYNC_GATE_TIMEOUT starts rejecting every merge as a timeout.
+#   * higher -> impact selection keeps working on a bigger repo, at ~2 ms per
+#               `.py` file per merge (measured), until DEFAULT_MAX_INDEX_SECONDS
+#               below becomes the binding limit instead -- 30 s is reached at
+#               roughly 15k files, so raising this without raising that only
+#               moves the cliff.
 DEFAULT_MAX_INDEX_FILES = 5000
 DEFAULT_MAX_INDEX_SECONDS = 30.0
 

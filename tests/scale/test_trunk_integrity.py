@@ -105,22 +105,64 @@ def wave(scale):
 # --- preconditions: we are really testing the real repo, at real scale -------------
 
 
-def test_the_index_is_the_real_repo_at_the_scale_the_plan_claims(scale):
-    """The premise of every other assertion here. Also records where the execution
-    plan's stated numbers are STALE: it says 380 parcels / 66 contracts; the real
-    index is 567 / 86 over 45 files. Reported, not quietly accommodated."""
-    assert scale.parcel_count == harness.MEASURED_PARCELS
-    assert scale.contract_count == harness.MEASURED_CONTRACTS
-    assert scale.parcel_count != harness.PLAN_STATED_PARCELS  # the plan is stale
+def test_the_index_is_a_real_repo_at_realistic_scale(scale):
+    """The premise of every other assertion here: we indexed a real multi-module
+    Python repo with tests, not an empty dir, a single file, or swarm-sync itself.
+
+    Every assertion below is a FLOOR or a SHAPE, never an equality. It used to pin
+    exact counts (567 parcels / 94 contracts / 45 files, measured against the fixture
+    on 2026-07-29) and that went red twice in one day without a single swarm-sync
+    change -- the fixture repo grew by three modules, and a history rewrite there
+    deleted the very commit the numbers were measured at. Those counts are facts about
+    the fixture's progress, not about swarm-sync, so `harness.MEASURED_*` is kept as a
+    dated observation and nothing compares against it."""
+    assert scale.parcel_count >= harness.PARCEL_COUNT_MIN
+    assert scale.contract_count >= harness.CONTRACT_COUNT_MIN
     paths = {
         row["path"]
         for row in scale.conn.execute("SELECT DISTINCT path FROM parcels").fetchall()
     }
-    assert len(paths) == harness.MEASURED_FILES
     source = {p for p in paths if p.startswith("codelearner/")}
     tests_ = {p for p in paths if p.startswith("tests/")}
-    assert len(source) == harness.MEASURED_SOURCE_MODULES
-    assert len(tests_) == harness.MEASURED_TEST_FILES
+
+    # A package, not a script: enough modules for cross-file dependency chains to
+    # exist at all, which is what every hypothesis in this suite walks.
+    assert len(source) >= 20, f"only {len(source)} source modules: {sorted(source)}"
+    # And it must ship tests, because impact selection's whole job is choosing which
+    # of them to run. A fixture with no tests would make H2 vacuously green.
+    assert len(tests_) >= 5, f"only {len(tests_)} test files: {sorted(tests_)}"
+    # Nothing outside those two trees should be indexed -- if it is, the clone is not
+    # the repo we think it is.
+    assert paths == source | tests_, f"unexpected indexed paths: {sorted(paths - source - tests_)}"
+
+
+def test_the_high_blast_radius_module_is_still_the_one_we_think_it_is(scale):
+    """The #22 regression signal, expressed RELATIVELY.
+
+    `from <pkg> import <submodule>` used to be credited to the package `__init__`,
+    which drove `codelearner/db.py`'s blast_radius to 3 -- below FREEZE_THRESHOLD --
+    when its true value was the highest in the repo. The old form of this check was
+    `contract_count == 94`, the absolute number that moved when the bug was fixed;
+    that coupled the signal to how much code the fixture happens to contain. What
+    actually characterises the defect is db.py's RANK, and rank survives the fixture
+    growing.
+
+    (`test_impact_selection.py` checks the same defect from the other side, by
+    asserting the reverse-dependency walk still reaches db.py at all.)"""
+    ranked = [
+        (row["path"], row["radius"])
+        for row in scale.conn.execute(
+            """SELECT path, MAX(blast_radius) AS radius FROM parcels
+               GROUP BY path ORDER BY radius DESC"""
+        ).fetchall()
+    ]
+    top = [path for path, _ in ranked[:3]]
+    assert "codelearner/db.py" in top, (
+        "codelearner/db.py is no longer among the top 3 files by blast_radius "
+        f"(ranked: {ranked[:6]}). Under defect #22 it sat at 3 while the package "
+        "__init__ wore its dependents, which silently disabled contract freezing for "
+        "every module imported as `from <pkg> import <submodule>`."
+    )
 
 
 def test_the_break_target_has_real_dependents(scale):

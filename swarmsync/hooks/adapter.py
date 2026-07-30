@@ -28,7 +28,9 @@ process invocation):
                 the lease TTL (S5). Never releases the lease here -- the agent
                 keeps it until it stops (SubagentStop/Stop -> `release`).
   release       SubagentStop/Stop. Releases every active lease this agent_id
-                holds (GET /leases, filter, POST /release each).
+                holds (GET /leases, filter, POST /release each). The ONE
+                subcommand exempt from the opt-in gate -- see `_UNGATED_RELEASE`
+                in `_dispatch` and requirement 1's exception below.
   session-start SessionStart. Best-effort POST /index of the repo root if the
                 blackboard is reachable; otherwise a silent no-op (the same
                 fail-open umbrella below turns "unreachable" into "no-op").
@@ -47,6 +49,28 @@ gets stuck.
    zero network calls and printed nothing. A user who has never heard of
    swarm-sync is completely unaffected even if this hook is wired into their
    settings.json.
+
+   ONE EXCEPTION -- `release`. Every signal the gate consults is derived from a
+   PATH (the env var, a marker at the repo root, a marker at the payload cwd),
+   and a SubagentStop payload carries NO edit target, so `_repo_root` falls back
+   to the session cwd -- which a Claude Code subagent inherits from its parent
+   and which is routinely OUTSIDE the repo being coordinated. The gate is
+   therefore not merely under-informed on this path, it is unanswerable: the
+   finished agent's leases were never released, and every other agent stayed
+   blocked on them until the 300s TTL expired. That is not fail-OPEN (letting
+   work through), it is fail-STUCK (holding a lock), so it is the one place
+   where the gate's silence does the harm the gate exists to prevent. `release`
+   consequently runs regardless of the gate; it is safe to because it is the one
+   subcommand that cannot act on a repo -- it deletes only rows whose agent_id
+   is this very caller's (`cmd_release` filters, and `POST /release` refuses a
+   foreign lease), so gating it could only ever cause a leak, never prevent one.
+   The ungated path is quiet and stateless by construction: no stderr, no
+   `.swarmsync-last-contact` stamp. `session-start` has the same payload shape
+   and is deliberately NOT exempted: it WRITES (`POST /index` of a cwd-derived
+   root guess), so ungating it would mint root-relative parcel ids into a
+   blackboard whose repo never opted in -- and its miss costs nothing anyway,
+   because `cmd_precheck` passes `ensure_parcel=True` and so leases a parcel
+   that was never indexed.
 
 2. FAIL-OPEN. Everything from "parse the JSON on stdin" through "talk to the
    blackboard" is wrapped in one broad `try/except Exception` in `main()`
@@ -858,9 +882,11 @@ def _dispatch(
     repo_root = _repo_root(payload)
     payload_cwd = Path(payload.get("cwd") or os.getcwd()).resolve()
 
-    # Requirement 1 (OPT-IN): checked before ANY blackboard I/O, for every
-    # subcommand alike. Inactive means silent, zero-network-call ALLOW.
-    if not _is_active(None, repo_root, payload_cwd):
+    # Requirement 1 (OPT-IN): checked before ANY blackboard I/O. Inactive means a
+    # silent, zero-network-call ALLOW -- for every subcommand EXCEPT `release`, which
+    # is deliberately ungated (see `_UNGATED_RELEASE`).
+    active = _is_active(None, repo_root, payload_cwd)
+    if not active and subcommand != "release":
         return 0
 
     base_url = config.url()
@@ -870,6 +896,25 @@ def _dispatch(
     try:
         recorder = _ContactRecordingHttp(http)
         client = BlackboardClient(recorder)
+
+        if not active:
+            # `_UNGATED_RELEASE` -- a SubagentStop whose repo we cannot identify.
+            # Deliberately quiet and stateless: NO degraded-identity warning (a
+            # payload with no identity holds no lease, so there is nothing to
+            # release and no reason to speak), NO `.swarmsync-last-contact` stamp
+            # (that file belongs to a repo that opted in, and `repo_root` here is a
+            # cwd-derived guess we already know is the wrong question), and NO
+            # stderr note when the blackboard is simply absent -- which is the
+            # common case for anyone who wired these hooks globally and never ran a
+            # server. Identity precedence mirrors `_agent_id`, minus its warning.
+            identity = payload.get("agent_id") or payload.get("session_id")
+            if identity:
+                try:
+                    cmd_release(client, identity)
+                except Exception:  # noqa: BLE001 -- best-effort by construction
+                    pass
+            return 0
+
         agent_id = _agent_id(payload, err)
         tool_name = payload.get("tool_name")
         tool_input = payload.get("tool_input") or {}

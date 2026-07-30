@@ -5,10 +5,17 @@ frozen contracts, 252 tests) rather than on `sample_repo`'s 195 lines?
 WHAT THIS FILE MEASURED (numbers from this machine, 2026-07-29)
 ==============================================================
 
-READ THIS FIRST -- BOTH DEFECTS BELOW ARE NOW FIXED
----------------------------------------------------
-These tests were written against a tree where BOTH defects were live, and the
-prose below describes what was originally measured. Since then:
+Every number in this docstring is a DATED OBSERVATION against a fixture repo that is
+developed separately and keeps growing (it has since passed 800 parcels). None of them
+is asserted as an equality; the assertions below are floors and shapes. If a count here
+disagrees with a fresh run, the prose is stale -- that is not a swarm-sync defect.
+
+READ THIS FIRST -- ALL THREE DEFECTS BELOW ARE NOW FIXED
+--------------------------------------------------------
+These tests were written against a tree where all three defects were live, and
+the prose below describes what was originally measured. Since then (DEFECT 3 --
+the index cap silently disabling graph selection -- is written up in the H3
+section, where it was found):
 
 * **DEFECT 1 IS FIXED** (`swarmsync/classifier/graph.py`, commit 54ade0e).
   `_reverse_dep_files` now reaches all 11 test files from `codelearner/db.py`
@@ -93,7 +100,9 @@ The graph signal is nonetheless LOAD-BEARING, not decoration: for
 substring backstop selects only 2. Deleting the graph rule leaves a NON-EMPTY
 selection, so the full-suite fallback does not rescue it -- 8 genuinely failing
 test files would never run. That is measured in
-`test_h2_graph_selection_is_load_bearing`.
+`test_h2_graph_selection_is_load_bearing`, which asserts the PROPERTY (deleting the
+graph rule strands at least one genuinely failing test file) and merely records the
+count, since how many tests exist against `ingest/types.py` is the fixture's business.
 
 H3 -- cost: **held, decisively, and in the OPPOSITE direction from the plan's
 suspicion.** Re-indexing is 0.7%--2.6% of gate wall-clock on code-learner:
@@ -142,21 +151,32 @@ Impact selection pays for itself as soon as it excludes more than ~0.8% of suite
 runtime. It is a net LOSS only when it excludes nothing (the `db.py` case, where
 all 11 files are selected), and even then it wastes 0.74% of the gate.
 
-The real cliff is not cost, it is a silent capability loss:
-`indexer.DEFAULT_MAX_INDEX_FILES = 5000` makes `index_repo` raise
-`IndexLimitError`, which `_reverse_dep_files` catches with a bare
-`except Exception: return set()`. Above 5000 `.py` files the graph signal
-DISAPPEARS with no log line and no event, leaving only the substring heuristic
+The real cliff is not cost, it was a silent capability loss -- **DEFECT 3, NOW
+FIXED** (`coordinator/gate.py`). `indexer.DEFAULT_MAX_INDEX_FILES = 5000` makes
+`index_repo` raise `IndexLimitError`, which `_reverse_dep_files` catches with a
+bare `except Exception: return set()`. Above 5000 `.py` files the graph signal
+DISAPPEARED with no log line and no event, leaving only the substring heuristic
 (and, when that matches nothing, the full-suite fallback). Simulated on the real
-clone, that takes an `ingest/types.py` change from 10 selected test files down to
+clone, that took an `ingest/types.py` change from 10 selected test files down to
 2 -- the same 8-file gap that `test_h2_graph_selection_is_load_bearing` shows is
 a false negative. Extrapolated re-index at that cap is 10.1 s -- still ~0.5% of
 the ~2000 s suite a repo that size would have at code-learner's tests-per-file
-ratio, so the cap is not protecting against a cost problem. See
-`test_h3_index_cap_silently_disables_graph_selection`. This is an EXTRAPOLATION
-from a measured-linear fit at constant edge density; I did not measure a repo
-with denser cross-module coupling, so the `build_graph` edge term could grow
-faster than files do.
+ratio, so the cap is not protecting against a cost problem. This is an
+EXTRAPOLATION from a measured-linear fit at constant edge density; I did not
+measure a repo with denser cross-module coupling, so the `build_graph` edge term
+could grow faster than files do.
+
+The bare `except` is unchanged -- selection is best-effort and must never fail the
+gate -- but the empty set it returns now carries WHY it is empty, so
+`run_impact_tests` can tell "nothing depends on this change" from "I could not
+compute the dependents" and WIDENS to the whole suite for the second, logging the
+reason in both the gate's returned log and swarm-sync's logger. The accepted cost
+is that a repo past the cap whose full suite exceeds `SWARMSYNC_GATE_TIMEOUT`
+(default 600 s) rejects every merge on a timeout instead of under-testing it: a
+visible, trunk-restoring stall in place of an invisible false negative. The test
+that CHARACTERIZED this defect has been inverted into a regression guard,
+`test_h3_index_cap_no_longer_silently_disables_graph_selection`, and keeps the
+`graph=False` control that measures the narrowing it replaced.
 
 HOW GROUND TRUTH IS DERIVED (and why it is not circular)
 ========================================================
@@ -876,11 +896,17 @@ def test_h2_graph_selection_is_load_bearing(
         f"{sorted(truth.failing)} selected={sorted(with_graph)}"
     )
     missed = truth.failing - without_graph
-    assert len(missed) >= 8, (
-        "deleting the graph rule was supposed to strand at least 8 genuinely "
-        f"failing test files; it stranded {len(missed)} ({sorted(missed)}). The "
-        "graph rule may have stopped being load-bearing, or the substring "
-        "backstop has widened."
+    # ONE stranded failing test file is already the whole finding: the gate would
+    # approve a merge that breaks trunk. This used to demand `>= 8` -- the count
+    # measured on 2026-07-29 -- and that number is a fact about how many tests the
+    # fixture repo happens to have written against `ingest/types.py`, not about
+    # whether the graph rule is load-bearing. It fell to 3 when the fixture grew and
+    # the substring backstop happened to match more of the new test text, which made
+    # a green property look red. The count is still reported in the record above.
+    assert missed, (
+        "deleting the graph rule stranded NO genuinely failing test file, so the "
+        "graph rule is not load-bearing for this change and this mutation check is "
+        f"vacuous. failing={sorted(truth.failing)} without_graph={sorted(without_graph)}"
     )
 
 
@@ -1615,15 +1641,32 @@ def test_h3_gate_interpreter_override_cost_is_separable_and_small(
     )
 
 
-def test_h3_index_cap_silently_disables_graph_selection(scale: harness.ScaleRepo) -> None:
-    """The finding that is not about cost: above `DEFAULT_MAX_INDEX_FILES` the
-    graph signal vanishes with no signal at all.
+def test_h3_index_cap_no_longer_silently_disables_graph_selection(
+    scale: harness.ScaleRepo,
+) -> None:
+    """Above `DEFAULT_MAX_INDEX_FILES` the graph signal is still unavailable, but the
+    gate now WIDENS to the whole suite instead of narrowing in silence.
 
-    `index_repo` raises `IndexLimitError`; `_reverse_dep_files` catches bare
-    `Exception` and returns the empty set. Selection then silently degrades to the
-    substring heuristic (or the full-suite fallback) with no log line, no event,
-    and no difference in the gate's verdict shape -- so the operator of a repo
-    that has grown past the cap cannot tell that impact selection stopped working.
+    **Inverted when the fix landed** (`coordinator/gate.py`), following the same
+    convention as Defects 1 and 2 above. As written this test asserted the defect:
+    `index_repo` raises `IndexLimitError`, `_reverse_dep_files` catches bare
+    `Exception` and returns the empty set, and selection degraded to the substring
+    heuristic with no log line, no event and no difference in the gate's verdict
+    shape -- so the operator of a repo that had grown past the cap could not tell
+    impact selection had stopped working. Measured here on the real clone, that took
+    this change from 10 selected test files to 2, the same 8-file gap
+    `test_h2_graph_selection_is_load_bearing` shows is a false negative.
+
+    The bare `except` is unchanged and still catches everything -- selection must
+    never fail the gate. What changed is that the empty set now carries WHY it is
+    empty, so "no dependents" and "could not compute dependents" are no longer the
+    same answer.
+
+    The narrowing the fix replaces is measured here as the discrimination control
+    (`graph=False`), not merely described: it must still be a strict, non-empty
+    subset, because if it were empty the pre-existing full-suite fallback would
+    produce the same widened argv for an entirely different reason and this test
+    would prove nothing.
     """
     changed = "codelearner/ingest/types.py"
     before = gate._reverse_dep_files(scale.root, {changed})
@@ -1637,7 +1680,10 @@ def test_h3_index_cap_silently_disables_graph_selection(scale: harness.ScaleRepo
     with mock.patch.object(gate, "index_repo", over_cap):
         after = gate._reverse_dep_files(scale.root, {changed})
         selection_after = _gate_selection(scale.root, [changed])
+        _ok, gate_log = gate.run_impact_tests(scale.root, [changed])
     selection_before = _gate_selection(scale.root, [changed])
+    # What the gate USED to fall back to when the graph vanished.
+    selection_substring_only = _gate_selection(scale.root, [changed], graph=False)
 
     _record(
         "h3_index_cap",
@@ -1647,16 +1693,34 @@ def test_h3_index_cap_silently_disables_graph_selection(scale: harness.ScaleRepo
             "graph_dependents_over_cap": len(after),
             "gate_selection_normally": selection_before,
             "gate_selection_over_cap": selection_after,
-            "test_files_lost": sorted(set(selection_before) - set(selection_after)),
+            "selection_the_old_silent_narrowing_would_have_used": (
+                selection_substring_only
+            ),
+            "test_files_the_old_narrowing_lost": sorted(
+                set(selection_before) - set(selection_substring_only)
+            ),
+            "gate_log_announces_widening": "WIDENED" in gate_log,
         },
     )
     assert after == set(), (
         f"expected the empty set once index_repo raises, got {sorted(after)}"
     )
-    assert set(selection_after) < set(selection_before), (
-        "the gate's selection did not shrink when the graph signal disappeared, so "
-        "this repo cannot demonstrate the silent degradation "
-        f"({selection_before} -> {selection_after})"
+    assert set(selection_substring_only) < set(selection_before) and (
+        selection_substring_only
+    ), (
+        "the substring backstop no longer narrows non-emptily on this change, so this "
+        "repo cannot distinguish widening from the pre-existing full-suite fallback "
+        f"({selection_before} -> {selection_substring_only})"
+    )
+    assert selection_after == [gate.DEFAULT_TEST_DIR], (
+        "THE INDEX-CAP DEFECT HAS REGRESSED: with the dependency graph unavailable "
+        f"the gate selected {selection_after} instead of widening to the whole suite. "
+        f"It is back to reading 'I could not compute the dependents' as 'there are no "
+        f"dependents', which on this change silently drops "
+        f"{sorted(set(selection_before) - set(selection_substring_only))}."
+    )
+    assert "WIDENED" in gate_log, (
+        f"the gate widened without saying so in its own log: {gate_log!r}"
     )
 
 

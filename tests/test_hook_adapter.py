@@ -17,7 +17,14 @@ Coverage (see this unit's brief):
   - malformed stdin -> fail-open ALLOW
   - postupdate re-hashes the edited file and posts content_hash/state_summary
   - release releases only the calling agent's own active leases
-  - session-start POSTs /index when reachable, no-ops when not
+  - release runs even when the opt-in gate reads inactive (the one exempt
+    subcommand -- a missed release is fail-STUCK, not fail-open), quietly and
+    without stamping repo state, still scoped to the caller's own agent_id
+  - session-start POSTs /index when reachable, no-ops when not, and is
+    deliberately NOT exempt from the gate
+
+`session-start` is NOT exempt from the opt-in gate. See the block above the
+session-start tests for why the asymmetry with `release` is deliberate.
 """
 from __future__ import annotations
 
@@ -153,13 +160,15 @@ def test_inactive_repo_is_a_silent_noop_allow(monkeypatch, repo):
     assert err == ""
 
 
-def test_inactive_repo_release_and_postupdate_and_session_start_are_also_noop(monkeypatch, repo):
+@pytest.mark.parametrize("subcommand", ["postupdate", "session-start"])
+def test_inactive_repo_postupdate_and_session_start_are_also_noop(monkeypatch, repo, subcommand):
+    """`release` is deliberately NOT in this list -- see the `_UNGATED_RELEASE` block
+    below. Everything else keeps the zero-network-call opt-in guarantee."""
     monkeypatch.delenv("SWARMSYNC_ACTIVE", raising=False)
-    for subcommand in ("release", "postupdate", "session-start"):
-        payload = _payload("Edit", file_path=str(repo / "mod_a.py"), cwd=str(repo), agent_id="a1")
-        code, out, err = _run(subcommand, payload, http_factory=_ExplodingFactory())
-        assert code == 0
-        assert out == err == ""
+    payload = _payload("Edit", file_path=str(repo / "mod_a.py"), cwd=str(repo), agent_id="a1")
+    code, out, err = _run(subcommand, payload, http_factory=_ExplodingFactory())
+    assert code == 0
+    assert out == err == ""
 
 
 # --- activation via marker file (the other opt-in path) ----------------------------
@@ -552,7 +561,170 @@ def test_release_is_a_noop_when_agent_holds_no_leases(monkeypatch, repo, indexed
     assert indexed_client.get("/leases").json() == []
 
 
+# --- release is UNGATED: it runs even when the opt-in gate reads inactive ----------
+#
+# THE DEFECT. Every signal `_is_active` consults is derived from a PATH, and a
+# SubagentStop payload carries no edit target, so `_repo_root` falls back to the
+# session `cwd` -- which a Claude Code subagent inherits from its parent and which is
+# routinely OUTSIDE the repo being coordinated. The gate then read "inactive" for a
+# session that was very much coordinating, `release` no-opped, and the finished
+# agent's write leases were reclaimed only by 300s TTL expiry. A 3-agent dogfood
+# logged 94 `lease_granted` / 0 `released`; all 5 of its denials named holders that
+# had already stopped, and one agent was starved of both files it needed.
+#
+# A missed release is not fail-OPEN (which lets work through, and is the documented
+# policy precisely so a broken setup never blocks editing) -- it is fail-STUCK: it
+# HOLDS a lock. So `release` is exempt from the gate. It is the one subcommand that
+# can be, because it cannot act on a repo: it deletes only rows whose `agent_id` is
+# this very caller's.
+
+
+def _inactive(monkeypatch, repo):
+    monkeypatch.delenv("SWARMSYNC_ACTIVE", raising=False)
+    assert not (repo / adapter.ACTIVE_MARKER_FILENAME).exists()
+
+
+def test_release_runs_even_when_the_opt_in_gate_reads_inactive(monkeypatch, repo, indexed_client):
+    """REGRESSION: the lease must be gone after `release` even with NO activation
+    signal the adapter can see -- no `SWARMSYNC_ACTIVE`, no marker at the resolved
+    repo root, no marker at the payload `cwd`. That is exactly the state a subagent
+    whose cwd sits outside the coordinated repo presents.
+
+    Pre-fix this returned 0 having made zero network calls, and the lease below was
+    still `active` afterwards.
+    """
+    _inactive(monkeypatch, repo)
+    granted = indexed_client.post(
+        "/lease",
+        json={"agent_id": "sub-A", "parcel_id": f"mod_a.py::{MODULE_SYMBOL}", "mode": "write"},
+    ).json()
+    assert granted["granted"]
+
+    payload = _payload("SubagentStop", cwd=str(repo), agent_id="sub-A", session_id="sess-1")
+    code, out, err = _run("release", payload, http_factory=_http_factory(indexed_client))
+
+    assert code == 0
+    assert indexed_client.get("/leases").json() == [], "ungated release did not free the lease"
+    events = indexed_client.get("/events").json()
+    assert any(e["type"] == "released" for e in events), "no `released` event was recorded"
+
+
+def test_ungated_release_still_only_touches_the_calling_agents_leases(
+    monkeypatch, repo, indexed_client
+):
+    """The DANGEROUS mutation this fix must not become: a `release` that runs without
+    the opt-in gate and releases leases it does not own. Ungating widens WHEN release
+    runs, never WHAT it may free -- the `agent_id` filter is the whole safety argument
+    for ungating it, so it is pinned here on the ungated path specifically (the gated
+    path has its own coverage above)."""
+    _inactive(monkeypatch, repo)
+    for agent, mod in (("sub-A", "mod_a.py"), ("sub-B", "mod_b.py"), ("sub-B", "mod_c.py")):
+        r = indexed_client.post(
+            "/lease",
+            json={"agent_id": agent, "parcel_id": f"{mod}::{MODULE_SYMBOL}", "mode": "write"},
+        ).json()
+        assert r["granted"]
+
+    payload = _payload("SubagentStop", cwd=str(repo), agent_id="sub-A", session_id="sess-shared")
+    code, out, err = _run("release", payload, http_factory=_http_factory(indexed_client))
+
+    assert code == 0
+    survivors = sorted(lease["parcel_id"] for lease in indexed_client.get("/leases").json())
+    assert survivors == [f"mod_b.py::{MODULE_SYMBOL}", f"mod_c.py::{MODULE_SYMBOL}"]
+
+
+def test_ungated_release_is_silent_when_the_blackboard_is_absent(monkeypatch, repo):
+    """Quietness is load-bearing, not cosmetic. `release` is now wired to run in every
+    repo, including the many that never opted in, so the common case is "no server
+    listening at all". If that emitted the umbrella's `failing open (...)` note it
+    would put one line of pure noise on hook stderr per finished subagent per project
+    -- the stream an operator is supposed to read when coordination misbehaves. The
+    ungated path therefore swallows the absent-blackboard case in `_dispatch` instead
+    of letting it reach `main()`'s umbrella."""
+    _inactive(monkeypatch, repo)
+    payload = _payload("SubagentStop", cwd=str(repo), agent_id="sub-A", session_id="sess-1")
+    code, out, err = _run("release", payload, http_factory=lambda base_url: _ExplodingHttp())
+
+    assert code == 0
+    assert out == "", out
+    assert err == "", err
+
+
+def test_ungated_release_does_not_stamp_last_contact(monkeypatch, repo, indexed_client):
+    """`.swarmsync-last-contact` is repo state that feeds the C10 fail-CLOSED tier, and
+    on the ungated path `repo_root` is a cwd-derived GUESS -- the very input we stopped
+    trusting. Writing the stamp there would litter unrelated directories with
+    swarm-sync state on every SubagentStop, so the ungated path never stamps."""
+    _inactive(monkeypatch, repo)
+    indexed_client.post(
+        "/lease",
+        json={"agent_id": "sub-A", "parcel_id": f"mod_a.py::{MODULE_SYMBOL}", "mode": "write"},
+    )
+    stamp = repo / adapter.LAST_CONTACT_FILENAME
+    assert not stamp.exists()
+
+    payload = _payload("SubagentStop", cwd=str(repo), agent_id="sub-A", session_id="sess-1")
+    code, out, err = _run("release", payload, http_factory=_http_factory(indexed_client))
+
+    assert code == 0
+    assert indexed_client.get("/leases").json() == []
+    assert not stamp.exists(), "ungated release stamped last-contact into an un-opted-in tree"
+
+
+def test_ungated_release_with_no_identity_makes_no_request_and_says_nothing(monkeypatch, repo):
+    """A payload with neither `agent_id` nor `session_id` can hold no lease, so there is
+    nothing to release. The gated path mints a degraded per-invocation id and warns on
+    stderr about it; on the ungated path that warning would fire in projects that never
+    opted in and name an action nobody can take, so the ungated path skips the call
+    entirely rather than talking to the blackboard about a random uuid."""
+    _inactive(monkeypatch, repo)
+    payload = _payload("SubagentStop", cwd=str(repo))
+    code, out, err = _run("release", payload, http_factory=lambda base_url: _ExplodingHttp())
+
+    assert code == 0
+    assert out == "" and err == ""
+
+
+def test_ungated_release_prefers_agent_id_over_session_id(monkeypatch, repo, indexed_client):
+    """Identity precedence on the ungated path must match `_agent_id`: `agent_id` (unique
+    per subagent) beats `session_id` (SHARED by every subagent of one session). Getting
+    this backwards would make one subagent's stop release its live siblings' leases."""
+    _inactive(monkeypatch, repo)
+    for agent, mod in (("sub-A", "mod_a.py"), ("sess-shared", "mod_b.py")):
+        indexed_client.post(
+            "/lease",
+            json={"agent_id": agent, "parcel_id": f"{mod}::{MODULE_SYMBOL}", "mode": "write"},
+        )
+
+    payload = _payload("SubagentStop", cwd=str(repo), agent_id="sub-A", session_id="sess-shared")
+    code, out, err = _run("release", payload, http_factory=_http_factory(indexed_client))
+
+    assert code == 0
+    survivors = [lease["agent_id"] for lease in indexed_client.get("/leases").json()]
+    assert survivors == ["sess-shared"]
+
+
 # --- session-start: POST /index when reachable, no-op otherwise ------------------
+#
+# Deliberately NOT ungated alongside `release`, though its payload has the same shape
+# (no edit target). Two reasons, both asymmetries with `release`:
+#
+#   * Blast radius runs the other way. `release` only DELETES rows keyed by the
+#     caller's own agent_id; `session-start` WRITES -- `POST /index {root: <a
+#     cwd-derived guess>}`. With no marker to consult there is nothing to make that
+#     guess right, and `run_index` keys parcel ids relative to whatever root it is
+#     handed, so a guess that happens to fall under a broad `SWARMSYNC_ROOTS` would
+#     mint divergent ghost ids (the C12 failure) into a blackboard whose repo never
+#     opted in. A guess that does not is a 403. Neither outcome is worth having.
+#   * Its miss is not fail-STUCK. This `/index` is a documented best-effort warm-up
+#     that holds no lock: `cmd_precheck` passes `ensure_parcel=True`, so a parcel that
+#     was never indexed is created at acquire time and leasing works regardless. A
+#     skipped session-start costs a pre-warmed parcel/contract table, not a 300s lock
+#     on another agent's file.
+#
+# The right fix here is a different one -- resolve the root from the server's own
+# managed root (`GET /health` -> `root`), which is the only root `/index` can accept
+# anyway -- and it is a behavior change to a best-effort path, not this defect.
 
 
 def test_session_start_indexes_repo_when_reachable(monkeypatch, repo, test_client):

@@ -12,12 +12,19 @@ HOOK_BIN resolution paths (`command -v` on PATH, and the `../.venv/bin`
 sibling fallback relative to the script's own location) so "did the adapter
 actually launch?" is directly observable and the tests never depend on a real
 server being up.
+
+The `release`-from-OUTSIDE block at the bottom is the one case every other test
+here (and every test in test_hook_adapter.py) structurally could not see: they
+all run with cwd INSIDE the marked fixture repo, which is precisely the one
+condition under which the missed-release bug is invisible.
 """
 from __future__ import annotations
 
 import stat
 import subprocess
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 GUARD_SRC = REPO_ROOT / "scripts" / "swarmsync-hook-guard"
@@ -57,22 +64,39 @@ def _write_stub_adapter(dest_dir: Path, sentinel: Path, exit_code: int = 0) -> P
     return stub
 
 
-def _run_guard(guard: Path, *, active_env: bool, project_dir: Path, path: str, args=()):
+def _run_guard(
+    guard: Path,
+    *,
+    active_env: bool,
+    project_dir: Path,
+    path: str,
+    args=(),
+    cwd: Path | None = None,
+    payload: str | None = None,
+):
+    """Run the guard. `cwd` defaults to `project_dir` (the common case); pass it
+    explicitly to put the PROCESS somewhere other than the project dir. `payload`
+    is the JSON hook event on stdin -- None means an empty stdin."""
     env = {"PATH": path}
     if active_env:
         env["SWARMSYNC_ACTIVE"] = "1"
     env["CLAUDE_PROJECT_DIR"] = str(project_dir)
-    return subprocess.run(
-        [str(guard), *args],
-        env=env,
-        cwd=str(project_dir),
+    stdin_kwargs = (
         # The guard reads its payload with an unconditional `INPUT=$(cat)`. Without
         # an explicit stdin it inherits the terminal under `pytest -s` (capture off)
         # and blocks forever. DEVNULL keeps `-s` usable for watching live output.
-        stdin=subprocess.DEVNULL,
+        {"stdin": subprocess.DEVNULL}
+        if payload is None
+        else {"input": payload}
+    )
+    return subprocess.run(
+        [str(guard), *args],
+        env=env,
+        cwd=str(cwd if cwd is not None else project_dir),
         capture_output=True,
         text=True,
         timeout=30,
+        **stdin_kwargs,
     )
 
 
@@ -190,6 +214,178 @@ def test_active_but_adapter_unavailable_is_fail_open(tmp_path):
     )
 
     assert result.returncode == 0, "guard was not fail-open with an unavailable adapter"
+
+
+# --- `release` from a cwd OUTSIDE the coordinated repo ------------------------------
+#
+# The blind spot. Every test above puts the process cwd and $CLAUDE_PROJECT_DIR
+# INSIDE the marked project, which is the one arrangement in which a `release` that
+# never reaches the adapter is invisible. A Claude Code subagent inherits its parent
+# session's cwd, so "cwd outside the repo it edits" is the NORMAL case, not the exotic
+# one -- and a SubagentStop payload carries no file_path for the walk-up to work from.
+
+
+def _outside_layout(tmp_path):
+    """A marked coordinated repo, and an unrelated dir that is NOT an ancestor of it
+    (so no walk UP from the session cwd can ever reach the marker)."""
+    repo = tmp_path / "coordinated-repo"
+    repo.mkdir()
+    (repo / ".swarmsync-active").write_text("")
+    outside = tmp_path / "elsewhere" / "some-other-project"
+    outside.mkdir(parents=True)
+    return repo, outside
+
+
+def _stop_payload(cwd: Path) -> str:
+    """A SubagentStop event as Claude Code sends it: session/agent identity and a
+    cwd, and -- the whole point -- NO `file_path`/`notebook_path`."""
+    return (
+        '{"hook_event_name": "SubagentStop", "session_id": "sess-1", '
+        f'"agent_id": "sub-A", "cwd": "{cwd}"}}'
+    )
+
+
+def test_release_launches_the_adapter_from_a_cwd_outside_the_repo(tmp_path):
+    """REGRESSION (the defect this stage fixes): `SubagentStop -> release` must reach
+    the adapter even though the session's cwd is nowhere near the coordinated repo.
+
+    Pre-fix the guard evaluated `is_active()` for `release` like any other subcommand.
+    All three of its signals are path-derived: SWARMSYNC_ACTIVE (unset here), a marker
+    at $CLAUDE_PROJECT_DIR/$PWD (both `outside`), and a walk UP from the payload's edit
+    target -- which a release payload does not have, so it degrades to walking up from
+    `cwd`, and `repo` is not an ancestor of `outside`. No marker anywhere -> exit 0,
+    adapter never launched, the finished subagent's leases held until the 300s TTV
+    expired, and every other agent blocked on files whose holder had already finished.
+    Measured end to end (real server, real guard, varying only cwd): release from
+    inside -> lease released + a `released` event; from outside -> lease STILL HELD,
+    exit 0, no event, no stderr. A 3-agent dogfood logged 94 `lease_granted` / 0
+    `released`, all 5 of its denials naming holders that had already stopped.
+    """
+    repo, outside = _outside_layout(tmp_path)
+    sentinel = tmp_path / "launched"
+    bin_dir = tmp_path / "bin"
+    _write_stub_adapter(bin_dir, sentinel)
+    guard = _copy_guard(tmp_path / "scripts")
+
+    result = _run_guard(
+        guard,
+        active_env=False,          # no env activation: only the in-repo marker exists
+        project_dir=outside,       # $CLAUDE_PROJECT_DIR is OUTSIDE the repo
+        cwd=outside,               # ...and so is the process cwd
+        path=f"{bin_dir}:{BARE_PATH}",
+        args=["release"],
+        payload=_stop_payload(outside),
+    )
+
+    assert result.returncode == 0
+    assert sentinel.exists(), (
+        "guard did not launch the adapter for `release` from a cwd outside the repo -- "
+        "the finished agent's leases would be held until TTL expiry"
+    )
+    assert sentinel.read_text().strip() == "release"
+
+
+@pytest.mark.parametrize("subcommand", ["precheck", "postupdate", "session-start"])
+def test_only_release_is_ungated_others_still_pay_nothing(tmp_path, subcommand):
+    """The opposite mutation: `release` is exempt from the marker check, NOTHING ELSE
+    is. If someone "simplifies" the fix into an unconditional launch, the guard stops
+    being a guard -- every non-coordinated edit pays a ~0.3s Python start (measured;
+    the dormant path is ~8ms), which is the entire property the shim advertises.
+
+    Same out-of-repo arrangement as the release test above, so the ONLY difference
+    between passing and failing here is the subcommand.
+    """
+    repo, outside = _outside_layout(tmp_path)
+    sentinel = tmp_path / "launched"
+    bin_dir = tmp_path / "bin"
+    _write_stub_adapter(bin_dir, sentinel)
+    guard = _copy_guard(tmp_path / "scripts")
+
+    result = _run_guard(
+        guard,
+        active_env=False,
+        project_dir=outside,
+        cwd=outside,
+        path=f"{bin_dir}:{BARE_PATH}",
+        args=[subcommand],
+        payload=_stop_payload(outside),
+    )
+
+    assert result.returncode == 0
+    assert not sentinel.exists(), (
+        f"guard launched the adapter for `{subcommand}` while dormant -- only "
+        "`release` is exempt from the opt-in marker check"
+    )
+
+
+@pytest.mark.parametrize("subcommand", ["precheck", "postupdate", "session-start"])
+def test_dormant_edit_path_never_launches_python(tmp_path, subcommand):
+    """The zero-overhead promise, pinned per-subcommand for the ordinary dormant case
+    (no marker anywhere at all, cwd == project dir). `precheck`/`postupdate` are the
+    PER-EDIT hooks, so this is the assertion that must never regress."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    sentinel = tmp_path / "launched"
+    bin_dir = tmp_path / "bin"
+    _write_stub_adapter(bin_dir, sentinel)
+    guard = _copy_guard(tmp_path / "scripts")
+
+    result = _run_guard(
+        guard,
+        active_env=False,
+        project_dir=project,
+        path=f"{bin_dir}:{BARE_PATH}",
+        args=[subcommand],
+        payload=f'{{"tool_name": "Edit", "tool_input": {{"file_path": "{project}/x.py"}}}}',
+    )
+
+    assert result.returncode == 0
+    assert not sentinel.exists(), f"dormant guard launched Python for `{subcommand}`"
+
+
+def test_release_still_honors_the_marker_when_cwd_is_inside(tmp_path):
+    """The ungating must not have broken the ordinary in-repo case (which is how the
+    bug hid for 605 tests): `release` with the marker present and cwd inside still
+    launches the adapter, and still forwards its subcommand."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / ".swarmsync-active").write_text("")
+    sentinel = tmp_path / "launched"
+    bin_dir = tmp_path / "bin"
+    _write_stub_adapter(bin_dir, sentinel)
+    guard = _copy_guard(tmp_path / "scripts")
+
+    result = _run_guard(
+        guard,
+        active_env=False,
+        project_dir=project,
+        path=f"{bin_dir}:{BARE_PATH}",
+        args=["release"],
+        payload=_stop_payload(project),
+    )
+
+    assert result.returncode == 0
+    assert sentinel.exists()
+    assert sentinel.read_text().strip() == "release"
+
+
+def test_ungated_release_is_still_fail_open_with_no_adapter(tmp_path):
+    """`release` skipping the marker check must not cost the fail-open property: with
+    no adapter resolvable via EITHER path the guard still exits 0."""
+    _repo, outside = _outside_layout(tmp_path)
+    guard = _copy_guard(tmp_path / "some-other-checkout" / "scripts")
+
+    result = _run_guard(
+        guard,
+        active_env=False,
+        project_dir=outside,
+        cwd=outside,
+        path=BARE_PATH,  # no swarmsync-hook on PATH, no ../.venv/bin sibling
+        args=["release"],
+        payload=_stop_payload(outside),
+    )
+
+    assert result.returncode == 0
 
 
 def test_active_adapter_exit_code_propagates(tmp_path):

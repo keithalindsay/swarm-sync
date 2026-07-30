@@ -14,6 +14,13 @@ Severity scale: **P0** trunk-destroying / data loss · **P1** serious, reachable
 **P2** moderate / needs unusual-but-real conditions · **P3** minor. Usability findings use
 blocker/major/minor for *adoption* impact.
 
+**On the `ROUND5` references below.** Four findings cite "ROUND5" — an earlier, unpublished review
+round from the hardening phases, whose write-up is not in this repo. The citations are kept because
+they record that a finding is *recurring* rather than new, which is real information about it. But
+nothing here depends on that document: every finding below was reproduced against the source at
+`8beeb49` before being recorded, so each stands on its own reproduction. Read `ROUND5` as "this was
+raised once before and is still open," and nothing more.
+
 ---
 
 ## 1. Scorecard

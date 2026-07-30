@@ -465,8 +465,9 @@ def _live_blackboard(
             payload = r.json()
             live.parcel_count = payload["parcels"]
             live.contract_count = payload["contracts"]
-            low, high = harness.PARCEL_COUNT_RANGE
-            assert low <= live.parcel_count <= high, payload
+            # Floor only, no ceiling: same reasoning as harness.PARCEL_COUNT_MIN --
+            # the fixture is a separately-developed repo and is free to grow.
+            assert live.parcel_count >= harness.PARCEL_COUNT_MIN, payload
         yield live
     finally:
         for extra in live._extra_procs if live is not None else []:
@@ -573,10 +574,15 @@ def h5_wave(scale):
 
 
 def test_h5_the_contract_is_really_frozen_before_we_touch_it(scale):
-    """Precondition. If `module_qualname` were not one of the 94 frozen contracts,
-    a `contract_change` could never fire and H5 would pass or fail for reasons that
-    have nothing to do with contract detection."""
-    assert scale.contract_count == harness.MEASURED_CONTRACTS
+    """Precondition. If `module_qualname` were not a frozen contract, a
+    `contract_change` could never fire and H5 would pass or fail for reasons that
+    have nothing to do with contract detection.
+
+    Checked by looking up the symbol, not by pinning the total. `contract_count ==
+    MEASURED_CONTRACTS` used to stand here and it answered a different question:
+    it went red when the fixture repo grew, which says nothing about whether THIS
+    contract is frozen."""
+    assert scale.contract_count >= harness.CONTRACT_COUNT_MIN
     row = scale.conn.execute(
         "SELECT symbol, signature, version, frozen FROM contracts WHERE symbol = ?",
         (H5_CONTRACT,),
